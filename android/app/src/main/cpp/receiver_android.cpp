@@ -40,6 +40,7 @@ public:
                         stampTimeNs = timeNs;
                     }
                     updateXruns();
+                    updateOutputStats();
                 }
                 std::unique_lock<std::mutex> guard(waitMutex);
                 wake.wait_for(guard, std::chrono::milliseconds(stream ? 10 : 500), [this] {
@@ -64,11 +65,29 @@ public:
         wake.notify_all();
     }
 
+    void setLocalSourceRunning(bool running) {
+        if (localSourceRunning.exchange(running) != running && active.load()) routeChanged();
+    }
+
     std::string stats() {
+        bool open = outputOpen.load();
+        int sharing = outputSharing.load(), performance = outputPerformance.load(), usage = outputUsage.load();
+        std::string sharingName = sharing == AAUDIO_SHARING_MODE_SHARED ? "SHARED" :
+            sharing == AAUDIO_SHARING_MODE_EXCLUSIVE ? "EXCLUSIVE" : std::to_string(sharing);
+        std::string performanceName = performance == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? "LOW_LATENCY" :
+            performance == AAUDIO_PERFORMANCE_MODE_NONE ? "NONE" :
+            performance == AAUDIO_PERFORMANCE_MODE_POWER_SAVING ? "POWER_SAVING" : std::to_string(performance);
+        std::string usageName = usage == AAUDIO_USAGE_ASSISTANT ? "ASSISTANT" :
+            usage == AAUDIO_USAGE_MEDIA ? "MEDIA" : std::to_string(usage);
         std::string json = receiver.statsJson();
         json.pop_back();
-        return json + ",\"outputOpen\":" + (outputOpen.load() ? "true" : "false") +
-            ",\"outputRate\":" + std::to_string(outputRate.load()) + "}";
+        return json + ",\"outputOpen\":" + (open ? "true" : "false") +
+            ",\"outputRate\":" + std::to_string(outputRate.load()) +
+            ",\"outputDeviceId\":" + std::to_string(outputDeviceId.load()) +
+            ",\"outputFramesWritten\":" + std::to_string(outputFramesWritten.load()) +
+            ",\"outputSharingMode\":\"" + (open ? sharingName : "-") + "\"" +
+            ",\"outputPerformanceMode\":\"" + (open ? performanceName : "-") + "\"" +
+            ",\"outputUsage\":\"" + (open ? usageName : "-") + "\"}";
     }
 
 private:
@@ -76,7 +95,10 @@ private:
     std::condition_variable wake;
     std::thread manager;
     std::atomic<bool> active{false}, rebuild{false}, outputOpen{false};
+    std::atomic<bool> localSourceRunning{false};
     std::atomic<int> outputRate{0};
+    std::atomic<int> outputDeviceId{0}, outputSharing{0}, outputPerformance{0}, outputUsage{0};
+    std::atomic<int64_t> outputFramesWritten{0};
     int streamXruns = 0;
     AAudioStream* stream = nullptr;
     bool stampValid = false;
@@ -124,7 +146,8 @@ private:
         AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
         AAudioStreamBuilder_setChannelCount(builder, 2);
-        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
+        // 本机拦截 MEDIA/GAME/UNKNOWN 时，重放使用未被匹配的 ASSISTANT。
+        AAudioStreamBuilder_setUsage(builder, localSourceRunning.load() ? AAUDIO_USAGE_ASSISTANT : AAUDIO_USAGE_MEDIA);
         AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
         AAudioStreamBuilder_setSpatializationBehavior(builder, AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER);
         AAudioStreamBuilder_setDataCallback(builder, audioCallback, this);
@@ -145,6 +168,7 @@ private:
             closeStream();
             return false;
         }
+        updateOutputStats();
         outputOpen.store(true);
         return true;
     }
@@ -157,6 +181,8 @@ private:
             AAudioStream_close(stream);
             stream = nullptr;
         }
+        outputDeviceId.store(0);
+        outputFramesWritten.store(0);
         std::lock_guard<std::mutex> lock(timestampMutex);
         stampValid = false;
     }
@@ -165,6 +191,14 @@ private:
         int count = AAudioStream_getXRunCount(stream);
         if (count > streamXruns) receiver.addXruns(static_cast<uint32_t>(count - streamXruns));
         if (count >= 0) streamXruns = count;
+    }
+
+    void updateOutputStats() {
+        outputDeviceId.store(AAudioStream_getDeviceId(stream));
+        outputSharing.store(AAudioStream_getSharingMode(stream));
+        outputPerformance.store(AAudioStream_getPerformanceMode(stream));
+        outputUsage.store(AAudioStream_getUsage(stream));
+        outputFramesWritten.store(AAudioStream_getFramesWritten(stream));
     }
 };
 
@@ -187,3 +221,7 @@ Java_io_github_ichaivalx_unison_ReceiverEngine_statsJson(JNIEnv* env, jobject) {
 }
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_ichaivalx_unison_ReceiverEngine_routeChanged(JNIEnv*, jobject) { engine.routeChanged(); }
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_ichaivalx_unison_ReceiverEngine_setLocalSourceRunning(JNIEnv*, jobject, jboolean running) {
+    engine.setLocalSourceRunning(running == JNI_TRUE);
+}

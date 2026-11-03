@@ -114,6 +114,8 @@ struct Receiver::State {
         in_addr sourceIp;
         double clockOffset, minRtt, bufferMs, errorUs, correction, userOffsetUs;
         uint64_t lost, late, relocations, xruns;
+        uint64_t latePacketsPerSecond;
+        double lateAvgMs, lateMaxMs;
     };
 
     std::mutex mutex;
@@ -151,6 +153,11 @@ struct Receiver::State {
     double bufferMs = 0;
     uint64_t lost = 0;
     uint64_t late = 0;
+    uint64_t latePacketsPerSecond = 0;
+    double lateAvgMs = 0, lateMaxMs = 0;
+    int64_t lateWindowStartUs = 0;
+    uint64_t lateWindowCount = 0;
+    double lateWindowSumUs = 0, lateWindowMaxUs = 0;
     uint64_t relocations = 0;
     bool realTimestamp = false;
 #ifdef _WIN32
@@ -166,7 +173,12 @@ struct Receiver::State {
             reading = haveAudio = false;
             clockOffset = minRtt = errorUs = integral = correction = bufferMs = 0;
             accounted = false;
+            latePacketsPerSecond = 0;
+            lateAvgMs = lateMaxMs = 0;
         }
+        lateWindowStartUs = monotonicUs();
+        lateWindowCount = 0;
+        lateWindowSumUs = lateWindowMaxUs = 0;
         clockSamples.clear();
         pings.clear();
     }
@@ -186,7 +198,22 @@ struct Receiver::State {
         std::lock_guard<std::mutex> lock(mutex);
         return {running.load(), selected, clockReady, realTimestamp, source.sin_addr,
                 clockOffset, minRtt, bufferMs, errorUs, correction, userOffsetUs,
-                lost, late, relocations, xruns.load()};
+                lost, late, relocations, xruns.load(), latePacketsPerSecond, lateAvgMs, lateMaxMs};
+    }
+
+    void publishLateStatistics(int64_t now) {
+        if (now - lateWindowStartUs < 1'000'000) return;
+        double avgMs = lateWindowCount ? lateWindowSumUs / lateWindowCount / 1000.0 : 0;
+        double maxMs = lateWindowCount ? lateWindowMaxUs / 1000.0 : 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            latePacketsPerSecond = lateWindowCount;
+            lateAvgMs = avgMs;
+            lateMaxMs = maxMs;
+        }
+        lateWindowStartUs = now;
+        lateWindowCount = 0;
+        lateWindowSumUs = lateWindowMaxUs = 0;
     }
 
     void selectSource(const sockaddr_in& address, int64_t now) {
@@ -256,6 +283,11 @@ struct Receiver::State {
                 std::lock_guard<std::mutex> lock(mutex);
                 if (reading && playTime + kPacketUs <= readTime) {
                     ++late;
+                    // 收包减去本机应播时刻；仅错过输出队列写入期限时可能为负。
+                    double delayUs = now + clockOffset - userOffsetUs - playTime;
+                    lateWindowMaxUs = lateWindowCount ? std::max(lateWindowMaxUs, delayUs) : delayUs;
+                    lateWindowSumUs += delayUs;
+                    ++lateWindowCount;
                 } else if (packets.find(key) == packets.end()) {
                     packets.insert(std::move(node));
                     if (!haveAudio) {
@@ -307,6 +339,7 @@ struct Receiver::State {
             }
             reclaimPackets();
             int64_t now = monotonicUs();
+            publishLateStatistics(now);
             if (selected && now - lastSeen > kSubscribeTimeoutUs) {
                 if (fixedSource) selectSource(source, now);
                 else {
@@ -516,6 +549,8 @@ std::string Receiver::statsJson() {
         << ",\"minRttMs\":" << s.minRtt / 1000
         << ",\"bufferMs\":" << s.bufferMs
         << ",\"lostPackets\":" << s.lost << ",\"latePackets\":" << s.late
+        << ",\"latePacketsPerSecond\":" << s.latePacketsPerSecond
+        << ",\"lateAvgMs\":" << s.lateAvgMs << ",\"lateMaxMs\":" << s.lateMaxMs
         << ",\"syncErrorMs\":" << s.errorUs / 1000
         << ",\"speedPpm\":" << s.correction * 1e6
         << ",\"relocations\":" << s.relocations
@@ -532,6 +567,7 @@ std::string Receiver::statsLine() {
     out << std::fixed << std::setprecision(2)
         << (s.clockReady ? "sync " : "waiting ")
         << "err=" << s.errorUs / 1000 << "ms buf=" << s.bufferMs
+        << " late/s=" << s.latePacketsPerSecond << " avg/max=" << s.lateAvgMs << "/" << s.lateMaxMs << "ms"
         << " rtt=" << s.minRtt / 1000
         << " xrun=" << s.xruns
         << " lost=" << s.lost << " late=" << s.late

@@ -51,6 +51,13 @@ class PlaybackService : Service() {
     private lateinit var audioManager: AudioManager
     private var wifiForceAttempted = false
     @Volatile private var destroyed = false
+    private val sourceStateWatch = object : Runnable {
+        override fun run() {
+            if (destroyed) return
+            ReceiverEngine.setLocalSourceRunning(SourceController.isRunning)
+            main.postDelayed(this, 250)
+        }
+    }
     private val devices = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
             if (receiverRunning) ReceiverEngine.routeChanged()
@@ -75,6 +82,7 @@ class PlaybackService : Service() {
         wakeLock.acquire()
         audioManager = getSystemService(AudioManager::class.java)
         audioManager.registerAudioDeviceCallback(devices, main)
+        main.post(sourceStateWatch)
     }
 
     private fun notification(): Notification {
@@ -98,6 +106,7 @@ class PlaybackService : Service() {
                 try {
                     when (action) {
                         RECEIVE_START -> {
+                            ReceiverEngine.setLocalSourceRunning(SourceController.isRunning)
                             ReceiverEngine.setOffsetMs(offsetMs)
                             receiverRunning = ReceiverEngine.start()
                             message = if (receiverRunning) "" else "接收端启动失败（网络端口或输出设备不可用）"
@@ -117,6 +126,8 @@ class PlaybackService : Service() {
                 } catch (error: Exception) {
                     message = error.message ?: error.toString()
                     log(message)
+                } finally {
+                    ReceiverEngine.setLocalSourceRunning(SourceController.isRunning)
                 }
             }
             main.post {
@@ -133,10 +144,12 @@ class PlaybackService : Service() {
     override fun onDestroy() {
         destroyed = true
         active = false
+        main.removeCallbacks(sourceStateWatch)
         audioManager.unregisterAudioDeviceCallback(devices)
         worker.execute {
             try { SourceController.stop() } finally {
                 stopReceiver()
+                ReceiverEngine.setLocalSourceRunning(SourceController.isRunning)
                 busy = false
             }
         }

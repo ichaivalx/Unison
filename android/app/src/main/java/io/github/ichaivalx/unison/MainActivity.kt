@@ -26,6 +26,7 @@ class MainActivity : Activity() {
     private lateinit var state: TextView
     private lateinit var sourceState: TextView
     private lateinit var message: TextView
+    private var lastFramesWritten = -1L
     private val refresh = object : Runnable {
         override fun run() {
             state.text = "接收端：${if (PlaybackService.receiverRunning) "运行中" else "停止"}"
@@ -36,12 +37,26 @@ class MainActivity : Activity() {
             message.text = if (PlaybackService.busy) "正在处理…" else PlaybackService.message
             val value = JSONObject(ReceiverEngine.statsJson())
             fun number(name: String) = String.format(Locale.US, "%.3f", value.optDouble(name, 0.0))
+            val outputOpen = value.optBoolean("outputOpen")
+            val written = value.optLong("outputFramesWritten")
+            val growth = when {
+                !outputOpen -> "已关闭"
+                lastFramesWritten < 0 -> "等待采样"
+                written < lastFramesWritten -> "重新计数"
+                written > lastFramesWritten -> "增长"
+                else -> "未增长"
+            }
+            lastFramesWritten = if (outputOpen) written else -1
             stats.text = "音源 ${value.optString("source").ifEmpty { "等待发现" }}  时钟${if (value.optBoolean("clockReady")) "已同步" else "等待同步"}\n" +
                 "时钟 offset ${number("clockOffsetMs")} ms  最短 RTT ${number("minRttMs")} ms\n" +
                 "缓冲 ${number("bufferMs")} ms  同步误差 ${number("syncErrorMs")} ms\n" +
                 "丢包 ${value.optLong("lostPackets")}  晚到 ${value.optLong("latePackets")}  重定位 ${value.optLong("relocations")}\n" +
+                "晚到 ${value.optLong("latePacketsPerSecond")} 包/秒  avg/max ${number("lateAvgMs")}/${number("lateMaxMs")} ms（收包−应播）\n" +
                 "速度修正 ${number("speedPpm")} ppm\n" +
                 "时间戳 ${if (value.optString("timestamp") == "real") "真实" else "回退"}  输出 ${value.optInt("outputRate")} Hz ${if (value.optBoolean("outputOpen")) "已打开" else "关闭"}\n" +
+                "设备 id ${value.optInt("outputDeviceId")}  usage ${value.optString("outputUsage")}\n" +
+                "sharing ${value.optString("outputSharingMode")}  performance ${value.optString("outputPerformanceMode")}\n" +
+                "已写帧 $written（$growth）\n" +
                 "本地 xrun ${value.optLong("xruns")}  wifiForce=${PlaybackService.wifiForce}"
             handler.postDelayed(this, 250)
         }
@@ -89,7 +104,8 @@ class MainActivity : Activity() {
             PlaybackService.latencyMs += ms
             if (SourceController.isRunning) command(PlaybackService.LATENCY)
         }
-        row("−5 ms" to { adjustLatency(-5) }, "+5 ms" to { adjustLatency(5) })
+        row("−50 ms" to { adjustLatency(-50) }, "−5 ms" to { adjustLatency(-5) },
+            "+5 ms" to { adjustLatency(5) }, "+50 ms" to { adjustLatency(50) })
         logs = label("", 12f).apply { typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
         setContentView(scroll)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)

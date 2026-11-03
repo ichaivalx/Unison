@@ -7,4 +7,5 @@ object ReceiverEngine {
     external fun setOffsetMs(ms: Float)
     external fun statsJson(): String
     external fun routeChanged()
+    external fun setLocalSourceRunning(running: Boolean)
 }
