@@ -21,7 +21,6 @@
 #include <cstring>
 #include <deque>
 #include <iomanip>
-#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -121,7 +120,7 @@ struct Receiver::State {
     bool clockReady = false;
     std::deque<ClockSample> clockSamples;
     std::map<uint32_t, int64_t> pings;
-    std::map<int64_t, Packet> packets;
+    std::map<std::pair<int64_t, uint32_t>, Packet> packets;
     uint64_t receiverId = 0;
     uint32_t pingId = 0;
     int64_t selectedAt = 0;
@@ -135,7 +134,9 @@ struct Receiver::State {
     bool reading = false;
     bool haveAudio = false;
     int64_t firstAudioTime = 0;
-    int64_t lastLossSlot = std::numeric_limits<int64_t>::min();
+    double lossBaseTime = 0;
+    uint32_t lossBaseSeq = 0, accountedSeq = 0;
+    bool accounted = false;
     double errorUs = 0;
     double integral = 0;
     double correction = 0;
@@ -155,7 +156,7 @@ struct Receiver::State {
         clockReady = false;
         reading = haveAudio = false;
         clockOffset = minRtt = errorUs = integral = correction = bufferMs = 0;
-        lastLossSlot = std::numeric_limits<int64_t>::min();
+        accounted = false;
     }
 
     void selectSource(const sockaddr_in& address, int64_t now) {
@@ -212,16 +213,19 @@ struct Receiver::State {
                 ++late;
                 return;
             }
-            if (packets.find(playTime) != packets.end()) return;
+            auto key = std::make_pair(playTime, seq);
+            if (packets.find(key) != packets.end()) return;
             Packet packet{};
             packet.seq = seq;
             for (size_t i = 0; i < packet.pcm.size(); ++i) {
                 auto value = static_cast<int16_t>(readLe(p + kAudioFieldsSize + 2 * i, 2));
                 packet.pcm[i] = static_cast<float>(value) / 32768.0f;
             }
-            packets.emplace(playTime, std::move(packet));
+            packets.emplace(key, std::move(packet));
             if (!haveAudio) {
                 firstAudioTime = playTime;
+                lossBaseTime = playTime;
+                lossBaseSeq = seq;
                 haveAudio = true;
             }
         } else if (type == MsgType::Bye && bytes == 0) {
@@ -301,11 +305,16 @@ struct Receiver::State {
     }
 
     // 以包时间轴取样；缺失部分自然变为静音，不等待重传。
-    bool sample(double time, float& left, float& right, bool countLoss) {
-        auto it = packets.upper_bound(static_cast<int64_t>(std::floor(time)));
+    void sample(double time, float& left, float& right) {
+        auto it = packets.upper_bound({static_cast<int64_t>(std::floor(time)), UINT32_MAX});
         if (it != packets.begin()) {
             --it;
-            double position = (time - it->first) / kFrameUs;
+            auto next = std::next(it);
+            bool continuous = next != packets.end() && next->second.seq == it->second.seq + 1 &&
+                              next->first.first > it->first.first;
+            // 按相邻 seq 的时标连接，吸收采集时钟校准引起的包边界变化。
+            double packetDuration = continuous ? static_cast<double>(next->first.first - it->first.first) : kPacketUs;
+            double position = (time - it->first.first) * kFramesPerPacket / packetDuration;
             int frame = static_cast<int>(std::floor(position + 1e-5));
             if (frame >= 0 && frame < kFramesPerPacket) {
                 double fraction = std::clamp(position - frame, 0.0, 1.0);
@@ -315,27 +324,34 @@ struct Receiver::State {
                     nextLeft = it->second.pcm[(frame + 1) * 2];
                     nextRight = it->second.pcm[(frame + 1) * 2 + 1];
                 } else {
-                    auto next = std::next(it);
-                    if (next != packets.end() && next->second.seq == it->second.seq + 1 &&
-                        std::abs(next->first - (it->first + kPacketUs)) < kFrameUs) {
+                    if (continuous) {
                         nextLeft = next->second.pcm[0];
                         nextRight = next->second.pcm[1];
                     }
                 }
                 left = static_cast<float>(it->second.pcm[frame * 2] * (1 - fraction) + nextLeft * fraction);
                 right = static_cast<float>(it->second.pcm[frame * 2 + 1] * (1 - fraction) + nextRight * fraction);
-                return true;
+                if (!accounted || static_cast<int32_t>(it->second.seq - accountedSeq) > 0) {
+                    accounted = true;
+                    accountedSeq = lossBaseSeq = it->second.seq;
+                    lossBaseTime = it->first.first;
+                }
+                return;
             }
         }
         left = right = 0;
-        if (countLoss && time >= firstAudioTime) {
-            int64_t slot = static_cast<int64_t>(std::floor((time - firstAudioTime) / kPacketUs));
-            if (slot > lastLossSlot) {
-                lastLossSlot = slot;
-                ++lost;
+        if (time >= firstAudioTime) {
+            int64_t slot = static_cast<int64_t>(std::floor((time - lossBaseTime) / kPacketUs));
+            if (slot >= 1) {
+                uint32_t missingSeq = lossBaseSeq + static_cast<uint32_t>(slot);
+                if (!accounted) { accounted = true; accountedSeq = missingSeq - 1; }
+                int32_t gap = static_cast<int32_t>(missingSeq - accountedSeq);
+                if (gap > 0) {
+                    lost += static_cast<uint32_t>(gap);
+                    accountedSeq = missingSeq;
+                }
             }
         }
-        return false;
     }
 };
 
@@ -433,13 +449,13 @@ void Receiver::render(float* stereo, int frames, int deviceRate, int64_t firstFr
     }
     double step = 1e6 / deviceRate * (1.0 + s.correction);
     for (int i = 0; i < frames; ++i) {
-        s.sample(s.readTime, stereo[i * 2], stereo[i * 2 + 1], true);
+        s.sample(s.readTime, stereo[i * 2], stereo[i * 2 + 1]);
         s.readTime += step;
     }
     // 保留读取位置所在包供下次插值，其余已播放包回收。
-    while (!s.packets.empty() && s.packets.begin()->first + kPacketUs < s.readTime - kFrameUs)
+    while (s.packets.size() > 1 && std::next(s.packets.begin())->first.first < s.readTime - kFrameUs)
         s.packets.erase(s.packets.begin());
-    s.bufferMs = s.packets.empty() ? 0 : std::max(0.0, (s.packets.rbegin()->first + kPacketUs - s.readTime) / 1000.0);
+    s.bufferMs = s.packets.empty() ? 0 : std::max(0.0, (s.packets.rbegin()->first.first + kPacketUs - s.readTime) / 1000.0);
 }
 
 std::string Receiver::statsJson() {
