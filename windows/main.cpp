@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -103,8 +104,12 @@ struct AudioOutput {
     UINT64 frequency = 0;
     UINT64 written = 0;
     bool inflightReady = false;
+    std::array<double, 5> inflightSamples{};
+    size_t inflightCount = 0, inflightNext = 0;
     double inflightBaseline = 0;
     int64_t lastInflightUs = 0;
+    int inflightDropCount = 0;
+    int64_t inflightDropSinceUs = 0;
     REFERENCE_TIME latency = 0;
     bool floating = false;
     int validBits = 0;
@@ -204,7 +209,8 @@ struct AudioOutput {
     }
 
     HRESULT fill(unison::Receiver& receiver) {
-        constexpr int64_t kInflightDropUs = 1'000;
+        constexpr int64_t kInflightDropUs = 3'000;
+        constexpr int64_t kMaxQueryUs = 1'000;
         int64_t queryStartedUs = unison::monotonicUs();
         UINT32 padding = 0;
         HRESULT hr = client->GetCurrentPadding(&padding);
@@ -219,21 +225,38 @@ struct AudioOutput {
             double inflight = static_cast<double>(written) - playedFrames - padding;
             double dropFrames = format->nSamplesPerSec * (kInflightDropUs / 1e6);
             // 两次查询未原子配对；采样本身停顿过久时留待下一次检测。
-            bool paired = queriedUs - queryStartedUs < kInflightDropUs;
+            bool paired = queriedUs - queryStartedUs < kMaxQueryUs;
             // padding 不包含引擎到硬件的在途帧；欠载后重建流，不能据此修补帧零点。
-            if (playedFrames > written ||
-                (paired && inflightReady && inflightBaseline - inflight > dropFrames)) {
+            if (playedFrames > written) {
                 receiver.addXruns(1);
                 return AUDCLNT_E_BUFFER_ERROR;
             }
             if (paired) {
-                if (!inflightReady && playedFrames >= capacity) {
-                    // 预填充缓冲已经发声，管线进入稳态后建立基线。
-                    inflightBaseline = inflight;
-                    inflightReady = true;
-                } else if (inflightReady && inflight > inflightBaseline) {
-                    double follow = 1.0 - std::exp(-(queriedUs - lastInflightUs) / 1e6);
-                    inflightBaseline += follow * (inflight - inflightBaseline);
+                inflightSamples[inflightNext] = inflight;
+                inflightNext = (inflightNext + 1) % inflightSamples.size();
+                if (inflightCount < inflightSamples.size()) ++inflightCount;
+                if (inflightCount == inflightSamples.size()) {
+                    auto sorted = inflightSamples;
+                    std::sort(sorted.begin(), sorted.end());
+                    double median = sorted[sorted.size() / 2];
+                    if (!inflightReady && playedFrames >= capacity) {
+                        // 预填充缓冲发声后，用完整窗口建立新流的基线。
+                        inflightBaseline = median;
+                        inflightReady = true;
+                    } else if (inflightReady && inflightBaseline - median > dropFrames) {
+                        // 候选下降期间冻结基线，连续有效观测足够久才重建。
+                        if (inflightDropCount == 0) inflightDropSinceUs = queriedUs;
+                        ++inflightDropCount;
+                        if (inflightDropCount >= 3 && queriedUs - inflightDropSinceUs >= 30'000) {
+                            receiver.addXruns(1);
+                            return AUDCLNT_E_BUFFER_ERROR;
+                        }
+                    } else if (inflightReady) {
+                        inflightDropCount = 0;
+                        inflightDropSinceUs = 0;
+                        double follow = 1.0 - std::exp(-(queriedUs - lastInflightUs) / 1e6);
+                        inflightBaseline += follow * (median - inflightBaseline);
+                    }
                 }
                 lastInflightUs = queriedUs;
             }
