@@ -42,7 +42,7 @@ class MainActivity : Activity() {
                 "丢包 ${value.optLong("lostPackets")}  晚到 ${value.optLong("latePackets")}  重定位 ${value.optLong("relocations")}\n" +
                 "速度修正 ${number("speedPpm")} ppm\n" +
                 "时间戳 ${if (value.optString("timestamp") == "real") "真实" else "回退"}  输出 ${value.optInt("outputRate")} Hz ${if (value.optBoolean("outputOpen")) "已打开" else "关闭"}\n" +
-                "输出 underrun ${value.optInt("underruns")}"
+                "本地 xrun ${value.optLong("xruns")}  wifiForce=${PlaybackService.wifiForce}"
             handler.postDelayed(this, 250)
         }
     }

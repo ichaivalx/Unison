@@ -108,9 +108,17 @@ struct Receiver::State {
         std::array<float, kFramesPerPacket * kChannels> pcm;
     };
     struct ClockSample { double rtt; double offset; };
+    using PacketMap = std::map<std::pair<int64_t, uint32_t>, Packet>;
+    struct Statistics {
+        bool running, selected, clockReady, realTimestamp;
+        in_addr sourceIp;
+        double clockOffset, minRtt, bufferMs, errorUs, correction, userOffsetUs;
+        uint64_t lost, late, relocations, xruns;
+    };
 
     std::mutex mutex;
     std::atomic<bool> running{false};
+    std::atomic<uint64_t> xruns{0};
     std::thread worker;
     Socket dataSocket = kInvalidSocket;
     Socket beaconSocket = kInvalidSocket;
@@ -120,7 +128,7 @@ struct Receiver::State {
     bool clockReady = false;
     std::deque<ClockSample> clockSamples;
     std::map<uint32_t, int64_t> pings;
-    std::map<std::pair<int64_t, uint32_t>, Packet> packets;
+    PacketMap packets;
     uint64_t receiverId = 0;
     uint32_t pingId = 0;
     int64_t selectedAt = 0;
@@ -150,17 +158,40 @@ struct Receiver::State {
 #endif
 
     void resetStream() {
-        packets.clear();
+        PacketMap retired;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            packets.swap(retired);
+            clockReady = false;
+            reading = haveAudio = false;
+            clockOffset = minRtt = errorUs = integral = correction = bufferMs = 0;
+            accounted = false;
+        }
         clockSamples.clear();
         pings.clear();
-        clockReady = false;
-        reading = haveAudio = false;
-        clockOffset = minRtt = errorUs = integral = correction = bufferMs = 0;
-        accounted = false;
+    }
+
+    void reclaimPackets() {
+        PacketMap retired;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!reading) return;
+            // 锁内只摘取节点，锁外释放；回调只读包，不负责回收。
+            while (packets.size() > 1 && std::next(packets.begin())->first.first < readTime - kFrameUs)
+                retired.insert(packets.extract(packets.begin()));
+        }
+    }
+
+    Statistics snapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return {running.load(), selected, clockReady, realTimestamp, source.sin_addr,
+                clockOffset, minRtt, bufferMs, errorUs, correction, userOffsetUs,
+                lost, late, relocations, xruns.load()};
     }
 
     void selectSource(const sockaddr_in& address, int64_t now) {
         resetStream();
+        std::lock_guard<std::mutex> lock(mutex);
         source = address;
         selected = true;
         selectedAt = lastSeen = now;
@@ -199,6 +230,7 @@ struct Receiver::State {
             double mean = 0;
             for (size_t i = 0; i < count; ++i) mean += sorted[i].offset;
             mean /= count;
+            std::lock_guard<std::mutex> lock(mutex);
             minRtt = sorted.front().rtt;
             clockOffset = clockReady ? clockOffset + 0.12 * (mean - clockOffset) : mean;
             clockReady = true;
@@ -209,29 +241,38 @@ struct Receiver::State {
             uint32_t seq = static_cast<uint32_t>(readLe(p, 4));
             int64_t playTime = static_cast<int64_t>(readLe(p + 4, 8));
             lastSeen = now;
-            if (reading && playTime + kPacketUs <= readTime) {
-                ++late;
-                return;
-            }
             auto key = std::make_pair(playTime, seq);
-            if (packets.find(key) != packets.end()) return;
             Packet packet{};
             packet.seq = seq;
             for (size_t i = 0; i < packet.pcm.size(); ++i) {
                 auto value = static_cast<int16_t>(readLe(p + kAudioFieldsSize + 2 * i, 2));
                 packet.pcm[i] = static_cast<float>(value) / 32768.0f;
             }
-            packets.emplace(key, std::move(packet));
-            if (!haveAudio) {
-                firstAudioTime = playTime;
-                lossBaseTime = playTime;
-                lossBaseSeq = seq;
-                haveAudio = true;
+            // 提前分配 map 节点，转移到共享缓冲时不再分配内存。
+            PacketMap prepared;
+            prepared.emplace(key, std::move(packet));
+            auto node = prepared.extract(prepared.begin());
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                if (reading && playTime + kPacketUs <= readTime) {
+                    ++late;
+                } else if (packets.find(key) == packets.end()) {
+                    packets.insert(std::move(node));
+                    if (!haveAudio) {
+                        firstAudioTime = playTime;
+                        lossBaseTime = playTime;
+                        lossBaseSeq = seq;
+                        haveAudio = true;
+                    }
+                }
             }
         } else if (type == MsgType::Bye && bytes == 0) {
-            resetStream();
             if (fixedSource) selectSource(source, now);
-            else selected = false;
+            else {
+                resetStream();
+                std::lock_guard<std::mutex> lock(mutex);
+                selected = false;
+            }
         }
     }
 
@@ -260,17 +301,19 @@ struct Receiver::State {
                             static_cast<int>(buffer.size()), 0, reinterpret_cast<sockaddr*>(&from), &fromSize));
                         if (bytes < 0) break;
                         int64_t now = monotonicUs();
-                        std::lock_guard<std::mutex> lock(mutex);
                         receive(buffer.data(), bytes, from, s == beaconSocket, now);
                     }
                 }
             }
-            std::lock_guard<std::mutex> lock(mutex);
+            reclaimPackets();
             int64_t now = monotonicUs();
             if (selected && now - lastSeen > kSubscribeTimeoutUs) {
-                resetStream();
                 if (fixedSource) selectSource(source, now);
-                else selected = false;
+                else {
+                    resetStream();
+                    std::lock_guard<std::mutex> lock(mutex);
+                    selected = false;
+                }
             }
             if (!selected) continue;
             if (now - lastSubscribe >= 1'000'000) {
@@ -300,7 +343,6 @@ struct Receiver::State {
                 else ++it;
             }
         }
-        std::lock_guard<std::mutex> lock(mutex);
         if (selected) sendMessage(dataSocket, source, message(MsgType::Bye));
     }
 
@@ -373,30 +415,25 @@ bool Receiver::start(const std::string& sourceIp) {
         stop();
         return false;
     }
+    s.resetStream();
+    s.fixedSource = !sourceIp.empty();
+    s.receiverId = static_cast<uint64_t>(monotonicUs());
+    s.xruns.store(0);
     {
         std::lock_guard<std::mutex> lock(s.mutex);
-        s.resetStream();
         s.selected = false;
-        s.fixedSource = !sourceIp.empty();
         s.lost = s.late = s.relocations = 0;
         s.realTimestamp = false;
-        s.receiverId = static_cast<uint64_t>(monotonicUs());
-        if (s.fixedSource) {
-            sockaddr_in address{};
-            address.sin_family = AF_INET;
-            address.sin_port = htons(kSourcePort);
-            if (inet_pton(AF_INET, sourceIp.c_str(), &address.sin_addr) != 1) {
-                closeSocket(s.dataSocket);
-                closeSocket(s.beaconSocket);
-                s.dataSocket = s.beaconSocket = kInvalidSocket;
-#ifdef _WIN32
-                WSACleanup();
-                s.winsock = false;
-#endif
-                return false;
-            }
-            s.selectSource(address, monotonicUs());
+    }
+    if (s.fixedSource) {
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(kSourcePort);
+        if (inet_pton(AF_INET, sourceIp.c_str(), &address.sin_addr) != 1) {
+            stop();
+            return false;
         }
+        s.selectSource(address, monotonicUs());
     }
     s.running.store(true);
     s.worker = std::thread([&s] { s.networkLoop(); });
@@ -414,8 +451,8 @@ void Receiver::stop() {
     if (s.winsock) WSACleanup();
     s.winsock = false;
 #endif
-    std::lock_guard<std::mutex> lock(s.mutex);
     s.resetStream();
+    std::lock_guard<std::mutex> lock(s.mutex);
     s.selected = false;
 }
 
@@ -423,6 +460,16 @@ void Receiver::setOffsetMs(float ms) {
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->userOffsetUs = ms * 1000.0;
 }
+
+void Receiver::resetOutputTiming() {
+    auto& s = *state_;
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.reading) ++s.relocations;
+    s.reading = false;
+    s.errorUs = s.integral = s.correction = 0;
+}
+
+void Receiver::addXruns(uint32_t count) { state_->xruns.fetch_add(count); }
 
 void Receiver::render(float* stereo, int frames, int deviceRate, int64_t firstFrameUs, bool realTimestamp) {
     auto& s = *state_;
@@ -453,21 +500,17 @@ void Receiver::render(float* stereo, int frames, int deviceRate, int64_t firstFr
         s.sample(s.readTime, stereo[i * 2], stereo[i * 2 + 1]);
         s.readTime += step;
     }
-    // 保留读取位置所在包供下次插值，其余已播放包回收。
-    while (s.packets.size() > 1 && std::next(s.packets.begin())->first.first < s.readTime - kFrameUs)
-        s.packets.erase(s.packets.begin());
     s.bufferMs = s.packets.empty() ? 0 : std::max(0.0, (s.packets.rbegin()->first.first + kPacketUs - s.readTime) / 1000.0);
 }
 
 std::string Receiver::statsJson() {
-    auto& s = *state_;
-    std::lock_guard<std::mutex> lock(s.mutex);
+    auto s = state_->snapshot();
     char ip[INET_ADDRSTRLEN]{};
-    if (s.selected) inet_ntop(AF_INET, &s.source.sin_addr, ip, sizeof(ip));
+    if (s.selected) inet_ntop(AF_INET, &s.sourceIp, ip, sizeof(ip));
     std::ostringstream out;
     out.imbue(std::locale::classic());
     out << std::fixed << std::setprecision(3)
-        << "{\"running\":" << (s.running.load() ? "true" : "false")
+        << "{\"running\":" << (s.running ? "true" : "false")
         << ",\"source\":\"" << ip << "\",\"clockReady\":" << (s.clockReady ? "true" : "false")
         << ",\"clockOffsetMs\":" << s.clockOffset / 1000
         << ",\"minRttMs\":" << s.minRtt / 1000
@@ -476,20 +519,21 @@ std::string Receiver::statsJson() {
         << ",\"syncErrorMs\":" << s.errorUs / 1000
         << ",\"speedPpm\":" << s.correction * 1e6
         << ",\"relocations\":" << s.relocations
+        << ",\"xruns\":" << s.xruns
         << ",\"offsetMs\":" << s.userOffsetUs / 1000
         << ",\"timestamp\":\"" << (s.realTimestamp ? "real" : "fallback") << "\"}";
     return out.str();
 }
 
 std::string Receiver::statsLine() {
-    auto& s = *state_;
-    std::lock_guard<std::mutex> lock(s.mutex);
+    auto s = state_->snapshot();
     std::ostringstream out;
     out.imbue(std::locale::classic());
     out << std::fixed << std::setprecision(2)
         << (s.clockReady ? "sync " : "waiting ")
         << "err=" << s.errorUs / 1000 << "ms buf=" << s.bufferMs
         << " rtt=" << s.minRtt / 1000
+        << " xrun=" << s.xruns
         << " lost=" << s.lost << " late=" << s.late
         << " ppm=" << std::setprecision(0) << s.correction * 1e6
         << " seek=" << s.relocations << " ts=" << (s.realTimestamp ? "real" : "fallback")

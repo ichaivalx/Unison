@@ -15,6 +15,8 @@ public:
     bool start(const std::string& sourceIp = "");
     void stop();
     void setOffsetMs(float ms);
+    void resetOutputTiming();
+    void addXruns(uint32_t count);
     // firstFrameUs 是本次输出第一帧实际发声的本机单调时刻。
     void render(float* stereo, int frames, int deviceRate, int64_t firstFrameUs,
                 bool realTimestamp);

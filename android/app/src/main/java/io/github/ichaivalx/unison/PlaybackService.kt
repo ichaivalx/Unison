@@ -17,6 +17,7 @@ import android.os.Looper
 import android.os.PowerManager
 import io.github.ichaivalx.unison.capture.SourceController
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class PlaybackService : Service() {
     companion object {
@@ -32,6 +33,9 @@ class PlaybackService : Service() {
         @Volatile var offsetMs = 0f
         @Volatile var latencyMs = 50
         @Volatile var message = ""
+        @Volatile var wifiForce = "off"
+        // 引擎和 WiFi 强制模式属于进程；服务快速重建时也要按顺序完成启停。
+        private val worker = Executors.newSingleThreadExecutor()
         private val lines = ArrayDeque<String>()
         private fun log(line: String) = synchronized(lines) {
             lines.addLast(line)
@@ -40,12 +44,12 @@ class PlaybackService : Service() {
         fun sourceLog(): String = synchronized(lines) { lines.joinToString("\n") }
     }
 
-    private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private lateinit var wifiLock: WifiManager.WifiLock
     private lateinit var multicastLock: WifiManager.MulticastLock
     private lateinit var wakeLock: PowerManager.WakeLock
     private lateinit var audioManager: AudioManager
+    private var wifiForceAttempted = false
     @Volatile private var destroyed = false
     private val devices = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
@@ -97,8 +101,9 @@ class PlaybackService : Service() {
                             ReceiverEngine.setOffsetMs(offsetMs)
                             receiverRunning = ReceiverEngine.start()
                             message = if (receiverRunning) "" else "接收端启动失败（网络端口或输出设备不可用）"
+                            if (receiverRunning) setWifiForce(true)
                         }
-                        RECEIVE_STOP -> { ReceiverEngine.stop(); receiverRunning = false }
+                        RECEIVE_STOP -> stopReceiver()
                         SOURCE_START -> {
                             val started = SourceController.start(applicationContext, latencyMs, ::log)
                             message = if (started) "" else "音源启动失败，请检查 root 授权与下方输出"
@@ -106,9 +111,7 @@ class PlaybackService : Service() {
                         SOURCE_STOP -> SourceController.stop()
                         LATENCY -> SourceController.setLatency(latencyMs)
                         STOP_ALL -> {
-                            SourceController.stop()
-                            ReceiverEngine.stop()
-                            receiverRunning = false
+                            try { SourceController.stop() } finally { stopReceiver() }
                         }
                     }
                 } catch (error: Exception) {
@@ -132,12 +135,11 @@ class PlaybackService : Service() {
         active = false
         audioManager.unregisterAudioDeviceCallback(devices)
         worker.execute {
-            SourceController.stop()
-            ReceiverEngine.stop()
-            receiverRunning = false
-            busy = false
+            try { SourceController.stop() } finally {
+                stopReceiver()
+                busy = false
+            }
         }
-        worker.shutdown()
         if (wifiLock.isHeld) wifiLock.release()
         if (multicastLock.isHeld) multicastLock.release()
         if (wakeLock.isHeld) wakeLock.release()
@@ -145,4 +147,35 @@ class PlaybackService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun stopReceiver() {
+        try { ReceiverEngine.stop() } finally {
+            receiverRunning = false
+            setWifiForce(false)
+        }
+    }
+
+    // 与接收启停共用后台队列；无 root 或命令失败不影响接收。
+    private fun setWifiForce(enabled: Boolean) {
+        if (enabled && wifiForce == "on") return
+        if (!enabled && !wifiForceAttempted) return
+        wifiForceAttempted = true
+        var child: Process? = null
+        try {
+            val mode = if (enabled) "enabled" else "disabled"
+            child = ProcessBuilder("su", "-c", "cmd wifi force-low-latency-mode $mode")
+                .redirectErrorStream(true).start()
+            child.outputStream.close()
+            if (child.waitFor(30, TimeUnit.SECONDS) && child.exitValue() == 0) {
+                wifiForce = if (enabled) "on" else "off"
+                wifiForceAttempted = enabled
+            } else {
+                wifiForce = "failed"
+            }
+        } catch (_: Exception) {
+            wifiForce = "failed"
+        } finally {
+            child?.destroy()
+        }
+    }
 }

@@ -210,8 +210,11 @@ struct AudioOutput {
         int64_t firstFrameUs;
         if (real) {
             double playedFrames = static_cast<double>(position) * format->nSamplesPerSec / frequency;
-            // 共享引擎欠载时仍可能推进设备时钟，补齐提交计数中的静音空洞。
-            if (playedFrames > written) written = static_cast<UINT64>(std::ceil(playedFrames)) + padding;
+            // padding 不包含引擎到硬件的在途帧；欠载后重建流，不能据此修补帧零点。
+            if (playedFrames > written) {
+                receiver.addXruns(1);
+                return AUDCLNT_E_BUFFER_ERROR;
+            }
             firstFrameUs = static_cast<int64_t>(qpc100ns / 10.0 +
                 (static_cast<double>(written) / format->nSamplesPerSec - static_cast<double>(position) / frequency) * 1e6);
         } else {
@@ -234,18 +237,23 @@ void audioThread(unison::Receiver& receiver, const std::wstring& id) {
     DWORD taskIndex = 0;
     HANDLE priority = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
     while (running.load()) {
+        bool underrun = false;
         {
             AudioOutput output;
             HRESULT hr = output.open(id);
             if (SUCCEEDED(hr)) {
+                receiver.resetOutputTiming();
                 while (running.load()) {
                     DWORD signaled = WaitForSingleObject(output.event, 100);
                     if (signaled == WAIT_FAILED) { hr = HRESULT_FROM_WIN32(GetLastError()); break; }
                     if (FAILED(hr = output.fill(receiver))) break;
                 }
             }
-            if (FAILED(hr)) setStatus("输出不可用 " + errorText(hr) + "，等待重连");
+            underrun = hr == AUDCLNT_E_BUFFER_ERROR;
+            if (underrun) setStatus("输出欠载，正在重建流");
+            else if (FAILED(hr)) setStatus("输出不可用 " + errorText(hr) + "，等待重连");
         }
+        if (underrun) continue;
         for (int i = 0; i < 10 && running.load(); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }

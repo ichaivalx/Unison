@@ -39,7 +39,7 @@ public:
                         stampFrame = frame;
                         stampTimeNs = timeNs;
                     }
-                    xruns.store(AAudioStream_getXRunCount(stream));
+                    updateXruns();
                 }
                 std::unique_lock<std::mutex> guard(waitMutex);
                 wake.wait_for(guard, std::chrono::milliseconds(stream ? 10 : 500), [this] {
@@ -68,8 +68,7 @@ public:
         std::string json = receiver.statsJson();
         json.pop_back();
         return json + ",\"outputOpen\":" + (outputOpen.load() ? "true" : "false") +
-            ",\"outputRate\":" + std::to_string(outputRate.load()) +
-            ",\"underruns\":" + std::to_string(xruns.load()) + "}";
+            ",\"outputRate\":" + std::to_string(outputRate.load()) + "}";
     }
 
 private:
@@ -77,7 +76,8 @@ private:
     std::condition_variable wake;
     std::thread manager;
     std::atomic<bool> active{false}, rebuild{false}, outputOpen{false};
-    std::atomic<int> outputRate{0}, xruns{0};
+    std::atomic<int> outputRate{0};
+    int streamXruns = 0;
     AAudioStream* stream = nullptr;
     bool stampValid = false;
     int64_t stampFrame = 0, stampTimeNs = 0;
@@ -90,17 +90,19 @@ private:
         int64_t now = unison::monotonicUs();
         int64_t firstFrameUs;
         bool real;
+        int64_t stampFrame, stampTimeNs;
         {
             std::lock_guard<std::mutex> lock(self.timestampMutex);
             real = self.stampValid && now - self.stampTimeNs / 1000 < 100'000;
-            if (real) {
-                firstFrameUs = self.stampTimeNs / 1000 +
-                    static_cast<int64_t>((written - self.stampFrame) * 1e6 / rate);
-            } else {
-                int64_t queued = std::max<int64_t>(0, written - AAudioStream_getFramesRead(stream));
-                queued = std::max<int64_t>(queued, AAudioStream_getBufferSizeInFrames(stream));
-                firstFrameUs = now + static_cast<int64_t>(queued * 1e6 / rate);
-            }
+            stampFrame = self.stampFrame;
+            stampTimeNs = self.stampTimeNs;
+        }
+        if (real) {
+            firstFrameUs = stampTimeNs / 1000 + static_cast<int64_t>((written - stampFrame) * 1e6 / rate);
+        } else {
+            int64_t queued = std::max<int64_t>(0, written - AAudioStream_getFramesRead(stream));
+            queued = std::max<int64_t>(queued, AAudioStream_getBufferSizeInFrames(stream));
+            firstFrameUs = now + static_cast<int64_t>(queued * 1e6 / rate);
         }
         self.receiver.render(static_cast<float*>(audio), frames, rate, firstFrameUs, real);
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
@@ -135,8 +137,10 @@ private:
             closeStream();
             return false;
         }
-        AAudioStream_setBufferSizeInFrames(stream, AAudioStream_getFramesPerBurst(stream) * 2);
+        AAudioStream_setBufferSizeInFrames(stream, AAudioStream_getFramesPerBurst(stream) * 4);
         outputRate.store(AAudioStream_getSampleRate(stream));
+        streamXruns = 0;
+        receiver.resetOutputTiming();
         if (AAudioStream_requestStart(stream) != AAUDIO_OK) {
             closeStream();
             return false;
@@ -148,12 +152,19 @@ private:
     void closeStream() {
         outputOpen.store(false);
         if (stream) {
+            updateXruns();
             AAudioStream_requestStop(stream);
             AAudioStream_close(stream);
             stream = nullptr;
         }
         std::lock_guard<std::mutex> lock(timestampMutex);
         stampValid = false;
+    }
+
+    void updateXruns() {
+        int count = AAudioStream_getXRunCount(stream);
+        if (count > streamXruns) receiver.addXruns(static_cast<uint32_t>(count - streamXruns));
+        if (count >= 0) streamXruns = count;
     }
 };
 
