@@ -4,9 +4,11 @@
 #include <audioclient.h>
 #include <avrt.h>
 #include <conio.h>
-#include <functiondiscoverykeys_devpkey.h>
-#include <ksmedia.h>
 #include <mmdeviceapi.h>
+#include <propkeydef.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <ks.h>
+#include <ksmedia.h>
 #include <wrl/client.h>
 
 #include <algorithm>
