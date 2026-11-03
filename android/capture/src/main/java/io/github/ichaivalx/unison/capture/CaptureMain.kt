@@ -14,6 +14,7 @@ import java.nio.channels.DatagramChannel
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.util.Collections
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -38,6 +39,13 @@ object CaptureMain {
     private val droppedCount = AtomicLong()
     private val errorCount = AtomicLong()
     private val peak = AtomicInteger()
+    private val diagnosticsLock = Any()
+    private var ageCount = 0L
+    private var ageSumNs = 0L
+    private var ageMinNs = Long.MAX_VALUE
+    private var ageMaxNs = Long.MIN_VALUE
+    private var diagnosticTimestampFrame: Long? = null
+    private var diagnosticReadFrames = 0L
     @Volatile private var running = true
     @Volatile private var latencyUs = 50_000
     @Volatile private var timestampSource = "read-fallback"
@@ -131,9 +139,22 @@ object CaptureMain {
                             if (now - subscribedNs >= SUBSCRIBE_TIMEOUT_NS) subscribers.remove(subscriber, subscribedNs)
                         }
                         broadcast(udp, beacon)
+                        val diagnostics = synchronized(diagnosticsLock) {
+                            val ages = if (ageCount == 0L) "n/a" else String.format(Locale.ROOT, "%.2f/%.2f/%.2f",
+                                ageMinNs / 1_000_000.0, ageSumNs / ageCount / 1_000_000.0, ageMaxNs / 1_000_000.0)
+                            val frameLead = diagnosticTimestampFrame?.minus(diagnosticReadFrames)
+                            ageCount = 0
+                            ageSumNs = 0
+                            ageMinNs = Long.MAX_VALUE
+                            ageMaxNs = Long.MIN_VALUE
+                            "capture_age_ms_min_avg_max=$ages buffer_frames=${record.bufferSizeInFrames} " +
+                                "ts_frame=${diagnosticTimestampFrame ?: "n/a"} read_frames=$diagnosticReadFrames " +
+                                "ts_ahead_frames=${frameLead ?: "n/a"}"
+                        }
                         println("STATUS subscribers=${subscribers.size} packets/s=${packetCount.getAndSet(0)} " +
                             "sent/s=${sendCount.getAndSet(0)} dropped=${droppedCount.get()} " +
                             "timestamp=$timestampSource latency_us=$latencyUs " +
+                            "$diagnostics " +
                             "peak=${peak.getAndSet(0)} errors=${errorCount.get()} last_error=$lastError")
                         Thread.sleep(1000)
                     }
@@ -200,6 +221,16 @@ object CaptureMain {
                 timestampSource = "read-fallback($result,$estimate)"
             }
             val captureNs = checkNotNull(originNs) + framesToNs(firstFrame)
+            synchronized(diagnosticsLock) {
+                val ageNs = readNs - captureNs
+                ageCount++
+                ageSumNs += ageNs
+                ageMinNs = minOf(ageMinNs, ageNs)
+                ageMaxNs = maxOf(ageMaxNs, ageNs)
+                if (result == AudioRecord.SUCCESS) diagnosticTimestampFrame = timestamp.framePosition
+                // 与刚完成读取的包末尾比较；正值表示时间戳帧位置领先已读位置。
+                diagnosticReadFrames = firstFrame + FRAMES
+            }
             data.putInt(8, sequence++)
             data.putLong(12, captureNs / 1000 + latencyUs)
             var packetPeak = 0

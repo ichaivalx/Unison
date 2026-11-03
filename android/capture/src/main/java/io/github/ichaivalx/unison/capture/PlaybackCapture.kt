@@ -31,6 +31,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Looper
 
 @SuppressLint("PrivateApi", "DiscouragedPrivateApi", "SoonBlockedPrivateApi", "MissingPermission")
@@ -101,16 +102,47 @@ internal class PlaybackCapture {
         val result = register.invoke(null, builtPolicy) as Int
         check(result == 0) { "registerAudioPolicy returned $result" }
         registered = true
-        val record = policyClass.getMethod("createAudioRecordSink", mixClass).invoke(builtPolicy, mix) as AudioRecord?
+        val record = createMinimumRecord(builtPolicy, mix, mixClass, format)
         recorder = record
         check(record != null && record.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord sink is not initialized" }
         record.startRecording()
         check(record.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "AudioRecord did not start recording" }
     }
 
+    private fun createMinimumRecord(builtPolicy: Any, mix: Any, mixClass: Class<*>, format: AudioFormat): AudioRecord? {
+        var candidate: AudioRecord? = null
+        try {
+            // 与系统 createAudioRecordSink 使用同样的路由标签，只把请求容量减到一帧。
+            val attributes = AudioAttributes.Builder()
+            AudioAttributes.Builder::class.java.getMethod("setInternalCapturePreset", Int::class.javaPrimitiveType)
+                .invoke(attributes, MediaRecorder.AudioSource::class.java.getField("REMOTE_SUBMIX").getInt(null))
+            val address = policyClass.getDeclaredMethod("addressForTag", mixClass).apply { isAccessible = true }
+                .invoke(null, mix) as String
+            val addTag = AudioAttributes.Builder::class.java.getMethod("addTag", String::class.java)
+            addTag.invoke(attributes, address)
+            addTag.invoke(attributes, AudioRecord::class.java.getField("SUBMIX_FIXED_VOLUME").get(null) as String)
+            val inputFormat = AudioFormat.Builder(format).setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build()
+            val frameBytes = inputFormat.channelCount * 2
+            candidate = AudioRecord::class.java.getConstructor(AudioAttributes::class.java, AudioFormat::class.java,
+                Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                .newInstance(attributes.build(), inputFormat, frameBytes, 0)
+            check(candidate.state == AudioRecord.STATE_INITIALIZED) { "One-frame AudioRecord is not initialized" }
+            println("INFO audio_record_buffer requested_frames=1 actual_frames=${candidate.bufferSizeInFrames}")
+            return candidate
+        } catch (error: Exception) {
+            runCatching { candidate?.release() }
+            println("INFO audio_record_buffer requested_frames=1 rejected=${error.cause ?: error} fallback=policy_minimum")
+            return policyClass.getMethod("createAudioRecordSink", mixClass).invoke(builtPolicy, mix) as AudioRecord?
+        }
+    }
+
     fun close(): Boolean {
         var unregistered = !registered
         try {
+            // 手动创建的同路由 AudioRecord 不在 policy 的 captors 列表中，需显式停止。
+            runCatching {
+                recorder?.let { if (it.recordingState == AudioRecord.RECORDSTATE_RECORDING) it.stop() }
+            }.onFailure { println("ERROR stop_audio_record=$it") }
             if (registered) {
                 try {
                     unregister.invoke(manager, policy)
