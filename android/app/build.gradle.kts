@@ -22,6 +22,7 @@ android {
             storeType = "PKCS12"
         }
     }
+    packaging { jniLibs { useLegacyPackaging = true } }
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")

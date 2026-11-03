@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(unison_android LANGUAGES CXX)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../../../core" "${CMAKE_CURRENT_BINARY_DIR}/core")
 add_library(unison SHARED receiver_android.cpp)
 target_compile_features(unison PRIVATE cxx_std_17)
+target_link_libraries(unison PRIVATE unison-core aaudio)

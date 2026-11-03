@@ -1,0 +1,148 @@
+package io.github.ichaivalx.unison
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
+import io.github.ichaivalx.unison.capture.SourceController
+import java.util.concurrent.Executors
+
+class PlaybackService : Service() {
+    companion object {
+        const val RECEIVE_START = "receive.start"
+        const val RECEIVE_STOP = "receive.stop"
+        const val SOURCE_START = "source.start"
+        const val SOURCE_STOP = "source.stop"
+        const val LATENCY = "source.latency"
+        const val STOP_ALL = "stop.all"
+        @Volatile var receiverRunning = false
+        @Volatile var busy = false
+        @Volatile var active = false
+        @Volatile var offsetMs = 0f
+        @Volatile var latencyMs = 50
+        @Volatile var message = ""
+        private val lines = ArrayDeque<String>()
+        private fun log(line: String) = synchronized(lines) {
+            lines.addLast(line)
+            while (lines.size > 20) lines.removeFirst()
+        }
+        fun sourceLog(): String = synchronized(lines) { lines.joinToString("\n") }
+    }
+
+    private val worker = Executors.newSingleThreadExecutor()
+    private val main = Handler(Looper.getMainLooper())
+    private lateinit var wifiLock: WifiManager.WifiLock
+    private lateinit var multicastLock: WifiManager.MulticastLock
+    private lateinit var wakeLock: PowerManager.WakeLock
+    private lateinit var audioManager: AudioManager
+    @Volatile private var destroyed = false
+    private val devices = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+            if (receiverRunning) ReceiverEngine.routeChanged()
+        }
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+            if (receiverRunning) ReceiverEngine.routeChanged()
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        active = true
+        val notifications = getSystemService(NotificationManager::class.java)
+        notifications.createNotificationChannel(NotificationChannel("playback", "Unison 音频", NotificationManager.IMPORTANCE_LOW))
+        startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        val wifi = applicationContext.getSystemService(WifiManager::class.java)
+        wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "Unison:audio")
+        multicastLock = wifi.createMulticastLock("Unison:discovery")
+        wakeLock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Unison:audio")
+        wifiLock.acquire()
+        multicastLock.acquire()
+        wakeLock.acquire()
+        audioManager = getSystemService(AudioManager::class.java)
+        audioManager.registerAudioDeviceCallback(devices, main)
+    }
+
+    private fun notification(): Notification {
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val stop = PendingIntent.getService(this, 1, Intent(this, PlaybackService::class.java).setAction(STOP_ALL), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return Notification.Builder(this, "playback")
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("Unison 正在运行")
+            .setContentText("接收：${if (receiverRunning) "运行中" else "停止"}  音源：${if (SourceController.isRunning) "运行中" else "停止"}")
+            .setContentIntent(open)
+            .setOngoing(true)
+            .addAction(Notification.Action.Builder(null, "全部停止", stop).build())
+            .build()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action
+        busy = true
+        worker.execute {
+            if (!destroyed) {
+                try {
+                    when (action) {
+                        RECEIVE_START -> {
+                            ReceiverEngine.setOffsetMs(offsetMs)
+                            receiverRunning = ReceiverEngine.start()
+                            message = if (receiverRunning) "" else "接收端启动失败（网络端口或输出设备不可用）"
+                        }
+                        RECEIVE_STOP -> { ReceiverEngine.stop(); receiverRunning = false }
+                        SOURCE_START -> {
+                            val started = SourceController.start(applicationContext, latencyMs, ::log)
+                            message = if (started) "" else "音源启动失败，请检查 root 授权与下方输出"
+                        }
+                        SOURCE_STOP -> SourceController.stop()
+                        LATENCY -> SourceController.setLatency(latencyMs)
+                        STOP_ALL -> {
+                            SourceController.stop()
+                            ReceiverEngine.stop()
+                            receiverRunning = false
+                        }
+                    }
+                } catch (error: Exception) {
+                    message = error.message ?: error.toString()
+                    log(message)
+                }
+            }
+            main.post {
+                busy = false
+                if (!destroyed) {
+                    getSystemService(NotificationManager::class.java).notify(1, notification())
+                    if (!receiverRunning && !SourceController.isRunning) stopSelfResult(startId)
+                }
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        destroyed = true
+        active = false
+        audioManager.unregisterAudioDeviceCallback(devices)
+        worker.execute {
+            SourceController.stop()
+            ReceiverEngine.stop()
+            receiverRunning = false
+            busy = false
+        }
+        worker.shutdown()
+        if (wifiLock.isHeld) wifiLock.release()
+        if (multicastLock.isHeld) multicastLock.release()
+        if (wakeLock.isHeld) wakeLock.release()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+}
