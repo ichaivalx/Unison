@@ -29,6 +29,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 std::atomic<bool> running{true};
+std::atomic<uint64_t> outputRebuilds{0};
 std::mutex statusMutex;
 std::string outputStatus = "正在打开输出";
 
@@ -101,6 +102,9 @@ struct AudioOutput {
     UINT32 capacity = 0;
     UINT64 frequency = 0;
     UINT64 written = 0;
+    bool inflightReady = false;
+    double inflightBaseline = 0;
+    int64_t lastInflightUs = 0;
     REFERENCE_TIME latency = 0;
     bool floating = false;
     int validBits = 0;
@@ -200,20 +204,38 @@ struct AudioOutput {
     }
 
     HRESULT fill(unison::Receiver& receiver) {
+        constexpr int64_t kInflightDropUs = 1'000;
+        int64_t queryStartedUs = unison::monotonicUs();
         UINT32 padding = 0;
         HRESULT hr = client->GetCurrentPadding(&padding);
         if (FAILED(hr)) return hr;
         UINT32 frames = capacity - padding;
-        if (!frames) return S_OK;
         UINT64 position = 0, qpc100ns = 0;
         bool real = clock->GetPosition(&position, &qpc100ns) == S_OK && frequency != 0 && position != 0;
+        int64_t queriedUs = unison::monotonicUs();
         int64_t firstFrameUs;
         if (real) {
             double playedFrames = static_cast<double>(position) * format->nSamplesPerSec / frequency;
+            double inflight = static_cast<double>(written) - playedFrames - padding;
+            double dropFrames = format->nSamplesPerSec * (kInflightDropUs / 1e6);
+            // 两次查询未原子配对；采样本身停顿过久时留待下一次检测。
+            bool paired = queriedUs - queryStartedUs < kInflightDropUs;
             // padding 不包含引擎到硬件的在途帧；欠载后重建流，不能据此修补帧零点。
-            if (playedFrames > written) {
+            if (playedFrames > written ||
+                (paired && inflightReady && inflightBaseline - inflight > dropFrames)) {
                 receiver.addXruns(1);
                 return AUDCLNT_E_BUFFER_ERROR;
+            }
+            if (paired) {
+                if (!inflightReady && playedFrames >= capacity) {
+                    // 预填充缓冲已经发声，管线进入稳态后建立基线。
+                    inflightBaseline = inflight;
+                    inflightReady = true;
+                } else if (inflightReady && inflight > inflightBaseline) {
+                    double follow = 1.0 - std::exp(-(queriedUs - lastInflightUs) / 1e6);
+                    inflightBaseline += follow * (inflight - inflightBaseline);
+                }
+                lastInflightUs = queriedUs;
             }
             firstFrameUs = static_cast<int64_t>(qpc100ns / 10.0 +
                 (static_cast<double>(written) / format->nSamplesPerSec - static_cast<double>(position) / frequency) * 1e6);
@@ -221,6 +243,7 @@ struct AudioOutput {
             firstFrameUs = unison::monotonicUs() + latency / 10 +
                 static_cast<int64_t>(padding * 1e6 / format->nSamplesPerSec);
         }
+        if (!frames) return S_OK;
         BYTE* target = nullptr;
         if (FAILED(hr = renderer->GetBuffer(frames, &target))) return hr;
         receiver.render(stereo.data(), static_cast<int>(frames), static_cast<int>(format->nSamplesPerSec), firstFrameUs, real);
@@ -236,12 +259,15 @@ void audioThread(unison::Receiver& receiver, const std::wstring& id) {
     if (FAILED(initialized)) { setStatus("COM 初始化失败 " + errorText(initialized)); return; }
     DWORD taskIndex = 0;
     HANDLE priority = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    bool opened = false;
     while (running.load()) {
         bool underrun = false;
         {
             AudioOutput output;
             HRESULT hr = output.open(id);
             if (SUCCEEDED(hr)) {
+                if (opened) outputRebuilds.fetch_add(1);
+                opened = true;
                 receiver.resetOutputTiming();
                 while (running.load()) {
                     DWORD signaled = WaitForSingleObject(output.event, 100);
@@ -329,7 +355,7 @@ int run(int argc, wchar_t** argv) {
         }
         int64_t now = unison::monotonicUs();
         if (now - lastStatus >= 1'000'000) {
-            std::string line = receiver.statsLine() + " | " + status();
+            std::string line = "rebuild=" + std::to_string(outputRebuilds.load()) + " " + receiver.statsLine() + " | " + status();
             CONSOLE_SCREEN_BUFFER_INFO screen{};
             if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &screen)) {
                 size_t width = static_cast<size_t>(screen.srWindow.Right - screen.srWindow.Left);

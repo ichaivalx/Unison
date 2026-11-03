@@ -166,7 +166,13 @@ class PlaybackService : Service() {
             child = ProcessBuilder("su", "-c", "cmd wifi force-low-latency-mode $mode")
                 .redirectErrorStream(true).start()
             child.outputStream.close()
-            if (child.waitFor(30, TimeUnit.SECONDS) && child.exitValue() == 0) {
+            val completed = child.waitFor(30, TimeUnit.SECONDS)
+            val output = if (completed) child.inputStream.bufferedReader().use { it.readText() } else ""
+            // cmd wifi 底层失败时仍可能返回 0，启用与关闭都检查输出。
+            val failed = listOf("fail", "error", "denied", "not permitted", "not found",
+                "not supported", "unknown command", "失败", "错误", "拒绝")
+                .any { output.contains(it, ignoreCase = true) }
+            if (completed && child.exitValue() == 0 && !failed) {
                 wifiForce = if (enabled) "on" else "off"
                 wifiForceAttempted = enabled
             } else {
