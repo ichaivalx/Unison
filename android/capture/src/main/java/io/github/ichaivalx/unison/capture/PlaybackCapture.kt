@@ -99,7 +99,7 @@ internal class PlaybackCapture {
         val register = AudioManager::class.java.getDeclaredMethod("registerAudioPolicyStatic", policyClass)
         register.isAccessible = true
         val result = register.invoke(null, builtPolicy) as Int
-        check(result == AudioManager.SUCCESS) { "registerAudioPolicy returned $result" }
+        check(result == 0) { "registerAudioPolicy returned $result" }
         registered = true
         val record = policyClass.getMethod("createAudioRecordSink", mixClass).invoke(builtPolicy, mix) as AudioRecord?
         recorder = record

@@ -74,10 +74,13 @@ object CaptureMain {
             check(Process.myUid() == 0) { "CaptureMain must be run as root (uid=${Process.myUid()})" }
             stage = "signal_handler"
             val apk = System.getProperty("java.class.path")!!.substringBefore(File.pathSeparator)
+            val extractedLibrary = File(File(apk).parentFile, "lib/arm64/libunison_capture.so")
             val library = System.getProperty("unison.capture.library")
+                ?: extractedLibrary.takeIf { it.isFile }?.absolutePath
                 ?: "$apk!/lib/${Build.SUPPORTED_ABIS.first()}/libunison_capture.so"
             System.load(library)
-            check(installTerminationHandler() == 0) { "Cannot install SIGTERM handler" }
+            val signalStatus = installTerminationHandler()
+            check(signalStatus == 0) { "Cannot install SIGTERM handler: errno=${-signalStatus}" }
             Runtime.getRuntime().addShutdownHook(Thread({ close("shutdown") }, "source-shutdown"))
             println("PROCESS pid=${Process.myPid()}")
             thread(name = "source-signal", isDaemon = true) {
