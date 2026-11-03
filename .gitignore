@@ -1,0 +1,10 @@
+.gradle/
+build/
+.cxx/
+local.properties
+*.iml
+.idea/
+out/
+.vs/
+CMakeFiles/
+CMakeCache.txt
