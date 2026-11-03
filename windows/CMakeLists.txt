@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.22)
+cmake_policy(SET CMP0091 NEW)
+project(unison_windows LANGUAGES CXX)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_executable(unison-receiver main.cpp)
+target_compile_features(unison-receiver PRIVATE cxx_std_17)
