@@ -5,14 +5,14 @@ import android.media.AudioTimestamp
 import android.os.Build
 import android.os.Process
 import java.io.File
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
-import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.DatagramChannel
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -35,6 +35,7 @@ object CaptureMain {
     private val subscribers = ConcurrentHashMap<InetSocketAddress, Long>()
     private val packetCount = AtomicLong()
     private val sendCount = AtomicLong()
+    private val droppedCount = AtomicLong()
     private val errorCount = AtomicLong()
     private val peak = AtomicInteger()
     @Volatile private var running = true
@@ -43,7 +44,7 @@ object CaptureMain {
     @Volatile private var lastError = "none"
     @Volatile private var stage = "arguments"
     private var closed = false
-    private var socket: DatagramSocket? = null
+    private var channel: DatagramChannel? = null
     private var capture: PlaybackCapture? = null
 
     @JvmStatic private external fun installTerminationHandler(): Int
@@ -98,9 +99,9 @@ object CaptureMain {
             synchronized(lifecycle) {
                 if (closed) return
                 stage = "udp_bind"
-                socket = DatagramSocket(null).apply {
-                    broadcast = true
-                    soTimeout = 250
+                channel = DatagramChannel.open().apply {
+                    configureBlocking(false)
+                    socket().broadcast = true
                     bind(InetSocketAddress(SOURCE_PORT))
                 }
                 stage = "audio_policy"
@@ -108,13 +109,13 @@ object CaptureMain {
                 capture = playback
                 playback.start(appUid, mode == "dup")
             }
-            val udp = checkNotNull(socket)
+            val udp = checkNotNull(channel)
             val record = checkNotNull(capture?.recorder)
             val nameBytes = name.toByteArray(Charsets.UTF_8)
             require(nameBytes.size <= 65535) { "Device name does not fit protocol nameLen" }
             val beacon = message(1, 4 + nameBytes.size).apply {
                 putShort(SOURCE_PORT.toShort()).putShort(nameBytes.size.toShort()).put(nameBytes)
-            }.array()
+            }
             thread(name = "source-control", isDaemon = true) {
                 try {
                     receiveControl(udp)
@@ -131,7 +132,8 @@ object CaptureMain {
                         }
                         broadcast(udp, beacon)
                         println("STATUS subscribers=${subscribers.size} packets/s=${packetCount.getAndSet(0)} " +
-                            "sent/s=${sendCount.getAndSet(0)} timestamp=$timestampSource latency_us=$latencyUs " +
+                            "sent/s=${sendCount.getAndSet(0)} dropped=${droppedCount.get()} " +
+                            "timestamp=$timestampSource latency_us=$latencyUs " +
                             "peak=${peak.getAndSet(0)} errors=${errorCount.get()} last_error=$lastError")
                         Thread.sleep(1000)
                     }
@@ -156,17 +158,17 @@ object CaptureMain {
         exitProcess(exitCode)
     }
 
-    private fun captureAudio(record: AudioRecord, udp: DatagramSocket) {
+    private fun captureAudio(record: AudioRecord, udp: DatagramChannel) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val data = message(5, 20 + PCM_BYTES)
         data.position(20)
         data.putInt(SAMPLE_RATE).put(2.toByte()).put(1.toByte()).putShort(FRAMES.toShort())
         val bytes = data.array()
-        val datagram = DatagramPacket(bytes, bytes.size)
         val timestamp = AudioTimestamp()
         var firstFrame = 0L
         var sequence = 0
         var originNs: Long? = null
+        var calibrated = false
         var lastTimestampFrame = -1L
         while (running) {
             var read = 0
@@ -179,23 +181,25 @@ object CaptureMain {
             if (!running) return
             val readNs = System.nanoTime()
             val result = record.getTimestamp(timestamp, AudioTimestamp.TIMEBASE_MONOTONIC)
-            val captureNs: Long
             if (result == AudioRecord.SUCCESS && timestamp.nanoTime > 0 && timestamp.framePosition > 0) {
                 val measuredOrigin = timestamp.nanoTime - framesToNs(timestamp.framePosition)
                 // 平滑帧零点，保持每包严格按 240 帧前进；同一硬件时标不重复加权。
-                if (originNs == null) originNs = measuredOrigin
-                else if (timestamp.framePosition != lastTimestampFrame) originNs += (measuredOrigin - originNs) / 16
+                if (!calibrated) {
+                    originNs = measuredOrigin
+                    calibrated = true
+                } else if (timestamp.framePosition != lastTimestampFrame) {
+                    val previousOrigin = checkNotNull(originNs)
+                    originNs = previousOrigin + (measuredOrigin - previousOrigin) / 16
+                }
                 lastTimestampFrame = timestamp.framePosition
-                captureNs = originNs + framesToNs(firstFrame)
                 timestampSource = "monotonic"
             } else {
-                // 优先用最近校准的帧零点估计排队时长；启动时只能用缓冲容量估算。
-                val bufferedNs = originNs?.let { readNs - it - framesToNs(firstFrame) }
-                    ?: framesToNs(record.bufferSizeInFrames.toLong())
-                captureNs = readNs - bufferedNs
-                val estimate = if (originNs == null) "buffer-estimate" else "last-calibration"
+                // 首次读取仅锚定一次，之后按帧数推进，不把缓冲容量当成排队时长。
+                if (originNs == null) originNs = readNs - framesToNs(firstFrame + FRAMES)
+                val estimate = if (calibrated) "last-calibration" else "frame-anchor"
                 timestampSource = "read-fallback($result,$estimate)"
             }
+            val captureNs = checkNotNull(originNs) + framesToNs(firstFrame)
             data.putInt(8, sequence++)
             data.putLong(12, captureNs / 1000 + latencyUs)
             var packetPeak = 0
@@ -209,36 +213,27 @@ object CaptureMain {
                     subscribers.remove(subscriber, subscribedNs)
                     continue
                 }
-                datagram.socketAddress = subscriber
-                try {
-                    udp.send(datagram)
-                    sendCount.incrementAndGet()
-                } catch (error: Exception) {
-                    if (running) reportError("audio_send=${describe(error)}")
-                }
+                if (send(udp, data, subscriber, "audio_send")) sendCount.incrementAndGet()
             }
             packetCount.incrementAndGet()
             firstFrame += FRAMES
         }
     }
 
-    private fun receiveControl(udp: DatagramSocket) {
-        val bytes = ByteArray(65507)
-        val packet = DatagramPacket(bytes, bytes.size)
+    private fun receiveControl(udp: DatagramChannel) = Selector.open().use { selector ->
+        udp.register(selector, SelectionKey.OP_READ)
+        val data = ByteBuffer.allocate(65507).order(ByteOrder.LITTLE_ENDIAN)
         while (running) {
-            packet.length = bytes.size
-            try {
-                udp.receive(packet)
-            } catch (_: SocketTimeoutException) {
-                continue
-            }
+            if (selector.select(250) == 0) continue
+            selector.selectedKeys().clear()
+            data.clear()
+            val sender = udp.receive(data) as InetSocketAddress? ?: continue
             val receivedUs = System.nanoTime() / 1000
-            if (packet.length < 8) continue
-            val data = ByteBuffer.wrap(bytes, 0, packet.length).order(ByteOrder.LITTLE_ENDIAN)
+            data.flip()
+            if (data.remaining() < 8) continue
             if (data.int != MAGIC || data.get().toInt() != 1) continue
             val type = data.get().toInt()
             data.short
-            val sender = packet.socketAddress as InetSocketAddress
             when (type) {
                 2 -> {
                     if (data.remaining() < 10) continue
@@ -252,20 +247,16 @@ object CaptureMain {
                     val t1 = data.long
                     val pong = message(4, 28).apply {
                         putInt(pingId).putLong(t1).putLong(receivedUs).putLong(System.nanoTime() / 1000)
-                    }.array()
-                    try {
-                        udp.send(DatagramPacket(pong, pong.size, sender))
-                    } catch (error: Exception) {
-                        if (running) reportError("pong_send=${describe(error)}")
                     }
+                    send(udp, pong, sender, "pong_send")
                 }
                 6 -> subscribers.remove(sender)
-                7 -> if (packet.address.hostAddress == "127.0.0.1" && data.remaining() >= 4) latencyUs = data.int
+                7 -> if (sender.address.hostAddress == "127.0.0.1" && data.remaining() >= 4) latencyUs = data.int
             }
         }
     }
 
-    private fun broadcast(udp: DatagramSocket, beacon: ByteArray) {
+    private fun broadcast(udp: DatagramChannel, beacon: ByteBuffer) {
         val addresses = linkedSetOf(InetAddress.getByName("255.255.255.255"))
         try {
             val interfaces = NetworkInterface.getNetworkInterfaces()
@@ -280,12 +271,20 @@ object CaptureMain {
             if (running) reportError("broadcast_interfaces=${describe(error)}")
         }
         for (address in addresses) {
-            try {
-                udp.send(DatagramPacket(beacon, beacon.size, address, BEACON_PORT))
-            } catch (error: Exception) {
-                if (running) reportError("beacon_send=${describe(error)}")
-            }
+            send(udp, beacon, InetSocketAddress(address, BEACON_PORT), "beacon_send")
         }
+    }
+
+    private fun send(udp: DatagramChannel, data: ByteBuffer, destination: InetSocketAddress, operation: String): Boolean {
+        try {
+            data.rewind()
+            // 非阻塞 send 返回 0 时直接丢包，不等待发送缓冲腾出空间。
+            if (udp.send(data, destination) == data.limit()) return true
+        } catch (error: Exception) {
+            if (running) reportError("$operation=${describe(error)}")
+        }
+        if (running) droppedCount.incrementAndGet()
+        return false
     }
 
     private fun close(reason: String) = synchronized(lifecycle) {
@@ -294,10 +293,10 @@ object CaptureMain {
         running = false
         // 先恢复本机路由，再关闭网络；不依赖阻塞中的录音线程主动返回。
         val restored = capture?.close() ?: true
-        socket?.let { udp ->
-            val bye = message(6, 0).array()
+        channel?.let { udp ->
+            val bye = message(6, 0)
             for (subscriber in subscribers.keys) {
-                runCatching { udp.send(DatagramPacket(bye, bye.size, subscriber)) }
+                send(udp, bye, subscriber, "bye_send")
             }
             udp.close()
         }
@@ -322,7 +321,8 @@ object CaptureMain {
         return "${cause.javaClass.simpleName}:${cause.message}"
     }
 
-    private fun framesToNs(frames: Long) = frames * 1_000_000_000L / SAMPLE_RATE
+    private fun framesToNs(frames: Long) = frames / SAMPLE_RATE * 1_000_000_000L +
+        frames % SAMPLE_RATE * 1_000_000_000L / SAMPLE_RATE
 
     private fun message(type: Int, payload: Int): ByteBuffer = ByteBuffer.allocate(8 + payload)
         .order(ByteOrder.LITTLE_ENDIAN).apply {
