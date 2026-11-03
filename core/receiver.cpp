@@ -331,7 +331,8 @@ struct Receiver::State {
                 }
                 left = static_cast<float>(it->second.pcm[frame * 2] * (1 - fraction) + nextLeft * fraction);
                 right = static_cast<float>(it->second.pcm[frame * 2 + 1] * (1 - fraction) + nextRight * fraction);
-                if (!accounted || static_cast<int32_t>(it->second.seq - accountedSeq) > 0) {
+                if (!accounted || it->first.first > lossBaseTime ||
+                    static_cast<int32_t>(it->second.seq - accountedSeq) > 0) {
                     accounted = true;
                     accountedSeq = lossBaseSeq = it->second.seq;
                     lossBaseTime = it->first.first;
