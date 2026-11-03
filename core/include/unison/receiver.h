@@ -19,6 +19,7 @@ public:
     void render(float* stereo, int frames, int deviceRate, int64_t firstFrameUs,
                 bool realTimestamp);
     std::string statsJson();
+    std::string statsLine();
 
 private:
     struct State;

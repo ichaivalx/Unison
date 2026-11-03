@@ -480,4 +480,20 @@ std::string Receiver::statsJson() {
     return out.str();
 }
 
+std::string Receiver::statsLine() {
+    auto& s = *state_;
+    std::lock_guard<std::mutex> lock(s.mutex);
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::fixed << std::setprecision(2)
+        << (s.clockReady ? "sync " : "waiting ")
+        << "err=" << s.errorUs / 1000 << "ms buf=" << s.bufferMs
+        << " rtt=" << s.minRtt / 1000
+        << " lost=" << s.lost << " late=" << s.late
+        << " ppm=" << std::setprecision(0) << s.correction * 1e6
+        << " seek=" << s.relocations << " ts=" << (s.realTimestamp ? "real" : "fallback")
+        << " offset=" << s.userOffsetUs / 1000 << "ms clk=" << std::setprecision(2) << s.clockOffset / 1000;
+    return out.str();
+}
+
 }  // namespace unison

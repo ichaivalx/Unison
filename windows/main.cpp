@@ -321,7 +321,18 @@ int run(int argc, wchar_t** argv) {
         }
         int64_t now = unison::monotonicUs();
         if (now - lastStatus >= 1'000'000) {
-            std::cout << "\r\x1b[2K" << receiver.statsJson() << " | " << status() << std::flush;
+            std::string line = receiver.statsLine() + " | " + status();
+            CONSOLE_SCREEN_BUFFER_INFO screen{};
+            if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &screen)) {
+                size_t width = static_cast<size_t>(screen.srWindow.Right - screen.srWindow.Left);
+                if (line.size() > width) {
+                    line.resize(width);
+                    // UTF-8 设备名按字节保守裁剪，保留一行且不截断字符。
+                    while (!line.empty() && (static_cast<unsigned char>(line.back()) & 0xc0) == 0x80) line.pop_back();
+                    if (!line.empty() && static_cast<unsigned char>(line.back()) >= 0xc0) line.pop_back();
+                }
+            }
+            std::cout << "\r\x1b[2K" << line << std::flush;
             lastStatus = now;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
