@@ -45,7 +45,7 @@ class AudioService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         NativeRuntime.serviceStarted()
         if (intent?.action == "exit") NativeRuntime.notificationExit()
-        else if (intent?.action == "stop-source") NativeRuntime.stopSource()
+        else if (intent?.action == "stop-source") NativeRuntime.stopSource().whenComplete { _, _ -> NativeRuntime.emit("exit", null) }
         refresh(); return START_NOT_STICKY
     }
     private fun text() = when {

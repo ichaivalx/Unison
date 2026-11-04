@@ -199,7 +199,7 @@ abstract final class UnisonNative {
   /// Windows 无需常驻服务，此调用不执行操作。
   static Future<void> setKeepAlive(bool on) => _call<void>('setKeepAlive', on);
 
-  /// Android 通知上的“退出”；不重放。原生停止音频与常驻，调用方同步接收开关并关闭控制连接。
+  /// Android 通知停止/退出请求；不重放。调用方同步启停状态，控制端还需关闭控制连接。
   static Stream<void> get exitRequests => _stream('exit').map<void>((_) {});
 
   static Future<void> startReceiver({required String sourceHost}) => _call<void>('startReceiver', {'sourceHost': sourceHost});
