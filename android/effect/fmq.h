@@ -13,6 +13,10 @@
 #include <linux/futex.h>
 #include <climits>
 #include <unistd.h>
+#include <android/log.h>
+#include <cerrno>
+
+extern "C" int ashmem_create_region(const char* name, size_t size);
 
 template<class T> class Fmq {
 public:
@@ -23,9 +27,21 @@ public:
         eventOffset_ = (16 + bytes_ + 7) & ~size_t(7);
         size_ = (eventOffset_ + (event ? 4 : 0) + page - 1) / page * page;
         fd_ = memfd_create("unison-fmq", MFD_CLOEXEC);
-        if (fd_ < 0 || ftruncate(fd_, size_) != 0) { if (fd_ >= 0) ::close(fd_); throw std::runtime_error("FMQ memfd"); }
+        if (fd_ < 0) {
+            __android_log_print(ANDROID_LOG_WARN, "UnisonTap", "FMQ memfd_create: %s", strerror(errno));
+        } else if (ftruncate(fd_, size_) != 0) {
+            const int failure = errno;
+            ::close(fd_); fd_ = -1;
+            __android_log_print(ANDROID_LOG_WARN, "UnisonTap", "FMQ memfd ftruncate: %s", strerror(failure));
+        }
+        if (fd_ < 0) {
+            // 使用 HAL 已在使用的 libcutils 分配器，遵循该设备 ashmem/memfd 选择。
+            fd_ = ashmem_create_region("unison-fmq", size_);
+            if (fd_ < 0) throw std::runtime_error(std::string("FMQ platform ashmem: ") + strerror(errno));
+            __android_log_print(ANDROID_LOG_INFO, "UnisonTap", "FMQ allocator=platform size=%zu", size_);
+        }
         base_ = static_cast<uint8_t*>(mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
-        if (base_ == MAP_FAILED) { ::close(fd_); base_ = nullptr; throw std::runtime_error("FMQ mmap"); }
+        if (base_ == MAP_FAILED) { const int failure = errno; ::close(fd_); base_ = nullptr; throw std::runtime_error(std::string("FMQ mmap: ") + strerror(failure)); }
         read_ = new (base_) std::atomic<uint64_t>(0);
         write_ = new (base_ + 8) std::atomic<uint64_t>(0);
         if (event) event_ = new (base_ + eventOffset_) std::atomic<uint32_t>(0);

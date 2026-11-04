@@ -76,6 +76,7 @@ assert (platform_cpp / 'config/__config_site').is_file()
 binder_map = (native / 'libs/binder/ndk/libbinder_ndk.map.txt').read_text()
 exports = re.findall(r'^\s*(A[A-Za-z0-9_]+)\s*;', binder_map, re.M)
 (BUILD / 'binder_stub.c').write_text('\n'.join(f'void {name}(void) {{ __builtin_trap(); }}' for name in exports))
+(BUILD / 'cutils_stub.c').write_text('#include <stddef.h>\nint ashmem_create_region(const char* name, size_t size) { __builtin_trap(); }\n')
 roots = [(hardware / path, version) for path, version in groups] + [(system / media_path, 4)]
 sdk = Path(os.environ['ANDROID_HOME'])
 aidls = sorted(sdk.glob('build-tools/*/aidl'), key=lambda p: tuple(int(x) for x in p.parent.name.split('.') if x.isdigit()))

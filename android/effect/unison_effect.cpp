@@ -67,6 +67,8 @@ public:
                       IEffect::OpenEffectReturn* result) override {
         std::lock_guard lock(control_);
         if (state_ != State::INIT) return error("already open");
+        __android_log_print(ANDROID_LOG_INFO, "UnisonTap", "open begin io=%d rate=%d frames=%lld",
+            common.ioHandle, common.input.base.sampleRate, static_cast<long long>(common.input.frameCount));
         try {
             if (!valid(common)) return error("requires matching float stereo input/output");
             common_ = common;
@@ -101,7 +103,10 @@ public:
     ScopedAStatus getState(State* result) override { *result = state_.load(); return ScopedAStatus::ok(); }
     ScopedAStatus command(CommandId id) override {
         std::lock_guard lock(control_);
-        if (state_ == State::INIT) return error("not open");
+        if (state_ == State::INIT) {
+            if (id == CommandId::STOP || id == CommandId::RESET) return ScopedAStatus::ok();
+            return error("not open");
+        }
         if (id == CommandId::START) {
             if (state_ == State::PROCESSING) return ScopedAStatus::ok();
             quit_ = false;
@@ -191,6 +196,10 @@ private:
         collectRetired();
     }
     ScopedAStatus parameter(const Parameter& param) {
+        __android_log_print(ANDROID_LOG_DEBUG, "UnisonTap", "setParameter tag=%d state=%d",
+            static_cast<int>(param.getTag()), static_cast<int>(state_.load()));
+        // 设备/模式/音量等 indication 可在 open 前到达，直通效果不消费它们。
+        if (param.getTag() != Parameter::common && param.getTag() != Parameter::specific) return ScopedAStatus::ok();
         if (state_ == State::INIT) return error("parameter before open");
         if (param.getTag() == Parameter::common) {
             const auto& c = param.get<Parameter::common>();
