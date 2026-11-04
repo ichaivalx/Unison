@@ -143,12 +143,9 @@ class SourceService implements Console {
     _exited = true;
     _enabled = false;
     _prefs.setBool(_enabledKey, false);
-    // 校准中退出：阻止尚未开始的测量，并在断开前把恢复后的音量发给各设备
-    if (_calibrating) {
-      _cancelled = true;
-      // 原生退出时已停止测量，取消失败不作为错误显示
-      UnisonNative.cancelCalibration().catchError((_) {});
-    }
+    // 校准中退出：原生退出已清理测量，这里只阻止尚未开始的测量，并在断开前把恢复后
+    // 的音量发给各设备
+    if (_calibrating) _cancelled = true;
     _restoreVolumes(immediate: true);
     _links.clear();
     for (final peer in _peers.values) {
