@@ -121,10 +121,33 @@ class SourceService implements Console {
   @override
   int localTimeOf(int sourceUs) => sourceUs;
 
-  /// 从后台回到前台时保持常驻，使其他控制台随时能开启音源
+  /// 从后台回到前台时保持常驻，使其他控制台随时能开启音源；退出后重新开启控制面
   @override
   void wake({required bool returned}) {
-    if (returned) UnisonNative.setKeepAlive(true).catchError((_) {});
+    if (!returned) return;
+    UnisonNative.setKeepAlive(true).catchError((_) {});
+    if (_exited) {
+      _exited = false;
+      _transport = _newTransport();
+      _transport.start().then((_) => _publish(), onError: (_) {});
+    }
+  }
+
+  /// 通知上的“退出”：原生已停止音源与常驻；关闭控制面，下次启动 App 不再自动启动音源
+  Future<void> _exit() async {
+    if (_exited) return;
+    _exited = true;
+    _enabled = false;
+    _prefs.setBool(_enabledKey, false);
+    _links.clear();
+    _boosted.clear();
+    for (final peer in _peers.values) {
+      peer
+        ..connection = null
+        ..stats = null;
+    }
+    _publish();
+    await _transport.dispose();
   }
 
   final _prefs = LocalSettings.prefs;
@@ -154,11 +177,13 @@ class SourceService implements Console {
   _Snapshot? _undo;
   bool _cancelled = false;
 
-  late final _transport = SourceTransport(
-    onConnected: (_) {},
-    onMessage: _onMessage,
-    onDisconnected: _onDisconnected,
-  );
+  late SourceTransport _transport = _newTransport();
+
+  SourceTransport _newTransport() =>
+      SourceTransport(onConnected: (_) {}, onMessage: _onMessage, onDisconnected: _onDisconnected);
+
+  /// 用户从通知退出后控制面关闭，从后台回到前台时重新开启
+  bool _exited = false;
 
   /// 已发来 hello 的连接及其设备
   final Map<Connection, _Peer> _links = {};
@@ -182,6 +207,11 @@ class SourceService implements Console {
     }
     _normalize();
     UnisonNative.sourceStatus.listen((status) {
+      // 实际停止（如通知上停止音源、音源进程退出）：下次启动 App 不再自动启动
+      if (_running && !status.running && _enabled) {
+        _enabled = false;
+        _prefs.setBool(_enabledKey, false);
+      }
       _status = status;
       if (status.error != null) _error = status.error;
       _publish();
@@ -191,11 +221,7 @@ class SourceService implements Console {
       _publish();
     }, onError: (_) {});
     // 通知上的“退出”：原生已停止音源，下次启动 App 不再自动启动
-    UnisonNative.exitRequests.listen((_) {
-      _enabled = false;
-      _prefs.setBool(_enabledKey, false);
-      _publish();
-    }, onError: (_) {});
+    UnisonNative.exitRequests.listen((_) => _exit(), onError: (_) {});
     UnisonNative.volumeChanges.listen((volume) {
       _volume = volume;
       // 临时提高期间用户调整了本机音量：以调整为准，不再恢复
