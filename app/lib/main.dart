@@ -18,9 +18,7 @@ Future<void> main() async {
   await LocalSettings.init();
   final console = ValueNotifier<Console?>(null);
   runApp(UnisonApp(console: console));
-  final opened = console.value = await _open();
-  // 界面已在前台时补一次唤醒；之后由回到前台触发
-  if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) opened.wake(returned: true);
+  console.value = await _open();
 }
 
 Future<Console> _open() async {
@@ -45,7 +43,8 @@ class UnisonApp extends StatefulWidget {
 class _UnisonAppState extends State<UnisonApp> {
   late final AppLifecycleListener _lifecycle;
 
-  /// 上次进入前台后曾转入后台；只是失去焦点（inactive）不算
+  /// 尚待交付的“回到前台”唤醒：启动后或转入后台后置位，只在控制服务已就绪且处于前台
+  /// 时交付并清除；只是失去焦点（inactive）不置位
   bool _away = true;
 
   @override
@@ -55,18 +54,31 @@ class _UnisonAppState extends State<UnisonApp> {
       onStateChange: (state) {
         switch (state) {
           case AppLifecycleState.resumed:
-            widget.console.value?.wake(returned: _away);
-            _away = false;
+            _wake();
           case AppLifecycleState.hidden || AppLifecycleState.paused || AppLifecycleState.detached:
             _away = true;
           case AppLifecycleState.inactive:
         }
       },
     );
+    // 控制服务就绪时已在前台则补交付
+    widget.console.addListener(_onConsole);
+  }
+
+  void _onConsole() {
+    if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) _wake();
+  }
+
+  void _wake() {
+    final console = widget.console.value;
+    if (console == null) return;
+    console.wake(returned: _away);
+    _away = false;
   }
 
   @override
   void dispose() {
+    widget.console.removeListener(_onConsole);
     _lifecycle.dispose();
     super.dispose();
   }

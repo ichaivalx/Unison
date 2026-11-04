@@ -143,8 +143,13 @@ class SourceService implements Console {
     _exited = true;
     _enabled = false;
     _prefs.setBool(_enabledKey, false);
+    // 校准中退出：阻止尚未开始的测量，并在断开前把恢复后的音量发给各设备
+    if (_calibrating) {
+      _cancelled = true;
+      _guard(UnisonNative.cancelCalibration);
+    }
+    _restoreVolumes(immediate: true);
     _links.clear();
-    _boosted.clear();
     for (final peer in _peers.values) {
       peer
         ..connection = null
@@ -212,7 +217,7 @@ class SourceService implements Console {
     _normalize();
     UnisonNative.sourceStatus.listen((status) {
       // 实际停止（如通知上停止音源、音源进程退出）：下次启动 App 不再自动启动
-      if (_running && !status.running && _enabled) {
+      if (_running && !status.running && _enabled && !_starting) {
         _enabled = false;
         _prefs.setBool(_enabledKey, false);
       }
@@ -273,10 +278,19 @@ class SourceService implements Console {
     }
   }
 
-  Future<void> _startSource() => _guard(() async {
-    _error = null;
-    await UnisonNative.startSource(latencyUs: _latencyUs, localDelayUs: _localDelayUs);
-  });
+  /// 正在启动音源
+  bool _starting = false;
+
+  /// 已在运行或正在启动时不再重建，避免旧会话的停止被当成关闭
+  Future<void> _startSource() async {
+    if (_running || _starting) return;
+    _starting = true;
+    await _guard(() async {
+      _error = null;
+      await UnisonNative.startSource(latencyUs: _latencyUs, localDelayUs: _localDelayUs);
+    });
+    _starting = false;
+  }
 
   // ---- 控制连接 ----
 
@@ -584,13 +598,13 @@ class SourceService implements Console {
   }
 
   /// 恢复临时提高的音量；期间调整过的设备已不在其中
-  void _restoreVolumes() {
+  void _restoreVolumes({bool immediate = false}) {
     _boosted.clear();
     if (_boostedFrom case final volume?) {
       _boostedFrom = null;
       _setLocalVolume(volume);
     }
-    _publish();
+    _publish(immediate: immediate);
   }
 
   String _localGapsNote() {
