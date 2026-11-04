@@ -21,6 +21,8 @@ object CaptureMain {
     @JvmStatic private external fun installTerminationHandler(): Int
     @JvmStatic private external fun waitForTermination(): Int
     @Volatile private var source: SourceSession? = null
+    private val sourceLifecycle = Any()
+    private val sourceEvents = Any()
     private var media: RootMedia? = null
     private var latencyUs = 50_000L
     private var delayUs = 0L
@@ -45,22 +47,24 @@ object CaptureMain {
                     val data = request.optJSONObject("args") ?: JSONObject()
                     val value: Any? = when (request.getString("method")) {
                         "available" -> available()
-                        "startSource" -> {
+                        "startSource" -> synchronized(sourceLifecycle) {
                             check(available()) { "Unison effect module is not active or has a different version" }
-                            source?.close(); latencyUs = data.getLong("latencyUs"); delayUs = data.getLong("localDelayUs")
+                            closeSource(); latencyUs = data.getLong("latencyUs"); delayUs = data.getLong("localDelayUs")
                             check(delayUs >= 0)
-                            val session = SourceSession(excludeUid, latencyUs, delayUs) { exitProcess(1) }
-                            source = session; session.start(); null
+                            val session = SourceSession(excludeUid, latencyUs, delayUs) { failed, _ -> if (source === failed) exitProcess(1) }
+                            synchronized(sourceEvents) { source = session }
+                            try { session.start() } catch (error: Throwable) { closeSource(); throw error }
+                            null
                         }
-                        "stopSource" -> { source?.close(); source = null; RootEvents.emit("source", stopped()); null }
-                        "setSourceLatencyUs" -> { val value = data.getLong("value"); source?.setLatency(value); latencyUs = value; if (source == null) RootEvents.emit("source", stopped()); null }
-                        "setLocalDelayUs" -> { val value = data.getLong("value"); check(value >= 0); source?.setDelay(value); delayUs = value; if (source == null) RootEvents.emit("source", stopped()); null }
+                        "stopSource" -> { closeSource(); publishStopped(); null }
+                        "setSourceLatencyUs" -> { val value = data.getLong("value"); source?.setLatency(value); latencyUs = value; publishStopped(); null }
+                        "setLocalDelayUs" -> { val value = data.getLong("value"); check(value >= 0); source?.setDelay(value); delayUs = value; publishStopped(); null }
                         "calibrate" -> {
                             val session = checkNotNull(source) { "Source is not running" }
                             val ids = data.getJSONArray("receiverIds").let { array -> List(array.length()) { array.getLong(it) } }
                             val bands = data.getJSONArray("bands").let { array -> List(array.length()) { array.getString(it) } }
                             val replyId = id
-                            session.calibrate(ids, bands, { RootEvents.emit("calibration", it) }, { result, error -> RootEvents.reply(replyId, result, error) })
+                            session.calibrate(ids, bands, { publish(session, "calibration", it) }, { result, error -> RootEvents.reply(replyId, result, error) })
                             return@forEachLine
                         }
                         "cancelCalibration" -> { source?.cancelCalibration(); null }
@@ -73,6 +77,7 @@ object CaptureMain {
                 } catch (error: Throwable) { RootEvents.reply(id, error = error) }
             }
         } catch (error: Throwable) {
+            closeSource()
             RootEvents.emit("source", stopped().put("error", error.message))
         } finally { shutdown() }
         exitProcess(0)
@@ -82,5 +87,14 @@ object CaptureMain {
     } == true
     private fun stopped() = JSONObject().put("running", false).put("latencyUs", latencyUs).put("localDelayUs", delayUs)
         .put("sessions", org.json.JSONArray()).put("receiverIds", org.json.JSONArray()).put("error", JSONObject.NULL)
-    private fun shutdown() { source?.close(); source = null; media?.close() }
+    internal fun publish(session: SourceSession, type: String, value: JSONObject) = synchronized(sourceEvents) {
+        // 快照在调用处构造，不能在持有发布锁时再获取音效锁。
+        if (source === session) RootEvents.emit(type, value)
+    }
+    private fun publishStopped() = synchronized(sourceEvents) { if (source == null) RootEvents.emit("source", stopped()) }
+    private fun closeSource() = synchronized(sourceLifecycle) {
+        val previous = synchronized(sourceEvents) { source.also { source = null } }
+        previous?.close()
+    }
+    private fun shutdown() { closeSource(); media?.close() }
 }

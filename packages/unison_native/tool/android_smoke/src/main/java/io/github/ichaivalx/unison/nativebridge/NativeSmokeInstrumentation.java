@@ -104,6 +104,13 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             if (playingNotification.actions.length != 2 || !"停止音源".contentEquals(playingNotification.actions[0].title) || !"退出".contentEquals(playingNotification.actions[1].title)) throw new IllegalStateException("Source notification actions mismatch");
             java.lang.reflect.Field rootField = Class.forName("io.github.ichaivalx.unison.capture.SourceController", true, loader).getDeclaredField("process");
             rootField.setAccessible(true); Process rootProcess = (Process)rootField.get(null);
+            for (int restart = 0; restart < 3; ++restart) {
+                await(call("stopSource", new Class<?>[]{}));
+                await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250)));
+            }
+            Thread.sleep(1200);
+            if (!((JSONObject)call("getSource", new Class<?>[]{})).optBoolean("running") || service() != holder || rootField.get(null) != rootProcess) throw new IllegalStateException("Old session overwrote restarted source status");
+            result.putBoolean("immediateSourceRestart", true);
             context.startService(new Intent(context, serviceClass).setAction("stop-source"));
             deadline = System.nanoTime() + 5_000_000_000L;
             while (((JSONObject)call("getSource", new Class<?>[]{})).optBoolean("running") && System.nanoTime() < deadline) Thread.sleep(50);

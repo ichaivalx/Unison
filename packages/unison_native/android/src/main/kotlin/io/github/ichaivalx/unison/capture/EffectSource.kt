@@ -262,5 +262,6 @@ internal class EffectSource {
         factory = null
         closeTap(socket)
         socket = -1
+        joinThread(healthThread); joinThread(callbacks)
     }
 }

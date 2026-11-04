@@ -63,6 +63,7 @@ internal class AcousticCalibration(
     @Volatile var sessionId: Int? = null
         private set
     @Volatile private var cancelled = false
+    private var cancelRequested = false
     @Volatile private var window: Window? = null
     @Volatile private var micOriginNs: Long? = null
     @Volatile private var micReadFrames = 0L
@@ -159,6 +160,7 @@ internal class AcousticCalibration(
                             }
                             val reference = detect(tap, sine, cosine, false, band.lookback, band.ratio)
                             val found = detect(mic, sine, cosine, true, band.lookback, band.ratio)
+                            check(!cancelled) { "校准已停止" }
                             if (!current.gap && reference != null && found != null && reference[1] >= 8 &&
                                 reference[2] >= 0.1 && found[1] >= 8 && found[2] >= 0.1) {
                                 val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
@@ -180,11 +182,17 @@ internal class AcousticCalibration(
                 if (receiver == null) { for (i in 0 until valuesForDevice.length()) local.put(valuesForDevice.get(i)) }
                 else remote.put(receiver.toString(), valuesForDevice)
             }
+            check(!cancelled) { "校准已停止" }
             result = JSONObject().put("local", local).put("receivers", remote)
         } catch (error: Throwable) { failure = if (cancelled) InterruptedException("Calibration cancelled") else error }
         finally {
-            close(); isRunning = false
-            complete(result, failure)
+            close()
+            synchronized(control) {
+                // 包括最后一次匹配及清理期间收到的取消；成功提交与取消互斥。
+                if (cancelRequested) { result = null; failure = InterruptedException("Calibration cancelled") }
+                isRunning = false
+                complete(result, failure)
+            }
         }
     }
 
@@ -306,6 +314,16 @@ internal class AcousticCalibration(
 
     fun cancel() {
         synchronized(control) {
+            if (!isRunning) return
+            cancelRequested = true
+        }
+        stopAudio()
+    }
+
+    fun cancelAndWait() { cancel(); joinThread(worker) }
+
+    private fun stopAudio() {
+        synchronized(control) {
             cancelled = true
             window = null
             networkTarget = null
@@ -318,8 +336,8 @@ internal class AcousticCalibration(
     }
 
     private fun close() {
-        cancel()
-        runCatching { playThread?.join(1000) }; runCatching { micThread?.join(1000) }
+        stopAudio()
+        joinThread(playThread); joinThread(micThread)
         runCatching { player?.release() }; player = null
         inputEffects.forEach { runCatching { it.release() } }; inputEffects.clear()
         runCatching { recorder?.release() }; recorder = null

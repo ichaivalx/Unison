@@ -11,13 +11,20 @@ import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
+// 退出时等线程真正结束；取消标志由各自的生命周期负责。
+internal fun joinThread(thread: Thread?) {
+    if (thread == null || thread === Thread.currentThread()) return
+    while (thread.isAlive) try { thread.join() } catch (_: InterruptedException) {}
+}
+
 internal class SourceSession(private val excludeUid: Int, @Volatile var latencyUs: Long,
-    @Volatile var localDelayUs: Long, private val onFatal: (Throwable) -> Unit) {
+    @Volatile var localDelayUs: Long, private val onFatal: (SourceSession, Throwable) -> Unit) {
     private val MAGIC = 0x4E534E55
     private val SOURCE_PORT = 47800
     private val BEACON_PORT = 47801
@@ -28,6 +35,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
     private val silentPacket by lazy { message(5, 20 + PCM_BYTES) }
     private val SUBSCRIBE_TIMEOUT_NS = 5_000_000_000L
     private val lifecycle = Any()
+    private val closeFinished = CountDownLatch(1)
     private data class Subscriber(val id: Long, val lastNs: Long)
     private val subscribers = ConcurrentHashMap<InetSocketAddress, Subscriber>()
     private val packetCount = AtomicLong()
@@ -55,27 +63,29 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
     @Volatile private var running = true
     @Volatile private var lastError = "none"
     @Volatile private var fatalError: String? = null
-    private var closed = false
+    @Volatile private var closed = false
     private var channel: DatagramChannel? = null
     private var effect: EffectSource? = null
     private var captureThread: Thread? = null
+    private var controlThread: Thread? = null
+    private var statusThread: Thread? = null
     @Volatile private var calibration: AcousticCalibration? = null
 
     fun start() {
         try {
             channel = DatagramChannel.open().apply { configureBlocking(false); socket().broadcast = true; bind(InetSocketAddress(SOURCE_PORT)) }
-            effect = EffectSource().also { it.onSessionsChanged = { RootEvents.emit("source", status()) } }
+            effect = EffectSource().also { it.onSessionsChanged = { publishStatus() } }
             checkNotNull(effect).start(excludeUid, localDelayUs)
             val udp = checkNotNull(channel)
             val name = android.os.Build.MODEL.toByteArray(Charsets.UTF_8)
             val beacon = message(1, 4 + name.size).apply { putShort(SOURCE_PORT.toShort()).putShort(name.size.toShort()).put(name) }
-            thread(name = "source-control", isDaemon = true) { try { receiveControl(udp) } catch (error: Throwable) { if (running) fatal(error) } }
-            thread(name = "source-status", isDaemon = true) {
+            controlThread = thread(start = false, name = "source-control", isDaemon = true) { try { receiveControl(udp) } catch (error: Throwable) { if (running) fatal(error) } }
+            statusThread = thread(start = false, name = "source-status", isDaemon = true) {
                 try { while (running) {
                     val now = System.nanoTime()
                     for ((peer, sub) in subscribers.entries) if (now - sub.lastNs >= SUBSCRIBE_TIMEOUT_NS) subscribers.remove(peer, sub)
                     broadcast(udp, beacon)
-                    RootEvents.emit("source", status())
+                    publishStatus()
                     println("STATUS subscribers=${subscribers.size} peers=[${subscribers.keys.joinToString(",")}] latency_us=$latencyUs local_delay_us=$localDelayUs " +
                         "packets/s=${packetCount.getAndSet(0)} sent/s=${sendCount.getAndSet(0)} dropped=${droppedCount.get()} " +
                         "peak=${peak.getAndSet(0)} subscriptions/s=${subscribeCount.getAndSet(0)} errors=${errorCount.get()} " +
@@ -83,14 +93,17 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     Thread.sleep(1000)
                 } } catch (error: Throwable) { if (running) fatal(error) }
             }
-            captureThread = thread(name = "effect-capture", isDaemon = true) { try { captureEffect(checkNotNull(effect), udp) } catch (error: Throwable) { if (running) fatal(error) } }
-            RootEvents.emit("source", status())
+            captureThread = thread(start = false, name = "effect-capture", isDaemon = true) { try { captureEffect(checkNotNull(effect), udp) } catch (error: Throwable) { if (running) fatal(error) } }
+            synchronized(lifecycle) { controlThread!!.start(); statusThread!!.start(); captureThread!!.start() }
+            publishStatus()
         } catch (error: Throwable) { close("start_failed"); throw error }
     }
 
     fun status(): org.json.JSONObject = org.json.JSONObject().put("running", running && !closed)
         .put("latencyUs", latencyUs).put("localDelayUs", localDelayUs).put("sessions", effect?.sessionStatus() ?: org.json.JSONArray())
         .put("receiverIds", org.json.JSONArray(receiverIds())).put("error", fatalError ?: org.json.JSONObject.NULL)
+
+    private fun publishStatus() { CaptureMain.publish(this, "source", status()) }
 
     private fun diagnostics(): String = synchronized(diagnosticsLock) {
         fun ms(ns: Long) = ns / 1_000_000.0
@@ -106,8 +119,8 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
     }
 
     fun receiverIds(): List<Long> = subscribers.values.filter { System.nanoTime() - it.lastNs < SUBSCRIBE_TIMEOUT_NS }.map { it.id }.distinct()
-    fun setDelay(us: Long) { check(calibration?.isRunning != true) { "校准中" }; check(us >= 0); effect?.setLocalDelay(us); localDelayUs = us; RootEvents.emit("source", status()) }
-    fun setLatency(us: Long) { check(calibration?.isRunning != true) { "校准中" }; latencyUs = us; RootEvents.emit("source", status()) }
+    fun setDelay(us: Long) { check(calibration?.isRunning != true) { "校准中" }; check(us >= 0); effect?.setLocalDelay(us); localDelayUs = us; publishStatus() }
+    fun setLatency(us: Long) { check(calibration?.isRunning != true) { "校准中" }; latencyUs = us; publishStatus() }
     fun cancelCalibration() { calibration?.cancel() }
     fun calibrate(ids: List<Long>, bands: List<String>, progress: (org.json.JSONObject) -> Unit,
         complete: (org.json.JSONObject?, Throwable?) -> Unit) {
@@ -300,7 +313,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     val nameLength = data.short.toInt() and 0xffff
                     if (data.remaining() >= nameLength) {
                         val previous = subscribers.put(sender, Subscriber(receiverId, System.nanoTime()))
-                        if (previous?.id != receiverId) RootEvents.emit("source", status())
+                        if (previous?.id != receiverId) publishStatus()
                         subscribeCount.incrementAndGet()
                     }
                 }
@@ -313,7 +326,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     }
                     send(udp, pong, sender, "pong_send")
                 }
-                6 -> if (subscribers.remove(sender) != null) RootEvents.emit("source", status())
+                6 -> if (subscribers.remove(sender) != null) publishStatus()
                 7 -> if (sender.address.hostAddress == "127.0.0.1" && data.remaining() >= 4 && calibration?.isRunning != true) latencyUs = data.int.toLong()
             }
         }
@@ -350,31 +363,38 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
         return false
     }
 
-    fun close(reason: String = "stopped") = synchronized(lifecycle) {
-        if (closed) return@synchronized
-        closed = true
-        running = false
-        calibration?.cancel()
-        // 先恢复本机路由，再关闭网络；不依赖阻塞中的录音线程主动返回。
-        runCatching { effect?.close() }.onFailure { println("ERROR release_effect=${describe(it)}") }
-        channel?.let { udp ->
-            val bye = message(6, 0)
-            for (subscriber in subscribers.keys) {
-                send(udp, bye, subscriber, "bye_send")
-            }
-            udp.close()
+    fun close(reason: String = "stopped"): Boolean {
+        val first = synchronized(lifecycle) {
+            if (closed) false else { closed = true; running = false; true }
         }
-        if (Thread.currentThread() !== captureThread) runCatching { captureThread?.join(1000) }
-        RootEvents.emit("source", status())
-        println("STOPPED reason=$reason")
+        if (!first) {
+            // 工作线程不能等待正在 join 自己的关闭者；主线程须等资源全部释放。
+            if (Thread.currentThread() !in listOf(controlThread, statusThread, captureThread)) {
+                while (closeFinished.count != 0L) try { closeFinished.await() } catch (_: InterruptedException) {}
+            }
+            return false
+        }
+        try {
+            statusThread?.interrupt(); controlThread?.interrupt()
+            calibration?.cancelAndWait()
+            runCatching { effect?.close() }.onFailure { println("ERROR release_effect=${describe(it)}") }
+            channel?.let { udp ->
+                val bye = message(6, 0)
+                for (subscriber in subscribers.keys) send(udp, bye, subscriber, "bye_send")
+                udp.close()
+            }
+            joinThread(controlThread); joinThread(statusThread); joinThread(captureThread)
+            publishStatus()
+            println("STOPPED reason=$reason")
+        } finally { closeFinished.countDown() }
+        return true
     }
 
     private fun fatal(error: Throwable) {
+        if (!running) return
         lastError = describe(error)
         fatalError = lastError
-        RootEvents.emit("source", status().put("running", false))
-        close("fatal")
-        onFatal(error)
+        if (close("fatal")) onFatal(this, error)
     }
 
     private fun reportError(message: String) {
