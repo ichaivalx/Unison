@@ -12,6 +12,7 @@ import 'console.dart';
 import 'models.dart';
 import 'protocol.dart';
 import 'transport.dart';
+import 'volume.dart';
 
 /// 一台接收端：设置保存在音源上，连接期间另有运行状态
 class _Peer {
@@ -48,6 +49,9 @@ class _Peer {
   bool? reportedReceiving;
   int? reportedOffsetUs;
   double? reportedVolume;
+
+  /// 设置已生效且同步误差持续在阈值内的起始时刻
+  int? stableSince;
 
   Map<String, Object?> toJson() => {
     'name': name,
@@ -93,6 +97,12 @@ class SourceService implements Console {
 
   /// 设备回报与下发不一致时，距上次下发此时间后重发
   static const _retryUs = 2000000;
+
+  /// 校准前要求各设备同步误差持续在此范围内一段时间，超时则不校准。接收端改偏移后
+  /// 按 PI 慢慢收敛（10ms 的改动约 20 秒后仍差约 2ms），超时留足收敛到 0.3ms 的时间
+  static const _stableErrorUs = 300;
+  static const _stableHoldUs = 2000000;
+  static const _stableTimeoutUs = 60000000;
 
   /// 校准期间不能修改的时序设置
   static const _timing = {Command.latency, Command.localDelay, Command.offset, Command.bandWeight};
@@ -171,8 +181,7 @@ class SourceService implements Console {
   MediaState? _media;
   double? _volume;
 
-  /// 本机设音量后此时间内的音量变化视为自身所致
-  int _selfVolumeUntil = 0;
+  late final _volumes = VolumeSetter(onUser: _onUserVolume);
 
   /// 校准临时提高本机音量前的音量；未提高或期间已调整过时为 null
   double? _boostedFrom;
@@ -230,10 +239,12 @@ class SourceService implements Console {
     // 通知上的“退出”：原生已停止音源，下次启动 App 不再自动启动
     UnisonNative.exitRequests.listen((_) => _exit(), onError: (_) {});
     UnisonNative.volumeChanges.listen((volume) {
-      _volume = volume;
-      // 临时提高期间用户调整了本机音量：以调整为准，不再恢复
-      if (nowUs >= _selfVolumeUntil) _boostedFrom = null;
-      _publish();
+      if (_volumes.isUser(volume)) {
+        _onUserVolume(volume);
+      } else {
+        _volume = volume;
+        _publish();
+      }
     }, onError: (_) {});
     await _transport.start();
     _publish();
@@ -257,8 +268,29 @@ class SourceService implements Console {
 
   Future<void> _setLocalVolume(double volume) {
     _volume = volume;
-    _selfVolumeUntil = nowUs + 1000000;
-    return _guard(() => UnisonNative.setVolume(volume));
+    return _guard(() async => _volume = await _volumes.set(volume));
+  }
+
+  /// 用户调整了本机音量：临时提高期间以调整为准，不再恢复
+  void _onUserVolume(double volume) {
+    _volume = volume;
+    _boostedFrom = null;
+    _publish();
+  }
+
+  /// 应下发给设备的接收开关、偏移与音量
+  ({bool receive, int offset, double? volume}) _desired(_Peer peer) => (
+    receive: peer.receive,
+    offset: _effectiveOffset(peer),
+    volume: _boosted[peer.id] ?? peer.volume.target(_sourceVolume),
+  );
+
+  /// 设备回报的实际状态与应下发的一致
+  bool _synced(_Peer peer) {
+    final desired = _desired(peer);
+    return peer.reportedReceiving == desired.receive &&
+        (!desired.receive || peer.reportedOffsetUs == desired.offset) &&
+        (desired.volume == null || peer.reportedVolume == desired.volume);
   }
 
   int _effectiveOffset(_Peer peer) => peer.baseOffsetUs + bandShift(_weight, peer.gaps, _localGaps);
@@ -304,6 +336,14 @@ class SourceService implements Console {
             ..reportedReceiving = message['receiving'] == true
             ..reportedOffsetUs = (message['offsetUs'] as num?)?.toInt()
             ..reportedVolume = (message['appliedVolume'] as num?)?.toDouble();
+          final stats = peer.stats;
+          final stable =
+              _synced(peer) &&
+              stats != null &&
+              stats.running &&
+              stats.clockReady &&
+              stats.syncErrorUs.abs() <= _stableErrorUs;
+          peer.stableSince = stable ? (peer.stableSince ?? nowUs) : null;
           _publish();
         }
       case MessageType.localVolume:
@@ -347,7 +387,8 @@ class SourceService implements Console {
       ..applied = null
       ..reportedReceiving = null
       ..reportedOffsetUs = null
-      ..reportedVolume = null;
+      ..reportedVolume = null
+      ..stableSince = null;
     _links[connection] = peer;
     _savePeers();
     _publish(immediate: true);
@@ -518,8 +559,8 @@ class SourceService implements Console {
     );
     _publish(immediate: true);
     try {
-      if (_boost) await _raiseVolumes(peers.values);
-      if (_cancelled) throw const CalibrationFailure('已取消');
+      if (_boost) _raiseVolumes(peers.values);
+      await _waitStable(peers.values);
       final result = await UnisonNative.calibrate(
         receiverIds: peers.keys.toList(),
         bands: CalibrationBand.values,
@@ -533,6 +574,8 @@ class SourceService implements Console {
           _publish();
         },
       );
+      // 计算期间取消的不应用
+      if (_cancelled) throw const CalibrationFailure('已取消');
       final outcome = solveCalibration(
         effective: effective,
         local: result.local,
@@ -578,8 +621,9 @@ class SourceService implements Console {
     }
   }
 
-  /// 把本机与参与校准的设备中音量低于设定值的临时提高到该值
-  Future<void> _raiseVolumes(Iterable<_Peer> peers) async {
+  /// 把本机与参与校准的设备中音量低于设定值的临时提高到该值；各设备是否设好由
+  /// [_waitStable] 按回报确认
+  void _raiseVolumes(Iterable<_Peer> peers) {
     final level = _boostLevel;
     for (final peer in peers) {
       final actual = peer.actualVolume;
@@ -587,12 +631,36 @@ class SourceService implements Console {
     }
     if (_volume case final local? when local < level) {
       _boostedFrom = local;
-      await _setLocalVolume(level);
+      _setLocalVolume(level);
     }
-    if (_boosted.isEmpty) return;
     _publish(immediate: true);
-    // 等各设备设好音量再播放测试音
-    await Future<void>.delayed(const Duration(milliseconds: 500));
+  }
+
+  /// 等各参与设备的设置按回报生效、同步误差持续稳定；断开或超时则以失败结束
+  Future<void> _waitStable(Iterable<_Peer> peers) async {
+    final deadline = nowUs + _stableTimeoutUs;
+    _calibration = const CalibrationView(stage: CalibrationStage.running, description: '等待同步稳定');
+    _publish();
+    while (true) {
+      if (_cancelled) throw const CalibrationFailure('已取消');
+      final now = nowUs;
+      bool stable(_Peer peer) {
+        final since = peer.stableSince;
+        return since != null && now - since >= _stableHoldUs && _synced(peer);
+      }
+
+      final waiting = [for (final peer in peers) if (!stable(peer)) peer];
+      if (waiting.isEmpty) return;
+      for (final peer in waiting) {
+        if (peer.connection == null) throw CalibrationFailure('${peer.name} 已断开');
+      }
+      if (now >= deadline) {
+        throw CalibrationFailure(
+          '${waiting.map((p) => p.name).join('、')} 同步未稳定（误差需持续在 ${formatMs(_stableErrorUs)} 内）',
+        );
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
   }
 
   /// 恢复临时提高的音量；期间调整过的设备已不在其中
@@ -720,16 +788,16 @@ class SourceService implements Console {
     }
     final now = nowUs;
     for (final peer in _links.values) {
-      final receive = peer.receive;
-      final offset = _effectiveOffset(peer);
-      final volume = _boosted[peer.id] ?? peer.volume.target(_sourceVolume);
-      final apply = jsonEncode({'receive': receive, 'offsetUs': offset, 'volume': volume});
+      final desired = _desired(peer);
+      // boost：音量为校准临时提高的值，设备据此自行保存恢复用的音量
+      final apply = jsonEncode({
+        'receive': desired.receive,
+        'offsetUs': desired.offset,
+        'volume': desired.volume,
+        'boost': _boosted.containsKey(peer.id),
+      });
       // 以设备回报的实际状态为准：未生效的定期重发
-      final synced =
-          peer.reportedReceiving == receive &&
-          (!receive || peer.reportedOffsetUs == offset) &&
-          (volume == null || peer.reportedVolume == volume);
-      if (apply == peer.applied && (synced || now - peer.appliedAt < _retryUs)) continue;
+      if (apply == peer.applied && (_synced(peer) || now - peer.appliedAt < _retryUs)) continue;
       peer
         ..applied = apply
         ..appliedAt = now;

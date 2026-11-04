@@ -10,6 +10,7 @@ import 'console.dart';
 import 'models.dart';
 import 'protocol.dart';
 import 'transport.dart';
+import 'volume.dart';
 
 /// 非音源设备：连接音源作控制台，并按音源下发的设置接收音频、设置音量
 class ConsoleClient implements Console {
@@ -20,9 +21,6 @@ class ConsoleClient implements Console {
     await client._start();
     return client;
   }
-
-  /// 本机设音量后此时间内的音量变化视为自身所致
-  static const _selfVolumeUs = 1000000;
 
   /// 开始接收后此时间内的统计可能仍是开始前的，不据此判断接收已停
   static const _startGraceUs = 2000000;
@@ -47,7 +45,10 @@ class ConsoleClient implements Console {
   ConsoleTransport _newTransport() => ConsoleTransport(
     onConnected: _onConnected,
     onMessage: _onMessage,
-    onDisconnected: () => _connected.value = false,
+    onDisconnected: () {
+      _connected.value = false;
+      _restoreBoost();
+    },
     onSource: (source) => LocalSettings.lastSource = source,
     lastSource: LocalSettings.lastSource,
   );
@@ -69,7 +70,10 @@ class ConsoleClient implements Console {
   int _startedAt = 0;
   ReceiverStats? _stats;
   double? _volume;
-  int _selfVolumeUntil = 0;
+  late final _volumes = VolumeSetter(onUser: _onUserVolume);
+
+  /// 校准临时提高音量前的音量：退出或断开时自行恢复，期间用户调整过则不再恢复
+  double? _boostFrom;
   Future<void> _applying = Future.value();
   bool _busy = false;
 
@@ -125,6 +129,7 @@ class ConsoleClient implements Console {
     // 未送达时重连后补发，确认前不按旧设置重新接收
     _receiveOffPending = true;
     _sendReceiveOff();
+    _restoreBoost();
     await _transport.dispose();
     _connected.value = false;
   }
@@ -205,10 +210,14 @@ class ConsoleClient implements Console {
     }
     if (message['volume'] case final num value) {
       final volume = value.toDouble();
+      if (message['boost'] != true) {
+        _boostFrom = null;
+      } else {
+        _boostFrom ??= _volume;
+      }
       if (volume != _targetVolume) {
-        _selfVolumeUntil = nowUs + _selfVolumeUs;
         try {
-          await UnisonNative.setVolume(volume);
+          _volume = await _volumes.set(volume);
           _targetVolume = volume;
         } catch (_) {}
       }
@@ -234,14 +243,29 @@ class ConsoleClient implements Console {
   void _sendReceiveOff() => command(Command.receive, {'id': selfId, 'on': false});
 
   void _onVolume(double volume) {
-    _volume = volume;
-    if (nowUs < _selfVolumeUntil) {
-      _report();
+    if (_volumes.isUser(volume)) {
+      _onUserVolume(volume);
       return;
     }
-    // 用户在本机调整：音源据此改写设置，再下发同样的音量
+    _volume = volume;
+    _report();
+  }
+
+  /// 用户在本机调整：音源据此改写设置，再下发同样的音量；临时提高期间则不再恢复
+  void _onUserVolume(double volume) {
+    _volume = volume;
+    _boostFrom = null;
     _targetVolume = volume;
     _transport.send({'t': MessageType.localVolume, 'volume': volume});
+  }
+
+  /// 恢复校准临时提高前的音量；重连后按音源下发的设置重新设定
+  void _restoreBoost() {
+    final volume = _boostFrom;
+    if (volume == null) return;
+    _boostFrom = null;
+    _targetVolume = null;
+    _volumes.set(volume).then((actual) => _volume = actual, onError: (_) {});
   }
 
   void _report() {

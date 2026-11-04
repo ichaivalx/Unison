@@ -497,6 +497,11 @@ class ConsoleTransport {
   void _search() {
     if (_connection != null || _connecting || _disposed) return;
     _discovery.broadcast(const {'k': Datagram.probe});
+    if (_candidate case final candidate?) {
+      _candidate = null;
+      _connect(candidate.address, candidate.port);
+      return;
+    }
     // 广播被过滤时直接连接上次的音源
     if (_lastSource case final last?) {
       final index = last.lastIndexOf(':');
@@ -510,11 +515,15 @@ class ConsoleTransport {
     }
   }
 
+  /// 连接期间收到的音源回应（如上次的地址已失效、音源换了地址），当前连接失败后优先尝试
+  ({InternetAddress address, int port})? _candidate;
+
   void _onDatagram(Message message, InternetAddress from, int _) {
-    if (message['k'] == Datagram.beacon &&
-        _connection == null &&
-        !_connecting) {
-      if (message['port'] case final int port) {
+    if (message['k'] != Datagram.beacon || _connection != null) return;
+    if (message['port'] case final int port) {
+      if (_connecting) {
+        _candidate = (address: from, port: port);
+      } else {
         _connect(from, port);
       }
     }
@@ -553,12 +562,21 @@ class ConsoleTransport {
         _lastSource = source;
         onSource(source);
       }
+      _candidate = null;
       _pingSeq = 0;
       _schedulePing();
       onConnected();
     } catch (_) {
     } finally {
       _connecting = false;
+    }
+    if (_connection == null && !_disposed) {
+      if (_candidate case final candidate?) {
+        _candidate = null;
+        if (candidate.address != address || candidate.port != port) {
+          _connect(candidate.address, candidate.port);
+        }
+      }
     }
   }
 
