@@ -32,6 +32,13 @@ internal object RootContext {
     @Synchronized
     fun create(): Context {
         instance?.let { return it }
+        // app_process 不经过 Zygote 的媒体 mainline 初始化。
+        val mediaInitializer = Class.forName("android.media.MediaFrameworkPlatformInitializer")
+        if (mediaInitializer.getDeclaredMethod("getMediaServiceManager").invoke(null) == null) {
+            val serviceManager = Class.forName("android.media.MediaServiceManager")
+            mediaInitializer.getDeclaredMethod("setMediaServiceManager", serviceManager)
+                .invoke(null, serviceManager.getDeclaredConstructor().newInstance())
+        }
         if (Looper.myLooper() == null) Looper.prepareMainLooper()
         val activityThreadClass = Class.forName("android.app.ActivityThread")
         val constructor = activityThreadClass.getDeclaredConstructor().apply { isAccessible = true }
