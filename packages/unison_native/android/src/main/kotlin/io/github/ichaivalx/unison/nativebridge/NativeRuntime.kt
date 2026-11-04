@@ -13,6 +13,7 @@ import org.json.JSONArray
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.roundToInt
 
 internal object NativeRuntime {
     lateinit var context: Context
@@ -106,9 +107,10 @@ internal object NativeRuntime {
     fun startSource(args: JSONObject): CompletableFuture<Any?> {
         val epoch = exitEpoch.get()
         check(!exiting) { "Unison 正在退出" }
-        sourceRequested = true
-        return keepService().thenCompose {
+        return keepAliveReady.thenCompose {
             check(!exiting && epoch == exitEpoch.get()) { "Unison 已退出" }
+            check(keepAliveRequested && AudioService.instance != null) { "请先在前台开启 Unison 常驻" }
+            sourceRequested = true; serviceState()
             root("startSource", args)
         }.whenComplete { _, error -> if (error != null && epoch == exitEpoch.get()) { sourceRequested = false; serviceState() } }
     }
@@ -193,7 +195,7 @@ internal object NativeRuntime {
     fun setVolume(value: Double) {
         require(value in 0.0..1.0)
         val audio = context.getSystemService(AudioManager::class.java)
-        audio.setStreamVolume(AudioManager.STREAM_MUSIC, (value * audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)).toInt(), 0)
+        audio.setStreamVolume(AudioManager.STREAM_MUSIC, (value * audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)).roundToInt(), 0)
         lastVolume = volume(); emit("volume", lastVolume)
     }
 }

@@ -32,6 +32,7 @@ class AudioService : Service() {
         super.onCreate(); NativeRuntime.initialize(applicationContext)
         val notifications = getSystemService(NotificationManager::class.java)
         notifications.createNotificationChannel(NotificationChannel("unison_audio", "Unison", NotificationManager.IMPORTANCE_LOW))
+        notifiedText = text()
         startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
         val manager = getSystemService(WifiManager::class.java)
         wifi = manager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "Unison:audio")
@@ -45,7 +46,7 @@ class AudioService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         NativeRuntime.serviceStarted()
         if (intent?.action == "exit") NativeRuntime.notificationExit()
-        else if (intent?.action == "stop-source") NativeRuntime.stopSource().whenComplete { _, _ -> NativeRuntime.emit("exit", null) }
+        else if (intent?.action == "stop-source") NativeRuntime.stopSource()
         refresh(); return START_NOT_STICKY
     }
     private fun text() = when {
@@ -54,19 +55,25 @@ class AudioService : Service() {
         else -> "已连接 Unison"
     }
     private fun notification(): Notification {
-        notifiedText = text()
         val launch = packageManager.getLaunchIntentForPackage(packageName)
         val open = launch?.let { PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE) }
-        val sourceOnly = NativeRuntime.sourceRequested && !NativeRuntime.keepAliveRequested
         val exit = PendingIntent.getService(this, 2, Intent(this, AudioService::class.java)
-            .setAction(if (sourceOnly) "stop-source" else "exit"), PendingIntent.FLAG_IMMUTABLE)
-        return Notification.Builder(this, "unison_audio").setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("Unison").setContentText(notifiedText).setContentIntent(open).setOngoing(true)
-            .addAction(Notification.Action.Builder(null, if (sourceOnly) "停止音源" else "退出", exit).build()).build()
+            .setAction("exit"), PendingIntent.FLAG_IMMUTABLE)
+        val builder = Notification.Builder(this, "unison_audio").setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("Unison").setContentText(text()).setContentIntent(open).setOngoing(true)
+        if (NativeRuntime.sourceRequested) {
+            val stop = PendingIntent.getService(this, 3, Intent(this, AudioService::class.java)
+                .setAction("stop-source"), PendingIntent.FLAG_IMMUTABLE)
+            builder.addAction(Notification.Action.Builder(null, "停止音源", stop).build())
+        }
+        return builder.addAction(Notification.Action.Builder(null, "退出", exit).build()).build()
     }
     fun refresh() {
         if (!NativeRuntime.holdsService()) stopSelf()
-        else if (notifiedText != text()) getSystemService(NotificationManager::class.java).notify(1, notification())
+        else if (notifiedText != text()) {
+            notifiedText = text()
+            getSystemService(NotificationManager::class.java).notify(1, notification())
+        }
     }
     override fun onDestroy() {
         instance = null
