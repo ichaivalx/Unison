@@ -146,7 +146,8 @@ class SourceService implements Console {
     // 校准中退出：阻止尚未开始的测量，并在断开前把恢复后的音量发给各设备
     if (_calibrating) {
       _cancelled = true;
-      _guard(UnisonNative.cancelCalibration);
+      // 原生退出时已停止测量，取消失败不作为错误显示
+      UnisonNative.cancelCalibration().catchError((_) {});
     }
     _restoreVolumes(immediate: true);
     _links.clear();
