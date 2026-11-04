@@ -23,6 +23,9 @@ class ConsoleClient implements Console {
   /// 本机设音量后此时间内的音量变化视为自身所致
   static const _selfVolumeUs = 1000000;
 
+  /// 开始接收后此时间内的统计可能仍是开始前的，不据此判断接收已停
+  static const _startGraceUs = 2000000;
+
   final _state = ValueNotifier<ConsoleState?>(null);
   final _connected = ValueNotifier(false);
 
@@ -51,17 +54,24 @@ class ConsoleClient implements Console {
   /// 无时钟样本时，按收到状态的时刻估计的音源时钟差
   int _fallbackOffsetUs = 0;
 
+  /// 以下为原生调用成功后的实际状态
   bool _receiverOn = false;
   String? _receiverHost;
   int? _offsetUs;
   double? _targetVolume;
+
+  int _startedAt = 0;
   ReceiverStats? _stats;
   double? _volume;
   int _selfVolumeUntil = 0;
   Future<void> _applying = Future.value();
+  bool _busy = false;
+
+  /// 原生侧自行停止了接收（如通知栏停止），尚待音源确认关闭接收开关
+  bool _stoppedNatively = false;
 
   Future<void> _start() async {
-    UnisonNative.receiverStats.listen((stats) => _stats = stats, onError: (_) {});
+    UnisonNative.receiverStats.listen(_onStats, onError: (_) {});
     UnisonNative.volumeChanges.listen(_onVolume, onError: (_) {});
     await _transport.start();
     Timer.periodic(const Duration(seconds: 1), (_) => _report());
@@ -85,7 +95,10 @@ class ConsoleClient implements Console {
   }
 
   @override
-  void wake() => _transport.wake();
+  void wake() {
+    _transport.wake();
+    _report();
+  }
 
   @override
   int localTimeOf(int sourceUs) =>
@@ -99,6 +112,7 @@ class ConsoleClient implements Console {
   void _onConnected() {
     _connected.value = true;
     _hello();
+    if (_stoppedNatively) _sendReceiveOff();
     _report();
   }
 
@@ -128,35 +142,67 @@ class ConsoleClient implements Console {
     }
   }
 
+  /// 按下发的设置调用原生；只在调用成功后更新实际状态，失败的由音源按回报重发
   Future<void> _apply(Message message, String host) async {
-    try {
-      if (message['receive'] == true) {
-        if (!_receiverOn || _receiverHost != host) {
+    _busy = true;
+    final receive = message['receive'] == true;
+    // 原生侧停止接收后，等音源确认关闭前不再按旧设置启动
+    if (!receive) _stoppedNatively = false;
+    if (receive && !_stoppedNatively) {
+      if (!_receiverOn || _receiverHost != host) {
+        try {
           await UnisonNative.startReceiver(sourceHost: host);
           _receiverOn = true;
           _receiverHost = host;
           _offsetUs = null;
-        }
+          _startedAt = nowUs;
+        } catch (_) {}
+      }
+      if (_receiverOn) {
         if (message['offsetUs'] case final int offset when offset != _offsetUs) {
-          await UnisonNative.setReceiverOffsetUs(offset);
-          _offsetUs = offset;
+          try {
+            await UnisonNative.setReceiverOffsetUs(offset);
+            _offsetUs = offset;
+          } catch (_) {}
         }
-      } else if (_receiverOn) {
-        _receiverOn = false;
-        _receiverHost = null;
+      }
+    } else if (_receiverOn) {
+      try {
         await UnisonNative.stopReceiver();
-      }
-      if (message['volume'] case final num value) {
-        final volume = value.toDouble();
-        if (volume != _targetVolume) {
-          _targetVolume = volume;
-          _selfVolumeUntil = nowUs + _selfVolumeUs;
+        _clearReceiver();
+      } catch (_) {}
+    }
+    if (message['volume'] case final num value) {
+      final volume = value.toDouble();
+      if (volume != _targetVolume) {
+        _selfVolumeUntil = nowUs + _selfVolumeUs;
+        try {
           await UnisonNative.setVolume(volume);
-        }
+          _targetVolume = volume;
+        } catch (_) {}
       }
-    } catch (_) {}
+    }
+    _busy = false;
     _report();
   }
+
+  void _clearReceiver() {
+    _receiverOn = false;
+    _receiverHost = null;
+    _offsetUs = null;
+  }
+
+  void _onStats(ReceiverStats stats) {
+    _stats = stats;
+    if (!_receiverOn || stats.running || _busy || nowUs - _startedAt < _startGraceUs) return;
+    // 不是控制面停止的：同步关闭接收开关，否则重连后不会再启动
+    _clearReceiver();
+    _stoppedNatively = true;
+    _sendReceiveOff();
+    _report();
+  }
+
+  void _sendReceiveOff() => command(Command.receive, {'id': selfId, 'on': false});
 
   void _onVolume(double volume) {
     _volume = volume;
@@ -175,6 +221,9 @@ class ConsoleClient implements Console {
       't': MessageType.report,
       'stats': stats == null || !_receiverOn ? null : statsToJson(stats),
       'volume': _volume,
+      'receiving': _receiverOn,
+      'offsetUs': _offsetUs,
+      'appliedVolume': _targetVolume,
     });
   }
 }

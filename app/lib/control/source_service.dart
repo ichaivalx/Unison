@@ -40,8 +40,14 @@ class _Peer {
   ReceiverStats? stats;
   double? actualVolume;
 
-  /// 上次下发的设置，未变化时不再下发
+  /// 上次下发的设置及时刻；设备回报与之一致前定期重发
   String? applied;
+  int appliedAt = 0;
+
+  /// 设备回报的实际状态：是否在接收、生效的偏移、已设定的音量
+  bool? reportedReceiving;
+  int? reportedOffsetUs;
+  double? reportedVolume;
 
   Map<String, Object?> toJson() => {
     'name': name,
@@ -84,6 +90,12 @@ class SourceService implements Console {
   static const _boostLevelKey = 'calibration.boostLevel';
 
   static const _defaultLatencyUs = 50000;
+
+  /// 设备回报与下发不一致时，距上次下发此时间后重发
+  static const _retryUs = 2000000;
+
+  /// 校准期间不能修改的时序设置
+  static const _timing = {Command.latency, Command.localDelay, Command.offset, Command.bandWeight};
 
   static Future<SourceService> start() async {
     final service = SourceService._();
@@ -165,6 +177,7 @@ class SourceService implements Console {
         if (key is String && value is Map) _peers[key] = _Peer.fromJson(key, value);
       }
     }
+    _normalize();
     UnisonNative.sourceStatus.listen((status) {
       _status = status;
       if (status.error != null) _error = status.error;
@@ -190,6 +203,8 @@ class SourceService implements Console {
   }
 
   bool get _running => _status?.running ?? false;
+
+  bool get _calibrating => _calibration.stage == CalibrationStage.running;
 
   /// 跟随音源的设备按此音量换算：临时提高期间为提高前的音量
   double? get _sourceVolume => _boostedFrom ?? _volume;
@@ -228,8 +243,12 @@ class SourceService implements Console {
         _onHello(connection, message);
       case MessageType.report:
         if (_links[connection] case final peer?) {
-          peer.stats = statsFromJson(message['stats']);
-          peer.actualVolume = (message['volume'] as num?)?.toDouble();
+          peer
+            ..stats = statsFromJson(message['stats'])
+            ..actualVolume = (message['volume'] as num?)?.toDouble()
+            ..reportedReceiving = message['receiving'] == true
+            ..reportedOffsetUs = (message['offsetUs'] as num?)?.toInt()
+            ..reportedVolume = (message['appliedVolume'] as num?)?.toDouble();
           _publish();
         }
       case MessageType.localVolume:
@@ -270,7 +289,10 @@ class SourceService implements Console {
       ..receiverId = (message['receiverId'] as num?)?.toInt()
       ..connection = connection
       ..stats = null
-      ..applied = null;
+      ..applied = null
+      ..reportedReceiving = null
+      ..reportedOffsetUs = null
+      ..reportedVolume = null;
     _links[connection] = peer;
     _savePeers();
     _publish(immediate: true);
@@ -292,6 +314,11 @@ class SourceService implements Console {
   void command(String command, [Map<String, Object?> args = const {}]) {
     final id = args['id'];
     final peer = _peers[id];
+    // 校准期间原生侧不接受时序修改，测量也按开始时的设置换算
+    if (_calibrating && _timing.contains(command)) {
+      _publish();
+      return;
+    }
     switch (command) {
       case Command.media:
         if (MediaCommand.values.asNameMap()[args['action']] case final action?) {
@@ -323,6 +350,7 @@ class SourceService implements Console {
           if (peer != null) {
             peer.baseOffsetUs += us.toInt() - _effectiveOffset(peer);
             _savePeers();
+            _normalize();
           }
         }
       case Command.volume:
@@ -377,9 +405,21 @@ class SourceService implements Console {
         if (args['weight'] case final num weight) {
           _weight = weight.toDouble().clamp(0.0, 1.0).toDouble();
           _prefs.setDouble(_weightKey, _weight);
+          _normalize();
         }
     }
     _publish();
+  }
+
+  /// 使所有已知设备（含离线的）的生效偏移不小于 0，且本机延迟尽量小
+  void _normalize() {
+    final shift = normalizationShift(_localDelayUs, [for (final peer in _peers.values) _effectiveOffset(peer)]);
+    if (shift == 0) return;
+    for (final peer in _peers.values) {
+      peer.baseOffsetUs += shift;
+    }
+    _savePeers();
+    _setLocalDelay(_localDelayUs + shift);
   }
 
   void _setLocalDelay(int us) {
@@ -413,6 +453,13 @@ class SourceService implements Console {
     }
     _cancelled = false;
     _calibration = const CalibrationView(stage: CalibrationStage.running, description: '准备中');
+    // 测量在此时的设置下进行；期间时序设置冻结
+    final effective = {for (final peer in peers.values) peer.id: _effectiveOffset(peer)};
+    final undo = (
+      localDelayUs: _localDelayUs,
+      localGaps: _localGaps,
+      peers: {for (final peer in _peers.values) peer.id: (base: peer.baseOffsetUs, gaps: peer.gaps)},
+    );
     _publish(immediate: true);
     try {
       if (_boost) await _raiseVolumes(peers.values);
@@ -431,27 +478,21 @@ class SourceService implements Console {
         },
       );
       final outcome = solveCalibration(
-        localDelayUs: _localDelayUs,
-        effective: {for (final peer in peers.values) peer.id: _effectiveOffset(peer)},
-        bases: {for (final peer in _peers.values) peer.id: peer.baseOffsetUs},
+        effective: effective,
         local: result.local,
         receivers: {
           for (final MapEntry(key: rid, value: peer) in peers.entries)
             peer.id: result.receivers[rid] ?? const [],
         },
       );
-      _undo = (
-        localDelayUs: _localDelayUs,
-        localGaps: _localGaps,
-        peers: {for (final peer in _peers.values) peer.id: (base: peer.baseOffsetUs, gaps: peer.gaps)},
-      );
+      _undo = undo;
       _localGaps = outcome.localGaps;
       for (final peer in _peers.values) {
         peer.baseOffsetUs = outcome.baseOffsets[peer.id] ?? peer.baseOffsetUs;
         if (outcome.gaps[peer.id] case final gaps?) peer.gaps = gaps;
       }
-      _setLocalDelay(outcome.localDelayUs);
       _saveCalibration();
+      _normalize();
       _calibration = CalibrationView(
         stage: CalibrationStage.done,
         canUndo: true,
@@ -535,6 +576,7 @@ class SourceService implements Console {
     }
     _setLocalDelay(undo.localDelayUs);
     _saveCalibration();
+    _normalize();
     _calibration = const CalibrationView(message: '已撤销本次校准');
   }
 
@@ -619,14 +661,21 @@ class SourceService implements Console {
     for (final connection in _links.keys) {
       connection.send(message);
     }
+    final now = nowUs;
     for (final peer in _links.values) {
-      final apply = jsonEncode({
-        'receive': peer.receive,
-        'offsetUs': _effectiveOffset(peer),
-        'volume': _boosted[peer.id] ?? peer.volume.target(_sourceVolume),
-      });
-      if (apply == peer.applied) continue;
-      peer.applied = apply;
+      final receive = peer.receive;
+      final offset = _effectiveOffset(peer);
+      final volume = _boosted[peer.id] ?? peer.volume.target(_sourceVolume);
+      final apply = jsonEncode({'receive': receive, 'offsetUs': offset, 'volume': volume});
+      // 以设备回报的实际状态为准：未生效的定期重发
+      final synced =
+          peer.reportedReceiving == receive &&
+          (!receive || peer.reportedOffsetUs == offset) &&
+          (volume == null || peer.reportedVolume == volume);
+      if (apply == peer.applied && (synced || now - peer.appliedAt < _retryUs)) continue;
+      peer
+        ..applied = apply
+        ..appliedAt = now;
       peer.connection?.send({'t': MessageType.apply, ...jsonDecode(apply) as Map<String, dynamic>});
     }
   }

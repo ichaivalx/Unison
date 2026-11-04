@@ -80,6 +80,7 @@ class SourcePanel extends StatelessWidget {
     final colors = context.colors;
     final texts = context.texts;
     final receiving = state.devices.where((d) => d.receiving).length;
+    final calibrating = state.calibration.stage == CalibrationStage.running;
     return Panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -115,6 +116,7 @@ class SourcePanel extends StatelessWidget {
             label: '目标延迟',
             value: (source.latencyUs / _latencyStep).round(),
             min: 0,
+            enabled: !calibrating,
             format: (v) => '$v ms',
             onChanged: (v) => console.command(Command.latency, {'us': v * _latencyStep}),
           ),
@@ -123,6 +125,7 @@ class SourcePanel extends StatelessWidget {
             label: '本机延迟',
             value: (source.localDelayUs / _delayStep).round(),
             min: 0,
+            enabled: !calibrating,
             format: (v) => formatMs(v * _delayStep),
             onChanged: (v) => console.command(Command.localDelay, {'us': v * _delayStep}),
           ),
@@ -192,10 +195,13 @@ String bandPosition(double weight) => switch (weight) {
 
 /// 一台设备：在线与同步状态、接收开关、音量与偏移
 class DeviceCard extends StatelessWidget {
-  const DeviceCard({super.key, required this.console, required this.device});
+  const DeviceCard({super.key, required this.console, required this.device, required this.calibrating});
 
   final Console console;
   final DeviceView device;
+
+  /// 校准期间偏移不可调
+  final bool calibrating;
 
   /// 偏移每格 0.5ms
   static const _offsetStep = 500;
@@ -299,7 +305,7 @@ class DeviceCard extends StatelessWidget {
                     max: 100,
                     format: (v) => device.isSource || device.volume.mode == VolumeMode.independent
                         ? '$v%'
-                        : '$v%  (${device.volume.offset >= 0 ? '+' : ''}${device.volume.offset})',
+                        : '$v%  (${_signedPoints(device.volume.offset)})',
                     trailing: device.isSource ? null : _ModeSwitch(device: device, onChanged: _command),
                     onChanged: (v) => _command(Command.volume, {'value': v / 100}),
                   ),
@@ -310,6 +316,7 @@ class DeviceCard extends StatelessWidget {
                       value: (device.offsetUs / _offsetStep).round(),
                       format: (v) => formatOffset(v == (device.offsetUs / _offsetStep).round() ? device.offsetUs : v * _offsetStep),
                       ends: const ('更早', '更晚'),
+                      enabled: !calibrating,
                       onChanged: (v) => _command(Command.offset, {'us': v * _offsetStep}),
                     ),
                   ],
@@ -377,4 +384,10 @@ class _Tag extends StatelessWidget {
     ),
     child: Text(text, style: context.texts.labelSmall?.copyWith(color: color)),
   );
+}
+
+/// 音量偏移的百分点文本
+String _signedPoints(double offset) {
+  final points = (offset * 100).round();
+  return '${points >= 0 ? '+' : ''}$points';
 }

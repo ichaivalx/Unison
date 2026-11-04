@@ -140,6 +140,7 @@ class DialField extends StatefulWidget {
     this.max,
     this.trailing,
     this.ends,
+    this.enabled = true,
   });
 
   final String label;
@@ -156,6 +157,9 @@ class DialField extends StatefulWidget {
 
   /// 拨轮左右两端的说明
   final (String, String)? ends;
+
+  /// 不可调时拨轮变暗且不响应
+  final bool enabled;
 
   @override
   State<DialField> createState() => _DialFieldState();
@@ -206,7 +210,14 @@ class _DialFieldState extends State<DialField> {
           ],
         ),
         const SizedBox(height: 2),
-        TickDial(index: value, onSteps: _onSteps),
+        IgnorePointer(
+          ignoring: !widget.enabled,
+          child: AnimatedOpacity(
+            duration: const Duration(milliseconds: 200),
+            opacity: widget.enabled ? 1 : 0.35,
+            child: TickDial(index: value, onSteps: _onSteps),
+          ),
+        ),
         if (widget.ends case (final left, final right))
           Row(
             children: [Text(left, style: muted), const Spacer(), Text(right, style: muted)],

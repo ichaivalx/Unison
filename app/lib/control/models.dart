@@ -26,8 +26,8 @@ class VolumeSetting {
 
   final VolumeMode mode;
 
-  /// 跟随音源时相对音源音量的偏移（百分点）
-  final int offset;
+  /// 跟随音源时相对音源音量的偏移（−1~1）
+  final double offset;
 
   /// 独立时设定的音量（0~1）
   final double level;
@@ -35,14 +35,14 @@ class VolumeSetting {
   /// 应设定的音量；跟随音源而音源音量未知时为 null
   double? target(double? sourceVolume) => switch (mode) {
     VolumeMode.follow =>
-      sourceVolume == null ? null : (sourceVolume + offset / 100).clamp(0.0, 1.0).toDouble(),
+      sourceVolume == null ? null : (sourceVolume + offset).clamp(0.0, 1.0).toDouble(),
     VolumeMode.independent => level,
   };
 
   /// 把设备音量设为 [volume]：跟随时折算为偏移，独立时为设定值
   VolumeSetting withVolume(double volume, double? sourceVolume) => switch (mode) {
     VolumeMode.follow =>
-      sourceVolume == null ? this : copyWith(offset: ((volume - sourceVolume) * 100).round()),
+      sourceVolume == null ? this : copyWith(offset: volume - sourceVolume),
     VolumeMode.independent => copyWith(level: volume.clamp(0.0, 1.0).toDouble()),
   };
 
@@ -50,7 +50,7 @@ class VolumeSetting {
   VolumeSetting switchTo(VolumeMode value, double? actual, double? sourceVolume) =>
       actual == null ? copyWith(mode: value) : copyWith(mode: value).withVolume(actual, sourceVolume);
 
-  VolumeSetting copyWith({VolumeMode? mode, int? offset, double? level}) => VolumeSetting(
+  VolumeSetting copyWith({VolumeMode? mode, double? offset, double? level}) => VolumeSetting(
     mode: mode ?? this.mode,
     offset: offset ?? this.offset,
     level: level ?? this.level,
@@ -62,7 +62,7 @@ class VolumeSetting {
     if (json is! Map) return initial;
     return VolumeSetting(
       mode: VolumeMode.values.asNameMap()[json['mode']] ?? VolumeMode.follow,
-      offset: (json['offset'] as num?)?.toInt() ?? 0,
+      offset: (json['offset'] as num?)?.toDouble() ?? 0,
       level: (json['level'] as num?)?.toDouble() ?? 0.5,
     );
   }

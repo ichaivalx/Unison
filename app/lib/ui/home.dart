@@ -102,7 +102,12 @@ class _Home extends StatelessWidget {
             style: context.texts.labelMedium?.copyWith(color: colors.onSurfaceVariant),
           )),
           for (final device in state.devices) ...[
-            DeviceCard(key: ValueKey(device.id), console: console, device: device),
+            DeviceCard(
+              key: ValueKey(device.id),
+              console: console,
+              device: device,
+              calibrating: state.calibration.stage == CalibrationStage.running,
+            ),
             const SizedBox(height: 12),
           ],
         ];
