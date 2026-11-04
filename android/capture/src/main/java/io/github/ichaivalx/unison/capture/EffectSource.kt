@@ -24,6 +24,8 @@ internal class EffectSource {
     private val callbacks = HandlerThread("effect-sessions")
     private lateinit var handler: Handler
     private var excludeUid = -1
+    @Volatile private var needsSessionLookup = false
+    @Volatile private var unresolvedClients = emptySet<Pair<Int, Int>>()
     @Volatile private var delayMs = 0
     @Volatile private var deathReason: String? = null
     @Volatile private var closed = false
@@ -31,9 +33,7 @@ internal class EffectSource {
     private val deathRecipient = IBinder.DeathRecipient { deathReason = "HAL effect factory binder died" }
     private val callback = object : AudioManager.AudioPlaybackCallback() {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
-            try { reconcile(configs) } catch (error: Exception) {
-                if (!closed) deathReason = "Playback configuration failed: ${error.cause ?: error}"
-            }
+            refresh(configs)
         }
     }
     private val constructor = AudioEffect::class.java.getDeclaredConstructor(UUID::class.java, UUID::class.java,
@@ -43,6 +43,7 @@ internal class EffectSource {
     private val getParameter = AudioEffect::class.java.getDeclaredMethod("getParameter", Int::class.javaPrimitiveType,
         IntArray::class.java).apply { isAccessible = true }
     private val getUid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientUid")
+    private val getPid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientPid")
     private val getSession = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getSessionId")
     private val isActive = AudioPlaybackConfiguration::class.java.getDeclaredMethod("isActive")
     private external fun openTap(): Int
@@ -63,7 +64,7 @@ internal class EffectSource {
         callbacks.start()
         handler = Handler(callbacks.looper)
         manager.registerAudioPlaybackCallback(callback, handler)
-        reconcile(manager.activePlaybackConfigurations)
+        handler.post { refresh() }
         // 探测不占采集线程；HAL 死亡后只退出，不重新创建效果。
         healthThread = thread(name = "effect-health", isDaemon = true) {
             while (!closed) {
@@ -80,45 +81,84 @@ internal class EffectSource {
                         }
                     }
                 }
+                if (needsSessionLookup) handler.post { refresh() }
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { return@thread }
             }
         }
         println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_ms=$localDelayMs")
     }
 
-    private fun reconcile(configs: List<AudioPlaybackConfiguration>) = synchronized(lock) {
-        if (closed || deathReason != null) return@synchronized
+    private fun refresh(configs: List<AudioPlaybackConfiguration>? = null) {
+        if (closed) return
+        try { reconcile(configs ?: manager.activePlaybackConfigurations) } catch (error: Exception) {
+            if (!closed) deathReason = "Playback configuration failed: ${error.cause ?: error}"
+        }
+    }
+
+    private fun reconcile(configs: List<AudioPlaybackConfiguration>) {
+        if (closed || deathReason != null) return
         val wanted = linkedMapOf<Int, Int>()
+        val unknown = mutableSetOf<Pair<Int, Int>>()
         for (config in configs) {
             val usage = config.audioAttributes.usage
             if (isActive.invoke(config) != true || usage !in intArrayOf(AudioAttributes.USAGE_MEDIA,
                     AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN)) continue
             val uid = getUid.invoke(config) as Int
+            if (uid < 0 || uid == excludeUid) continue
             val session = getSession.invoke(config) as Int
-            // session 0 是输出混音，不是播放器会话。
-            if (uid >= 0 && uid != excludeUid && session > 0) wanted[session] = uid
+            // session 0 是输出混音；AAudio 的 NONE(-1) 不等于底层 AudioTrack 没有会话。
+            if (session > 0) wanted[session] = uid
+            else if (session < 0) unknown.add(uid to (getPid.invoke(config) as Int))
         }
-        for (id in sessions.keys.toList()) if (id !in wanted) {
-            val session = sessions.remove(id)!!
-            release(session)
-            println("INFO effect_detached uid=${session.uid} session=$id io=${session.io ?: "pending"}")
+        needsSessionLookup = unknown.isNotEmpty()
+        val unresolved = unknown.toMutableSet()
+        if (unknown.isNotEmpty()) {
+            // 只查询缺失编号的活跃客户端；不在会话锁内等待 dumpsys，采集不受影响。
+            val dump = ProcessBuilder("dumpsys", "media.audio_flinger").redirectErrorStream(true).start()
+            val row = Regex("""^\s*(?:F\d+\s+)?\d+\s+yes\s+(\d+)\s*/\s*(\d+)\s+(\d+)\s+\d+\s+\S+\s+0x[0-9a-fA-F]+\s+\S+\s+\S+\s+\d+\s+\d+\s+(\d+)\s+""")
+            var output = false
+            dump.inputStream.bufferedReader().useLines { lines -> lines.forEach { line ->
+                if (line.startsWith("Output thread ")) output = true
+                if (line.trim() == "Local log:" || line.startsWith("Input thread ")) output = false
+                if (output) row.find(line)?.let { match ->
+                    val pid = match.groupValues[1].toInt()
+                    val uid = match.groupValues[2].toInt()
+                    val id = match.groupValues[3].toInt()
+                    val usage = match.groupValues[4].toInt()
+                    if ((uid to pid) in unknown && id > 0 && usage in intArrayOf(AudioAttributes.USAGE_MEDIA,
+                            AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN)) {
+                        wanted[id] = uid
+                        unresolved.remove(uid to pid)
+                    }
+                }
+            } }
+            dump.waitFor()
         }
-        failed.retainAll(wanted.keys)
-        for ((id, uid) in wanted) {
-            if (id in sessions || id in failed) continue
-            var instance: AudioEffect? = null
-            try {
-                instance = constructor.newInstance(UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8201"),
-                    UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, id)
-                check(setParameter.invoke(instance, 1, delayMs) == AudioEffect.SUCCESS) { "Cannot set local delay" }
-                check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
-                sessions[id] = Session(uid, id, instance)
-                println("INFO effect_attached uid=$uid session=$id local_delay_ms=$delayMs")
-            } catch (error: Exception) {
-                runCatching { instance?.release() }
-                failed.add(id)
-                // FAST/DIRECT 等拒绝挂载时保持播放器原路播放；不循环创建或改动其音量。
-                println("ERROR effect_attach uid=$uid session=$id error=${error.cause ?: error}")
+        unresolvedClients = unresolved
+        synchronized(lock) {
+            if (closed || deathReason != null) return@synchronized
+            for (id in sessions.keys.toList()) if (id !in wanted) {
+                val session = sessions.remove(id)!!
+                release(session)
+                println("INFO effect_detached uid=${session.uid} session=$id io=${session.io ?: "pending"}")
+            }
+            failed.retainAll(wanted.keys)
+            for ((id, uid) in wanted) {
+                if (id in sessions || id in failed) continue
+                var instance: AudioEffect? = null
+                try {
+                    instance = constructor.newInstance(UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8201"),
+                        UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, id)
+                    check(setParameter.invoke(instance, 1, delayMs) == AudioEffect.SUCCESS) { "Cannot set local delay" }
+                    check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
+                    sessions[id] = Session(uid, id, instance)
+                    println("INFO effect_attached uid=$uid session=$id local_delay_ms=$delayMs")
+                } catch (error: Exception) {
+                    runCatching { instance?.release() }
+                    failed.add(id)
+                    // FAST/DIRECT 等拒绝挂载时保持播放器原路播放；不循环创建或改动其音量。
+                    println("ERROR effect_attach uid=$uid session=$id error=${error.cause ?: error}")
+                }
             }
         }
     }
@@ -143,7 +183,8 @@ internal class EffectSource {
 
     fun status(): String = synchronized(lock) {
         "sessions=[${sessions.values.joinToString(",") { "${it.uid}/${it.id}/io:${it.io ?: "pending"}" }}] " +
-            "attach_failed=[${failed.joinToString(",")}]"
+            "attach_failed=[${failed.joinToString(",")}] " +
+            "session_lookup_pending=[${unresolvedClients.joinToString(",") { "${it.first}/${it.second}" }}]"
     }
 
     fun read(): ByteArray? {
