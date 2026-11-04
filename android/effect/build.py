@@ -31,6 +31,7 @@ def checkout(repo, name, paths, ref=TAG):
 
 # 构建方式参考 dungxnd/ViPERFX_RE 的树外 AIDL 构建；不引入其 DSP 或 FMQ shim。
 # 固定 V2 冻结接口及其 imports，不能用 current/V3 替代。
+# 实测平板 V2 库链接公共类型 V4；保持 V2 方法接口，公共类型按设备实际组合生成。
 groups = [
     ('common/aidl/aidl_api/android.hardware.common/2', 2),
     ('common/fmq/aidl/aidl_api/android.hardware.common.fmq/1', 1),
