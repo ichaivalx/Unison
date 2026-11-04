@@ -23,6 +23,7 @@ jobs:
           cache: true
       - run: flutter pub get
       - run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - run: flutter test
       - run: flutter build apk --release --target-platform android-arm64
       - run: mv build/app/outputs/flutter-apk/app-release.apk unison-arm64.apk
       - uses: actions/upload-artifact@v7
