@@ -114,10 +114,35 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             // 模拟远端在音源已停止、Activity 已销毁后再次开启；不允许新建服务。
             await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250)));
             if (service() != holder || rootField.get(null) != rootProcess) throw new IllegalStateException("Background source replaced service/root process");
-            java.util.Map<?,?> calibration = (java.util.Map<?,?>)await(call("root", new Class<?>[]{String.class, JSONObject.class}, "calibrate", new JSONObject().put("receiverIds", new org.json.JSONArray()).put("bands", new org.json.JSONArray().put("midHigh"))));
-            java.util.Map<?,?> local = (java.util.Map<?,?>)((java.util.List<?>)calibration.get("local")).get(0);
-            if (local.get("arrivalUs") == null) throw new IllegalStateException("Background source did not capture calibration audio");
-            result.putString("backgroundCalibration", local.toString()); result.putBoolean("backgroundSourceReused", true);
+            // AUDIO 由 tap 帧生成；验证采集链路，不依赖房间噪声下的麦克风检出结果。
+            java.net.DatagramSocket tap = new java.net.DatagramSocket(); tap.setSoTimeout(100);
+            java.net.InetAddress loopback = java.net.InetAddress.getByName("127.0.0.1");
+            byte[] subscribe = java.nio.ByteBuffer.allocate(18).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putInt(0x4e534e55).put((byte)1).put((byte)2).putShort((short)0)
+                .putLong((Long)engineClass.getMethod("receiverId").invoke(engine)).putShort((short)0).array();
+            java.util.concurrent.atomic.AtomicBoolean observing = new java.util.concurrent.atomic.AtomicBoolean(true);
+            java.util.concurrent.atomic.AtomicInteger packets = new java.util.concurrent.atomic.AtomicInteger();
+            Thread observer = new Thread(() -> {
+                long last = 0;
+                while (observing.get()) {
+                    try {
+                        if (System.nanoTime() - last >= 1_000_000_000L) { tap.send(new java.net.DatagramPacket(subscribe, subscribe.length, loopback, 47800)); last = System.nanoTime(); }
+                        java.net.DatagramPacket packet = new java.net.DatagramPacket(new byte[2048], 2048); tap.receive(packet);
+                        if (packet.getLength() == 988 && packet.getData()[5] == 5) packets.incrementAndGet();
+                    } catch (java.net.SocketTimeoutException ignored) {} catch (java.io.IOException error) { return; }
+                }
+            }, "background-source-probe");
+            observer.start();
+            try {
+                await(call("root", new Class<?>[]{String.class, JSONObject.class}, "calibrate", new JSONObject().put("receiverIds", new org.json.JSONArray()).put("bands", new org.json.JSONArray().put("midHigh"))));
+            } finally {
+                observing.set(false);
+                byte[] bye = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    .putInt(0x4e534e55).put((byte)1).put((byte)6).putShort((short)0).array();
+                try { tap.send(new java.net.DatagramPacket(bye, bye.length, loopback, 47800)); } finally { tap.close(); observer.join(1000); }
+            }
+            if (packets.get() == 0) throw new IllegalStateException("Background source did not capture audio packets");
+            result.putInt("backgroundAudioPackets", packets.get()); result.putBoolean("backgroundSourceReused", true);
             await(call("stopSource", new Class<?>[]{}));
             context.startService(new Intent(context, serviceClass).setAction("exit"));
             deadline = System.nanoTime() + 5_000_000_000L;
