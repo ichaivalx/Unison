@@ -63,12 +63,10 @@ jobs:
           packages: platform-tools
       - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;30.0.16248370' 'cmake;4.1.2'
       - working-directory: app
-        run: flutter pub get
+        run: flutter build apk --debug --config-only --target-platform android-arm64
       - run: |
-          printf 'flutter.sdk=%s\nsdk.dir=%s\n' "$FLUTTER_ROOT" "$ANDROID_HOME" > app/android/local.properties
           cd app/android
-          chmod +x gradlew
-          ./gradlew :unison_native:assembleDebugAndroidTest
+          ./gradlew :unison_native:assembleDebugAndroidTest -Ptarget-platform=android-arm64
       - run: |
           APK=$(find app/build/unison_native -name '*androidTest.apk' | head -1)
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign --ks app/android/debug.p12 --ks-type PKCS12 --ks-key-alias unison --ks-pass pass:android --key-pass pass:android --out native-smoke.apk "$APK"
