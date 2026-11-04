@@ -3,7 +3,7 @@
 #include "unison/receiver.h"
 #include <flutter/method_channel.h>
 #include <flutter/event_channel.h>
-#include <flutter/stream_handler_functions.h>
+#include <flutter/event_stream_handler_functions.h>
 #include <flutter/plugin_registrar_windows.h>
 #include <flutter/standard_method_codec.h>
 #include <algorithm>

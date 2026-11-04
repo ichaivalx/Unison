@@ -9,11 +9,23 @@ import zipfile
 import tarfile
 import io
 import re
+import time
+import urllib.error
 
 ROOT = Path(__file__).resolve().parent
 BUILD = ROOT / 'build'
 BUILD.mkdir(exist_ok=True)
 TAG = 'android-16.0.0_r1'
+
+
+def fetch(url):
+    for attempt in range(4):
+        try:
+            return urllib.request.urlopen(url, timeout=90)
+        except urllib.error.HTTPError as error:
+            if error.code not in (429, 500, 502, 503, 504) or attempt == 3:
+                raise
+            time.sleep(2 ** attempt)
 
 
 def run(*args):
@@ -63,7 +75,7 @@ for remote, local in (
     dest = platform_cpp / local
     dest.mkdir(parents=True, exist_ok=True)
     url = f'{clang_base}/+archive/{clang_revision}/{remote}.tar.gz'
-    with urllib.request.urlopen(url, timeout=90) as response:
+    with fetch(url) as response:
         with tarfile.open(fileobj=io.BytesIO(response.read()), mode='r:gz') as archive:
             # 通用头的 __config_site 指向宿主配置；只使用单独下载的平台配置。
             members = [m for m in archive.getmembers() if not m.issym() and not m.islnk()]
@@ -117,7 +129,7 @@ module = ROOT.parent / 'ksu-module'
 for script in sorted(module.glob('*.sh')):
     run('sh', '-n', script)
 out = BUILD / 'unison-tap-ksu.zip'
-with urllib.request.urlopen('https://www.apache.org/licenses/LICENSE-2.0.txt') as response:
+with fetch('https://www.apache.org/licenses/LICENSE-2.0.txt') as response:
     license_text = response.read()
 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
     for path in sorted(module.rglob('*')):

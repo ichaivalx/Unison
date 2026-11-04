@@ -22,7 +22,7 @@ object CaptureMain {
     @JvmStatic private external fun waitForTermination(): Int
     @Volatile private var source: SourceSession? = null
     private var media: RootMedia? = null
-    private var latencyUs = 50_000
+    private var latencyUs = 50_000L
     private var delayUs = 0L
     private var excludeUid = -1
     @JvmStatic fun main(args: Array<String>) {
@@ -47,13 +47,13 @@ object CaptureMain {
                         "available" -> available()
                         "startSource" -> {
                             check(available()) { "Unison effect module is not active or has a different version" }
-                            source?.close(); latencyUs = data.getInt("latencyUs"); delayUs = data.getLong("localDelayUs")
+                            source?.close(); latencyUs = data.getLong("latencyUs"); delayUs = data.getLong("localDelayUs")
                             check(delayUs >= 0)
                             val session = SourceSession(excludeUid, latencyUs, delayUs) { exitProcess(1) }
                             source = session; session.start(); null
                         }
                         "stopSource" -> { source?.close(); source = null; RootEvents.emit("source", stopped()); null }
-                        "setSourceLatencyUs" -> { val value = data.getInt("value"); source?.setLatency(value); latencyUs = value; if (source == null) RootEvents.emit("source", stopped()); null }
+                        "setSourceLatencyUs" -> { val value = data.getLong("value"); source?.setLatency(value); latencyUs = value; if (source == null) RootEvents.emit("source", stopped()); null }
                         "setLocalDelayUs" -> { val value = data.getLong("value"); check(value >= 0); source?.setDelay(value); delayUs = value; if (source == null) RootEvents.emit("source", stopped()); null }
                         "calibrate" -> {
                             val session = checkNotNull(source) { "Source is not running" }

@@ -33,10 +33,10 @@ std::atomic<bool> running{false}, rebuild{false};
 std::atomic<float> gain{1.0f};
 std::atomic<bool> gainDirty{true};
 std::mutex settingsMutex;
-std::wstring selection;
+std::wstring selectedOutput, endpointId;
 std::string actualDevice;
 void setStatus(const std::string& value) { std::lock_guard<std::mutex> lock(settingsMutex); actualDevice = value; }
-unison::Receiver receiver;
+unison::Receiver networkReceiver;
 std::thread worker;
 std::string utf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -71,13 +71,11 @@ HRESULT chooseDevice(IMMDeviceEnumerator* devices, const std::wstring& selection
     if (FAILED(hr)) return hr;
     UINT count = 0;
     if (FAILED(hr = collection->GetCount(&count))) return hr;
-    bool numeric = std::all_of(selection.begin(), selection.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; });
     std::wstring wanted = lower(selection);
     for (UINT i = 0; i < count; ++i) {
         ComPtr<IMMDevice> device;
         if (FAILED(collection->Item(i, &device))) continue;
-        if ((numeric && selection == std::to_wstring(i)) ||
-            (!numeric && lower(deviceName(device.Get())) == wanted)) {
+        if (lower(deviceName(device.Get())) == wanted) {
             out = device;
             return S_OK;
         }
@@ -173,6 +171,8 @@ struct AudioOutput {
         written = capacity;
         if (FAILED(hr = client->Start())) return hr;
         setStatus(utf8(deviceName(device.Get())));
+        LPWSTR currentId = nullptr;
+        if (SUCCEEDED(device->GetId(&currentId))) { std::lock_guard<std::mutex> lock(settingsMutex); endpointId = currentId; CoTaskMemFree(currentId); }
         return S_OK;
     }
 
@@ -293,12 +293,12 @@ public:
     }
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
         std::lock_guard<std::mutex> lock(settingsMutex);
-        if (selection.empty() && flow == eRender && role == eConsole) rebuild = true;
+        if (selectedOutput.empty() && flow == eRender && role == eConsole) rebuild = true;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { rebuild = true; return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { rebuild = true; return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override { std::lock_guard<std::mutex> lock(settingsMutex); if (endpointId == id) rebuild = true; return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD) override { std::lock_guard<std::mutex> lock(settingsMutex); if (endpointId == id) rebuild = true; return S_OK; }
     HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
 };
 void renderLoop() {
@@ -309,17 +309,17 @@ void renderLoop() {
     if (watcher) watcher->RegisterEndpointNotificationCallback(notifications);
     while (running.load()) {
         rebuild = false;
-        std::wstring id; { std::lock_guard<std::mutex> lock(settingsMutex); id = selection; }
+        std::wstring id; { std::lock_guard<std::mutex> lock(settingsMutex); id = selectedOutput; }
         bool underrun = false;
         {
             setStatus("");
             AudioOutput output;
             HRESULT hr = output.open(id);
             if (SUCCEEDED(hr)) {
-                receiver.resetOutputTiming();
+                networkReceiver.resetOutputTiming();
                 while (running.load() && !rebuild.load()) {
                     if (WaitForSingleObject(output.event, 100) == WAIT_FAILED) break;
-                    if (FAILED(hr = output.fill(receiver))) break;
+                    if (FAILED(hr = output.fill(networkReceiver))) break;
                 }
             }
             underrun = hr == AUDCLNT_E_BUFFER_ERROR;
@@ -334,15 +334,15 @@ void renderLoop() {
 }
 }
 namespace unison_windows {
-uint64_t receiverId() { return receiver.receiverId(); }
+uint64_t receiverId() { return networkReceiver.receiverId(); }
 bool start(const std::string& source) {
-    stop(); if (!receiver.start(source)) return false;
+    stop(); if (!networkReceiver.start(source)) return false;
     running = true; worker = std::thread(renderLoop); return true;
 }
-void stop() { running = false; if (worker.joinable()) worker.join(); receiver.stop(); }
-void offset(int64_t us) { receiver.setOffsetUs(us); }
+void stop() { running = false; if (worker.joinable()) worker.join(); networkReceiver.stop(); }
+void offset(int64_t us) { networkReceiver.setOffsetUs(us); }
 std::string stats() {
-    std::string data = receiver.statsJson(); data.pop_back();
+    std::string data = networkReceiver.statsJson(); data.pop_back();
     std::lock_guard<std::mutex> lock(settingsMutex);
     return data + ",\"outputDevice\":" + jsonString(running.load() ? actualDevice : "") + "}";
 }
@@ -357,7 +357,7 @@ std::vector<std::string> devices() {
     collection.Reset(); list.Reset(); if (SUCCEEDED(initialized)) CoUninitialize(); return values;
 }
 void device(const std::string& name) {
-    std::lock_guard<std::mutex> lock(settingsMutex); selection = wide(name); rebuild = true;
+    std::lock_guard<std::mutex> lock(settingsMutex); selectedOutput = wide(name); rebuild = true;
 }
 void volume(double value) { gain = static_cast<float>(std::clamp(value, 0.0, 1.0)); gainDirty = true; }
 double volume() { return gain.load(); }

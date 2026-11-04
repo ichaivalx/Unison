@@ -24,7 +24,7 @@ import kotlin.math.sin
 /** 仅在音源进程运行；录音与 tap 保留在内存中，沿用现有 UDP 音频和时钟。 */
 internal class AcousticCalibration(
     private val source: EffectSource,
-    private val latencyUs: Int,
+    private val latencyUs: Long,
     private val localDelayUs: Long,
     private val receivers: List<Long>,
     private val requestedBands: List<String>,

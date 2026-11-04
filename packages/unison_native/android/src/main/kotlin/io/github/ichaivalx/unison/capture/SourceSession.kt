@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
-internal class SourceSession(private val excludeUid: Int, @Volatile var latencyUs: Int,
+internal class SourceSession(private val excludeUid: Int, @Volatile var latencyUs: Long,
     @Volatile var localDelayUs: Long, private val onFatal: (Throwable) -> Unit) {
     private val MAGIC = 0x4E534E55
     private val SOURCE_PORT = 47800
@@ -25,6 +25,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
     private val FRAMES = 240
     private val AUDIO_HEADER = 28
     private val PCM_BYTES = FRAMES * 2 * 2
+    private val silentPacket by lazy { message(5, 20 + PCM_BYTES) }
     private val SUBSCRIBE_TIMEOUT_NS = 5_000_000_000L
     private val lifecycle = Any()
     private data class Subscriber(val id: Long, val lastNs: Long)
@@ -95,7 +96,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
 
     fun receiverIds(): List<Long> = subscribers.values.filter { System.nanoTime() - it.lastNs < SUBSCRIBE_TIMEOUT_NS }.map { it.id }.distinct()
     fun setDelay(us: Long) { check(calibration?.isRunning != true) { "校准中" }; check(us >= 0); effect?.setLocalDelay(us); localDelayUs = us; RootEvents.emit("source", status()) }
-    fun setLatency(us: Int) { check(calibration?.isRunning != true) { "校准中" }; latencyUs = us; RootEvents.emit("source", status()) }
+    fun setLatency(us: Long) { check(calibration?.isRunning != true) { "校准中" }; latencyUs = us; RootEvents.emit("source", status()) }
     fun cancelCalibration() { calibration?.cancel() }
     fun calibrate(ids: List<Long>, bands: List<String>, progress: (org.json.JSONObject) -> Unit,
         complete: (org.json.JSONObject?, Throwable?) -> Unit) {
@@ -260,8 +261,8 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
         peak.accumulateAndGet(packetPeak) { previous, current -> maxOf(previous, current) }
         val now = System.nanoTime()
         val currentCalibration = calibration
-        val silent = message(5, 20 + PCM_BYTES)
-        silent.put(data.array(), 8, AUDIO_HEADER - 8)
+        val silent = silentPacket
+        silent.position(8); silent.put(data.array(), 8, AUDIO_HEADER - 8)
         for ((subscriber, sub) in subscribers.entries) {
             if (now - sub.lastNs >= SUBSCRIBE_TIMEOUT_NS) { subscribers.remove(subscriber, sub); continue }
             val payload = if (currentCalibration?.isRunning == true && currentCalibration.networkTarget != sub.id) silent else data
@@ -305,7 +306,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     send(udp, pong, sender, "pong_send")
                 }
                 6 -> if (subscribers.remove(sender) != null) RootEvents.emit("source", status())
-                7 -> if (sender.address.hostAddress == "127.0.0.1" && data.remaining() >= 4 && calibration?.isRunning != true) latencyUs = data.int
+                7 -> if (sender.address.hostAddress == "127.0.0.1" && data.remaining() >= 4 && calibration?.isRunning != true) latencyUs = data.int.toLong()
             }
         }
     }
