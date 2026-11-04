@@ -7,7 +7,6 @@
 #include <android/log.h>
 #include <atomic>
 #include <chrono>
-#include <dlfcn.h>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -27,6 +26,8 @@ using ndk::ScopedAStatus;
 namespace {
 constexpr uint32_t kDataReady = 1u << 11; // AOSP IEffect V2 的 data MQ event
 constexpr uint32_t kMqChanged = 1u << 10;
+constexpr uint32_t kStatusNotFull = 0x01;
+constexpr uint32_t kStatusNotEmpty = 0x02;
 constexpr int kDelayParameter = 1;
 int64_t nowNs() { timespec t{}; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000LL + t.tv_nsec; }
 AudioUuid typeUuid() { return {static_cast<int32_t>(0x8e2581c2), 0x3d9a, 0x4e15, static_cast<int16_t>(0xa77a), {0x61,0x7f,0x6f,0x9e,0x82,0x01}}; }
@@ -214,7 +215,7 @@ private:
     }
     void stopWorker() {
         quit_ = true;
-        if (status_) status_->wake(kDataReady);
+        if (status_) status_->wake(kDataReady | kStatusNotFull);
         if (worker_.joinable()) worker_.join();
         if (state_ != State::INIT) state_ = State::IDLE;
     }
@@ -238,7 +239,7 @@ private:
         while (status_->wait(kDataReady, quit_)) {
             const int64_t callNs = nowNs();
             size_t n = std::min({input_->available(), output_->space(), work_.size()}) & ~size_t(1);
-            if (!n || !status_->space() || !input_->read(work_.data(), n)) continue;
+            if (!n || !input_->read(work_.data(), n)) continue;
             if (auto* next = pending_.exchange(nullptr)) {
                 if (activeDelay_) {
                     auto* previous = retired_.load();
@@ -266,8 +267,9 @@ private:
             }
             output_->write(work_.data(), n);
             const IEffect::Status result{0, static_cast<int32_t>(n), static_cast<int32_t>(n)};
-            status_->write(&result, 1);
-            status_->wake(1); // FMQ NOT_EMPTY，唤醒等待处理结果的 audioserver。
+            // audioserver 先写 input/wake data-ready，再 readBlocking(status)，最后读 output。
+            // 对应 AOSP writeBlocking：满时等 0x01；先发布状态，再唤醒 0x02。
+            if (!status_->writeBlocking(&result, 1, kStatusNotFull, kStatusNotEmpty, quit_)) return;
         }
     }
     std::mutex control_;
@@ -294,16 +296,8 @@ extern "C" __attribute__((visibility("default"))) binder_exception_t createEffec
     if (!uuid || !result) return EX_ILLEGAL_ARGUMENT;
     try {
         if (*uuid != implUuid()) return EX_ILLEGAL_ARGUMENT;
-        // 该 VINTF 标记符号由系统 libbinder_ndk 导出，但不在 NDK 公共链接桩中。
-        // 在发布 binder 前解析并标记，不引入任何设备库作为构建依赖。
-        using MarkVintf = void (*)(AIBinder*);
-        const auto mark = reinterpret_cast<MarkVintf>(dlsym(RTLD_DEFAULT, "AIBinder_markVintfStability"));
-        if (!mark) return EX_UNSUPPORTED_OPERATION;
-        auto instance = ndk::SharedRefBase::make<UnisonEffect>();
-        auto binder = instance->asBinder();
-        if (!binder.get()) return EX_ILLEGAL_STATE;
-        mark(binder.get());
-        *result = std::move(instance);
+        // 设备共享绑定负责创建及标记 Binder，Factory::fromBinder 也使用同一 Binder class。
+        *result = ndk::SharedRefBase::make<UnisonEffect>();
         return EX_NONE;
     }
     catch (...) { return EX_ILLEGAL_STATE; }

@@ -58,6 +58,7 @@ object CaptureMain {
     private var effectDroppedBatches: Long? = null
     private var effectActualDelayMs = 0
     private var effectIo = 0
+    private var timelineResets = 0L
     @Volatile private var localDelayMs = 0
     @Volatile private var running = true
     @Volatile private var latencyUs = 50_000
@@ -189,7 +190,8 @@ object CaptureMain {
                                     intervalMinNs / 1_000_000.0, intervalSumNs / intervalCount / 1_000_000.0, intervalMaxNs / 1_000_000.0)
                                 val text = "effect_frames/s=$effectFrames batch_frames_min_avg_max=$batches " +
                                     "call_interval_ms_min_avg_max=$intervals effect_dropped_frames=${effectDroppedFrames ?: "n/a"} " +
-                                    "effect_dropped_batches=${effectDroppedBatches ?: "n/a"} local_delay_ms=$effectActualDelayMs io=$effectIo "
+                                    "effect_dropped_batches=${effectDroppedBatches ?: "n/a"} local_delay_ms=$effectActualDelayMs io=$effectIo " +
+                                    "timeline_resets=$timelineResets "
                                 effectFrames = 0; effectBatches = 0; batchMin = Int.MAX_VALUE; batchMax = 0
                                 intervalCount = 0; intervalSumNs = 0; intervalMinNs = Long.MAX_VALUE; intervalMaxNs = 0
                                 text
@@ -295,6 +297,8 @@ object CaptureMain {
         var originNs = 0L
         var expectedFrame = 0L
         var previousCallNs = 0L
+        var previousFirstFrame = 0L
+        var previousBatchFrames = 0
         var filled = 0
         var packetTimeNs = 0L
         var sequence = 0
@@ -322,8 +326,20 @@ object CaptureMain {
                 stream = id; originNs = measuredOrigin; filled = 0; previousCallNs = 0
                 println("INFO effect_stream io=$io stream=$id rate=$rate")
             } else {
-                // 40ms 一批仅更新一次帧零点，批内仍按连续 48kHz 帧时钟展开。
-                originNs += (measuredOrigin - originNs) / 16
+                val elapsedNs = callNs - previousCallNs
+                val advancedFrames = firstFrame - previousFirstFrame
+                val residualNs = elapsedNs - framesToNs(advancedFrames)
+                // 超过一个批周期的时钟/帧进度分离视为中断；正常批内调度抖动仍平滑。
+                val toleranceNs = framesToNs(maxOf(previousBatchFrames, frames, FRAMES).toLong())
+                val interrupted = advancedFrames <= 0 || elapsedNs <= 0 || abs(residualNs) > toleranceNs
+                if (interrupted) {
+                    originNs = measuredOrigin
+                    filled = 0
+                    synchronized(diagnosticsLock) { timelineResets++ }
+                    println("INFO effect_timeline_reset residual_ms=${residualNs / 1_000_000.0} io=$io")
+                } else {
+                    originNs += (measuredOrigin - originNs) / 16
+                }
                 if (firstFrame != expectedFrame) {
                     sequence += ((firstFrame - expectedFrame + filled).coerceAtLeast(0) / FRAMES).toInt()
                     filled = 0
@@ -342,6 +358,8 @@ object CaptureMain {
                 effectActualDelayMs = actualDelay; effectIo = io; diagnosticReadFrames = expectedFrame
             }
             previousCallNs = callNs
+            previousFirstFrame = firstFrame
+            previousBatchFrames = frames
             for (frame in 0 until frames) {
                 if (filled == 0) packetTimeNs = originNs + framesToNs(firstFrame + frame)
                 repeat(2) { channel ->

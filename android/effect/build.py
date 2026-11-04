@@ -64,6 +64,8 @@ run(cmake, '-S', ROOT, '-B', BUILD / 'native-build', '-G', 'Ninja',
 run(cmake, '--build', BUILD / 'native-build', '--parallel', '4')
 
 module = ROOT.parent / 'ksu-module'
+for script in sorted(module.glob('*.sh')):
+    run('sh', '-n', script)
 out = BUILD / 'unison-tap-ksu.zip'
 with urllib.request.urlopen('https://www.apache.org/licenses/LICENSE-2.0.txt') as response:
     license_text = response.read()

@@ -111,7 +111,8 @@ class MainActivity : Activity() {
         localDelay = label("")
         fun adjustLocalDelay(ms: Int) {
             PlaybackService.localDelayMs = (PlaybackService.localDelayMs + ms).coerceAtLeast(0)
-            if (SourceController.isRunning) command(PlaybackService.LOCAL_DELAY)
+            // 不经过正在等待 SOURCE_START 的服务队列，启动中也保存最新期望值。
+            SourceController.setLocalDelay(PlaybackService.localDelayMs)
         }
         row("−5 ms" to { adjustLocalDelay(-5) }, "+5 ms" to { adjustLocalDelay(5) })
         logs = label("", 12f).apply { typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }

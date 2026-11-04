@@ -68,6 +68,14 @@ public:
         // 共享映射的 EventFlag 必须用跨进程 futex，不能用 FUTEX_*_PRIVATE。
         syscall(SYS_futex, event_, FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0);
     }
+    bool writeBlocking(const T* data, size_t n, uint32_t notFull, uint32_t notEmpty,
+                       const std::atomic<bool>& quit) {
+        while (!quit.load(std::memory_order_acquire)) {
+            if (write(data, n)) { wake(notEmpty); return true; }
+            if (!wait(notFull, quit)) return false;
+        }
+        return false;
+    }
     bool wait(uint32_t bits, const std::atomic<bool>& quit) {
         while (!quit.load(std::memory_order_acquire)) {
             uint32_t value = event_->load(std::memory_order_acquire);

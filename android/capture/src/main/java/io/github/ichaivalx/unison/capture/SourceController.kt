@@ -89,6 +89,9 @@ object SourceController {
         if (!started) {
             emit("ERROR source startup failed or timed out; check root permission and source output")
             stop()
+        } else {
+            // 启动命令只是快照；授权/启动等待期间 UI 仍可更新期望值。
+            setLocalDelay(localDelayMs)
         }
         return started
     }
@@ -143,7 +146,7 @@ object SourceController {
         commands.execute {
             if (process !== current || !isRunning) return@execute
             runCatching {
-                current.outputStream.write("LOCAL_DELAY $ms\n".toByteArray(Charsets.UTF_8))
+                current.outputStream.write("LOCAL_DELAY $localDelayMs\n".toByteArray(Charsets.UTF_8))
                 current.outputStream.flush()
             }.onFailure { if (isRunning) output?.invoke("ERROR local_delay: ${it.message}") }
         }
