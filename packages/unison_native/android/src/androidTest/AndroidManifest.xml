@@ -1,4 +1,0 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
-  <instrumentation android:name="io.github.ichaivalx.unison.nativebridge.NativeSmokeInstrumentation"
-    android:targetPackage="io.github.ichaivalx.unison" tools:replace="android:targetPackage"/>
-</manifest>

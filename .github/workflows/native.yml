@@ -65,10 +65,15 @@ jobs:
       - working-directory: app
         run: flutter build apk --debug --config-only --target-platform android-arm64
       - run: |
+          cat >> app/android/settings.gradle.kts <<'EOF'
+
+          include(":unison_native_smoke")
+          project(":unison_native_smoke").projectDir = file("../../packages/unison_native/tool/android_smoke")
+          EOF
           cd app/android
-          ./gradlew :unison_native:assembleDebugAndroidTest -Ptarget-platform=android-arm64
+          ./gradlew :unison_native_smoke:assembleDebug -Ptarget-platform=android-arm64
       - run: |
-          APK=$(find app/build/unison_native -name '*androidTest.apk' | head -1)
+          APK=$(find app/build/unison_native_smoke -name '*.apk' | head -1)
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" sign --ks app/android/debug.p12 --ks-type PKCS12 --ks-key-alias unison --ks-pass pass:android --key-pass pass:android --out native-smoke.apk "$APK"
       - uses: actions/upload-artifact@v4
         with:

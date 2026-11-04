@@ -15,7 +15,6 @@ configure<com.android.build.gradle.LibraryExtension> {
     ndkVersion = "30.0.16248370"
     defaultConfig {
         minSdk = 33
-        testInstrumentationRunner = "io.github.ichaivalx.unison.nativebridge.NativeSmokeInstrumentation"
         ndk { abiFilters += "arm64-v8a" }
         consumerProguardFiles("consumer-rules.pro")
         externalNativeBuild { cmake { arguments += "-DANDROID_STL=c++_static" } }
