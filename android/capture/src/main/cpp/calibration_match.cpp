@@ -32,7 +32,7 @@ static void fft(std::vector<std::complex<double>>& data, bool inverse) {
 
 extern "C" JNIEXPORT jdoubleArray JNICALL
 Java_io_github_ichaivalx_unison_capture_AcousticCalibration_detect(
-        JNIEnv* env, jobject, jfloatArray recording, jfloatArray sine, jfloatArray cosine) {
+        JNIEnv* env, jobject, jfloatArray recording, jfloatArray sine, jfloatArray cosine, jboolean directSound) {
     const auto length = static_cast<size_t>(env->GetArrayLength(recording));
     const auto m = static_cast<size_t>(env->GetArrayLength(sine));
     if (m == 0 || length < m + 3 || env->GetArrayLength(cosine) != static_cast<jsize>(m)) return nullptr;
@@ -70,7 +70,7 @@ Java_io_github_ichaivalx_unison_capture_AcousticCalibration_detect(
     // 最强峰前 15ms 内，取达到其一半且高于背景的最早局部峰。
     const double threshold = std::max(envelope[peak] * 0.5, noise * 8);
     const size_t earliest = peak > 720 ? peak - 720 : 1;
-    for (size_t i = earliest; i < peak; ++i) {
+    for (size_t i = earliest; directSound && i < peak; ++i) {
         if (envelope[i] >= threshold && envelope[i] >= envelope[i - 1] && envelope[i] >= envelope[i + 1]) {
             peak = i; break;
         }

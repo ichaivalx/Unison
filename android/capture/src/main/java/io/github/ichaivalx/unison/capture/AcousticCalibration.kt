@@ -57,6 +57,8 @@ internal class AcousticCalibration(
     @Volatile private var cancelled = false
     @Volatile private var window: Window? = null
     @Volatile private var micOriginNs: Long? = null
+    @Volatile private var micReadFrames = 0L
+    @Volatile private var micTimestampFrame = 0L
     @Volatile private var microphoneFailure: Throwable? = null
     @Volatile private var recorder: AudioRecord? = null
     @Volatile private var player: AudioTrack? = null
@@ -67,7 +69,7 @@ internal class AcousticCalibration(
     private var worker: Thread? = null
     private var micThread: Thread? = null
     private var playThread: Thread? = null
-    private external fun detect(samples: FloatArray, sine: FloatArray, cosine: FloatArray): DoubleArray?
+    private external fun detect(samples: FloatArray, sine: FloatArray, cosine: FloatArray, directSound: Boolean): DoubleArray?
 
     fun start() {
         isRunning = true
@@ -110,7 +112,7 @@ internal class AcousticCalibration(
             }
             track.play()
             playThread = thread(name = "calibration-output", isDaemon = true) { writeAudio(track) }
-            pause(1500)
+            pause(2500)
             check(micOriginNs != null) { "麦克风单调时钟时间戳不可用" }
             val delays = mutableListOf<List<Double>>()
             val settlingMs = maxOf(localDelayMs, latencyUs / 1000).coerceAtLeast(0) + 500L
@@ -144,21 +146,24 @@ internal class AcousticCalibration(
                         tap = current.tap.copyOf(current.tapCount)
                         mic = current.mic.copyOf(current.micCount)
                     }
-                    val reference = checkNotNull(detect(tap, sine, cosine)) { "tap 中没有完整测试音" }
-                    val received = checkNotNull(detect(mic, sine, cosine)) { "麦克风录音过短" }
+                    val reference = checkNotNull(detect(tap, sine, cosine, false)) { "tap 中没有完整测试音" }
+                    val received = checkNotNull(detect(mic, sine, cosine, true)) { "麦克风录音过短" }
+                    val micOrigin = checkNotNull(micOriginNs)
+                    val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
+                    val micTime = micOrigin + (current.micFirstFrame + received[0]) * 1_000_000_000.0 / RATE
+                    val offset = (micTime - tapTime) / 1_000_000.0
                     val tapMatch = reference[1] >= 8 && reference[2] >= 0.1
                     val micMatch = received[1] >= 8 && received[2] >= 0.1
                     event("detection") {
                         put("stage", side); put("round", round + 1)
                         put("tapSnr", reference[1]); put("tapMatch", reference[2])
                         put("snr", received[1]); put("match", received[2])
+                        put("offsetMs", offset); put("micOriginNs", micOrigin)
+                        put("micAheadFrames", micTimestampFrame - micReadFrames)
+                        put("tapNs", tapTime); put("micNs", micTime)
                     }
                     check(tapMatch) { "tap 扫频未可靠检出" }
                     check(micMatch) { "$side 扫频未可靠检出，请确认声音能到达麦克风并降低环境噪声" }
-                    val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
-                    val micTime = checkNotNull(micOriginNs) +
-                        (current.micFirstFrame + received[0]) * 1_000_000_000.0 / RATE
-                    val offset = (micTime - tapTime) / 1_000_000.0
                     values.add(offset)
                     event("round") {
                         put("stage", side); put("round", round + 1); put("offsetMs", offset)
@@ -212,10 +217,8 @@ internal class AcousticCalibration(
             try {
                 val minimum = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
                 input = AudioRecord(preset, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                    maxOf(minimum, RATE / 10 * 2))
+                    maxOf(minimum, RATE / 2 * 2))
                 check(input.state == AudioRecord.STATE_INITIALIZED) { "AudioRecord 未初始化" }
-                input.startRecording()
-                check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "麦克风录音未启动" }
                 recorder = input
                 for (effect in listOf(
                     if (AcousticEchoCanceler.isAvailable()) AcousticEchoCanceler.create(input.audioSessionId) else null,
@@ -226,6 +229,9 @@ internal class AcousticCalibration(
                         check(effect.setEnabled(false) == AudioEffect.SUCCESS && !effect.enabled) { "无法关闭麦克风预处理" }
                     }
                 }
+                // 先关闭预处理再开录音，避免创建效果期间产生无人读取的积压。
+                input.startRecording()
+                check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "麦克风录音未启动" }
                 event("microphone") { put("source", if (preset == MediaRecorder.AudioSource.UNPROCESSED) "UNPROCESSED" else "VOICE_RECOGNITION") }
                 val activeInput = checkNotNull(input)
                 micThread = thread(name = "calibration-microphone", isDaemon = true) { readMicrophone(activeInput) }
@@ -252,6 +258,7 @@ internal class AcousticCalibration(
                 if (cancelled) return
                 check(count > 0) { "麦克风读取失败：$count" }
                 if (input.getTimestamp(timestamp, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS && timestamp.nanoTime > 0) {
+                    micTimestampFrame = timestamp.framePosition
                     val origin = timestamp.nanoTime - frameNs(timestamp.framePosition)
                     if (timestamp.framePosition != previousTimestamp) {
                         micOriginNs = micOriginNs?.let { it + (origin - it) / 16 } ?: origin
@@ -266,6 +273,7 @@ internal class AcousticCalibration(
                     }
                 } }
                 readFrames += count
+                micReadFrames = readFrames
             }
         } catch (error: Exception) { if (!cancelled) microphoneFailure = error }
     }
