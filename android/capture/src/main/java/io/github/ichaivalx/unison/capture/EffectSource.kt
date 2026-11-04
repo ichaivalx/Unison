@@ -43,7 +43,7 @@ internal class EffectSource {
     private val getParameter = AudioEffect::class.java.getDeclaredMethod("getParameter", Int::class.javaPrimitiveType,
         IntArray::class.java).apply { isAccessible = true }
     private val getUid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientUid")
-    private val getSession = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getAudioSessionId")
+    private val getSession = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getSessionId")
     private val isActive = AudioPlaybackConfiguration::class.java.getDeclaredMethod("isActive")
     private external fun openTap(): Int
     private external fun readTap(fd: Int): ByteArray?
