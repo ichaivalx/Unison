@@ -48,6 +48,7 @@ class _Home extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final state = this.state;
     final padding = MediaQuery.paddingOf(context);
     final colors = context.colors;
     final connected = console.isSource || (state != null && console.connected.value);
@@ -78,7 +79,6 @@ class _Home extends StatelessWidget {
         ],
       ),
     );
-    final state = this.state;
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= _wide;

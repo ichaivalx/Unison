@@ -16,7 +16,6 @@ import 'ui/theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await LocalSettings.init();
-  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   final console = ValueNotifier<Console?>(null);
   runApp(UnisonApp(console: console));
   console.value = await _open();
