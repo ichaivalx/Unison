@@ -263,7 +263,7 @@ private:
             }
             const auto frames = static_cast<uint32_t>(n / 2);
             UnisonTapHeader header{UNISON_TAP_MAGIC, static_cast<uint32_t>(common_.input.base.sampleRate), frames,
-                common_.ioHandle, streamId_, frames_, callNs, droppedFrames_, droppedBatches_, activeDelay_ ? activeDelay_->milliseconds : 0, 0};
+                common_.ioHandle, streamId_, frames_, callNs, droppedFrames_, droppedBatches_, activeDelay_ ? activeDelay_->milliseconds : 0, common_.session};
             iovec vectors[] = {{&header, sizeof(header)}, {work_.data(), n * sizeof(float)}};
             msghdr message{};
             message.msg_name = &destination; message.msg_namelen = addressSize;

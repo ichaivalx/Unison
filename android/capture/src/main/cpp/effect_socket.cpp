@@ -32,7 +32,7 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_io_github_ichaivalx_unison_capture_EffectSource_readTap(JNIEnv* env, jobject, jint fd) {
     pollfd wait{fd, POLLIN, 0};
     int ready;
-    do { ready = poll(&wait, 1, 250); } while (ready < 0 && errno == EINTR);
+    do { ready = poll(&wait, 1, 5); } while (ready < 0 && errno == EINTR);
     if (ready == 0) return nullptr;
     if (ready < 0) { fail(env, "tap poll"); return nullptr; }
     const ssize_t count = recv(fd, nullptr, 0, MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT);

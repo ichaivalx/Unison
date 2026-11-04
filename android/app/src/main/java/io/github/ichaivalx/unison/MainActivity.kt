@@ -3,12 +3,14 @@ package io.github.ichaivalx.unison
 import android.app.Activity
 import android.Manifest
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -66,8 +68,15 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val scroll = ScrollView(this).apply { addView(root) }
+        val background = 0xff14171c.toInt()
+        window.decorView.setBackgroundColor(background)
+        window.insetsController?.setSystemBarsAppearance(0,
+            WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(background)
+        }
+        val scroll = ScrollView(this).apply { setBackgroundColor(background); addView(root) }
         scroll.setOnApplyWindowInsetsListener { view, insets ->
             val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
@@ -77,6 +86,7 @@ class MainActivity : Activity() {
         fun label(text: String, size: Float = 16f): TextView = TextView(this).apply {
             this.text = text
             textSize = size
+            setTextColor(0xffe6e9ef.toInt())
             setPadding(0, dp(8), 0, dp(8))
             root.addView(this)
         }
@@ -84,6 +94,8 @@ class MainActivity : Activity() {
             val layout = LinearLayout(this)
             for ((text, action) in items) layout.addView(Button(this).apply {
                 this.text = text
+                setTextColor(0xfff3f5f8.toInt())
+                backgroundTintList = ColorStateList.valueOf(0xff343c49.toInt())
                 setOnClickListener { action() }
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             root.addView(layout)

@@ -39,6 +39,7 @@ class PlaybackService : Service() {
         private val worker = Executors.newSingleThreadExecutor()
         private val lines = ArrayDeque<String>()
         private fun log(line: String) = synchronized(lines) {
+            android.util.Log.i("UnisonSource", line)
             lines.addLast(line)
             while (lines.size > 20) lines.removeFirst()
         }

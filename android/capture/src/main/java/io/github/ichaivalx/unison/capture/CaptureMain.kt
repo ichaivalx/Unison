@@ -35,6 +35,7 @@ object CaptureMain {
     private val lifecycle = Any()
     private val subscribers = ConcurrentHashMap<InetSocketAddress, Long>()
     private val packetCount = AtomicLong()
+    private val subscribeCount = AtomicLong()
     private val sendCount = AtomicLong()
     private val droppedCount = AtomicLong()
     private val errorCount = AtomicLong()
@@ -57,7 +58,6 @@ object CaptureMain {
     private var effectDroppedFrames: Long? = null
     private var effectDroppedBatches: Long? = null
     private var effectActualDelayMs = 0
-    private var effectIo = 0
     private var timelineResets = 0L
     @Volatile private var localDelayMs = 0
     @Volatile private var running = true
@@ -146,7 +146,7 @@ object CaptureMain {
                     stage = "audio_effect"
                     val source = EffectSource()
                     effect = source
-                    source.start(localDelayMs)
+                    source.start(appUid, localDelayMs)
                 } else {
                     stage = "audio_policy"
                     val playback = PlaybackCapture()
@@ -176,6 +176,7 @@ object CaptureMain {
                             if (now - subscribedNs >= SUBSCRIBE_TIMEOUT_NS) subscribers.remove(subscriber, subscribedNs)
                         }
                         broadcast(udp, beacon)
+                        val effectStatus = effect?.status().orEmpty()
                         val diagnostics = synchronized(diagnosticsLock) {
                             val ages = if (ageCount == 0L) "n/a" else String.format(Locale.ROOT, "%.2f/%.2f/%.2f",
                                 ageMinNs / 1_000_000.0, ageSumNs / ageCount / 1_000_000.0, ageMaxNs / 1_000_000.0)
@@ -190,7 +191,7 @@ object CaptureMain {
                                     intervalMinNs / 1_000_000.0, intervalSumNs / intervalCount / 1_000_000.0, intervalMaxNs / 1_000_000.0)
                                 val text = "effect_frames/s=$effectFrames batch_frames_min_avg_max=$batches " +
                                     "call_interval_ms_min_avg_max=$intervals effect_dropped_frames=${effectDroppedFrames ?: "n/a"} " +
-                                    "effect_dropped_batches=${effectDroppedBatches ?: "n/a"} local_delay_ms=$effectActualDelayMs io=$effectIo " +
+                                    "effect_dropped_batches=${effectDroppedBatches ?: "n/a"} local_delay_ms=$effectActualDelayMs $effectStatus " +
                                     "timeline_resets=$timelineResets "
                                 effectFrames = 0; effectBatches = 0; batchMin = Int.MAX_VALUE; batchMax = 0
                                 intervalCount = 0; intervalSumNs = 0; intervalMinNs = Long.MAX_VALUE; intervalMaxNs = 0
@@ -202,6 +203,7 @@ object CaptureMain {
                         }
                         println("STATUS subscribers=${subscribers.size} packets/s=${packetCount.getAndSet(0)} " +
                             "sent/s=${sendCount.getAndSet(0)} dropped=${droppedCount.get()} " +
+                            "subscribe/s=${subscribeCount.getAndSet(0)} peers=[${subscribers.keys.joinToString(",")}] " +
                             "timestamp=$timestampSource latency_us=$latencyUs " +
                             "$diagnostics " +
                             "peak=${peak.getAndSet(0)} errors=${errorCount.get()} last_error=$lastError")
@@ -293,94 +295,138 @@ object CaptureMain {
             position(20)
             putInt(SAMPLE_RATE).put(2.toByte()).put(1.toByte()).putShort(FRAMES.toShort())
         }
-        var stream: Long? = null
-        var originNs = 0L
-        var expectedFrame = 0L
-        var previousCallNs = 0L
-        var previousFirstFrame = 0L
-        var previousBatchFrames = 0
-        var filled = 0
-        var packetTimeNs = 0L
+        class Chunk(val startNs: Long, val samples: FloatArray) {
+            val frames get() = samples.size / 2
+            val endNs get() = startNs + framesToNs(frames.toLong())
+        }
+        class Stream(val id: Long, var originNs: Long) {
+            var previousCallNs = 0L
+            var previousFrame = 0L
+            var previousBatch = 0
+            var expectedFrame = 0L
+            var droppedFrames = 0L
+            var droppedBatches = 0L
+            val chunks = ArrayDeque<Chunk>()
+        }
+        val streams = mutableMapOf<Int, Stream>()
+        val mixed = FloatArray(FRAMES * 2)
+        var cursorNs: Long? = null
         var sequence = 0
-        timestampSource = "effect-mix-clock"
+        timestampSource = "effect-session-clock"
         while (running) {
-            val raw = source.read() ?: continue
-            val receivedNs = System.nanoTime()
-            val batch = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-            check(raw.size >= 64 && batch.int == 0x31585455) { "Invalid effect tap header" }
-            val rate = batch.int
-            val frames = batch.int
-            val io = batch.int
-            val id = batch.long
-            val firstFrame = batch.long
-            val callNs = batch.long
-            val droppedFrames = batch.long
-            val droppedBatches = batch.long
-            val actualDelay = batch.int
-            batch.int
-            check(frames > 0 && raw.size.toLong() == 64L + frames.toLong() * 8) { "Invalid effect batch size" }
-            check(rate == SAMPLE_RATE) { "Effect tap rate=$rate; UDP prototype requires $SAMPLE_RATE" }
-            val measuredOrigin = callNs - framesToNs(firstFrame)
-            if (stream != id) {
-                if (stream != null) {
-                    sequence += 2
-                    println("INFO effect_stream_changed io=$io stream=$id")
-                }
-                stream = id; originNs = measuredOrigin; filled = 0; previousCallNs = 0
-                println("INFO effect_stream io=$io stream=$id rate=$rate")
-            } else {
-                val elapsedNs = callNs - previousCallNs
-                val advancedFrames = firstFrame - previousFirstFrame
-                val residualNs = elapsedNs - framesToNs(advancedFrames)
-                // 超过一个批周期的时钟/帧进度分离视为中断；正常批内调度抖动仍平滑。
-                val toleranceNs = framesToNs(maxOf(previousBatchFrames, frames, FRAMES).toLong())
-                val interrupted = advancedFrames <= 0 || elapsedNs <= 0 || abs(residualNs) > toleranceNs
-                if (interrupted) {
-                    originNs = measuredOrigin
-                    // 跨中断不使用相邻 seq，防止接收端把旧包长度拉伸到新的时间轴。
-                    sequence += 2
-                    filled = 0
-                    synchronized(diagnosticsLock) { timelineResets++ }
-                    println("INFO effect_timeline_reset residual_ms=${residualNs / 1_000_000.0} io=$io")
-                } else {
-                    originNs += (measuredOrigin - originNs) / 16
-                }
-                if (firstFrame != expectedFrame) {
-                    sequence += ((firstFrame - expectedFrame + filled).coerceAtLeast(0) / FRAMES).toInt()
-                    filled = 0
-                }
-            }
-            expectedFrame = firstFrame + frames
-            synchronized(diagnosticsLock) {
-                effectFrames += frames; effectBatches++
-                batchMin = minOf(batchMin, frames); batchMax = maxOf(batchMax, frames)
-                if (previousCallNs != 0L) {
-                    val interval = callNs - previousCallNs
-                    intervalCount++; intervalSumNs += interval
-                    intervalMinNs = minOf(intervalMinNs, interval); intervalMaxNs = maxOf(intervalMaxNs, interval)
-                }
-                effectDroppedFrames = droppedFrames; effectDroppedBatches = droppedBatches
-                effectActualDelayMs = actualDelay; effectIo = io; diagnosticReadFrames = expectedFrame
-            }
-            previousCallNs = callNs
-            previousFirstFrame = firstFrame
-            previousBatchFrames = frames
-            for (frame in 0 until frames) {
-                if (filled == 0) packetTimeNs = originNs + framesToNs(firstFrame + frame)
-                repeat(2) { channel ->
-                    val pcm = (batch.float * 32768f).toInt().coerceIn(-32768, 32767)
-                    data.putShort(AUDIO_HEADER + filled * 4 + channel * 2, pcm.toShort())
-                }
-                if (++filled == FRAMES) {
-                    data.putInt(8, sequence++)
-                    data.putLong(12, packetTimeNs / 1000 + latencyUs)
-                    synchronized(diagnosticsLock) {
-                        val age = receivedNs - packetTimeNs
-                        ageCount++; ageSumNs += age
-                        ageMinNs = minOf(ageMinNs, age); ageMaxNs = maxOf(ageMaxNs, age)
+            val raw = source.read()
+            val active = source.activeSessions()
+            streams.keys.retainAll(active)
+            if (raw != null) {
+                val batch = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+                check(raw.size >= 64 && batch.int == 0x31585455) { "Invalid effect tap header" }
+                val rate = batch.int
+                val frames = batch.int
+                val io = batch.int
+                val id = batch.long
+                val firstFrame = batch.long
+                val callNs = batch.long
+                val droppedFrames = batch.long
+                val droppedBatches = batch.long
+                val actualDelay = batch.int
+                val session = batch.int
+                check(frames > 0 && raw.size.toLong() == 64L + frames.toLong() * 8) { "Invalid effect batch size" }
+                check(rate == SAMPLE_RATE) { "Effect tap rate=$rate; UDP prototype requires $SAMPLE_RATE" }
+                if (source.acceptStream(session, io)) {
+                    val measuredOrigin = callNs - framesToNs(firstFrame)
+                    var stream = streams[session]
+                    if (stream == null || stream.id != id) {
+                        if (stream != null) { sequence += 2; if (streams.size == 1) cursorNs = null }
+                        stream = Stream(id, measuredOrigin)
+                        streams[session] = stream
+                        println("INFO effect_stream session=$session io=$io stream=$id rate=$rate")
+                    } else {
+                        val elapsedNs = callNs - stream.previousCallNs
+                        val advancedFrames = firstFrame - stream.previousFrame
+                        val residualNs = elapsedNs - framesToNs(advancedFrames)
+                        val toleranceNs = framesToNs(maxOf(stream.previousBatch, frames, FRAMES).toLong())
+                        if (advancedFrames <= 0 || elapsedNs <= 0 || abs(residualNs) > toleranceNs) {
+                            stream.originNs = measuredOrigin
+                            stream.chunks.clear()
+                            if (streams.size == 1) cursorNs = null
+                            sequence += 2
+                            synchronized(diagnosticsLock) { timelineResets++ }
+                            println("INFO effect_timeline_reset session=$session residual_ms=${residualNs / 1_000_000.0} io=$io")
+                        } else stream.originNs += (measuredOrigin - stream.originNs) / 16
+                        if (firstFrame != stream.expectedFrame) {
+                            sequence += 2
+                            stream.chunks.clear()
+                            if (streams.size == 1) cursorNs = null
+                        }
                     }
-                    publishAudio(udp, data)
-                    filled = 0
+                    synchronized(diagnosticsLock) {
+                        effectFrames += frames; effectBatches++
+                        batchMin = minOf(batchMin, frames); batchMax = maxOf(batchMax, frames)
+                        if (stream.previousCallNs != 0L) {
+                            val interval = callNs - stream.previousCallNs
+                            intervalCount++; intervalSumNs += interval
+                            intervalMinNs = minOf(intervalMinNs, interval); intervalMaxNs = maxOf(intervalMaxNs, interval)
+                        }
+                        effectActualDelayMs = actualDelay
+                        diagnosticReadFrames += frames
+                    }
+                    stream.previousCallNs = callNs; stream.previousFrame = firstFrame; stream.previousBatch = frames
+                    stream.expectedFrame = firstFrame + frames
+                    stream.droppedFrames = droppedFrames; stream.droppedBatches = droppedBatches
+                    val samples = FloatArray(frames * 2)
+                    batch.asFloatBuffer().get(samples)
+                    stream.chunks.addLast(Chunk(stream.originNs + framesToNs(firstFrame), samples))
+                }
+            }
+            synchronized(diagnosticsLock) {
+                effectDroppedFrames = streams.values.sumOf { it.droppedFrames }
+                effectDroppedBatches = streams.values.sumOf { it.droppedBatches }
+            }
+            if (streams.isEmpty()) {
+                if (cursorNs != null) sequence += 2
+                cursorNs = null
+                continue
+            }
+            while (running) {
+                val chunks = streams.values.flatMap { it.chunks }
+                val firstNs = chunks.minOfOrNull { it.startNs } ?: break
+                var startNs = cursorNs ?: firstNs
+                if (firstNs > startNs + framesToNs(FRAMES.toLong())) {
+                    // 空窗不延长旧包；序号不相邻，使接收端按正常包长结束旧包。
+                    sequence += 2
+                    startNs = firstNs
+                }
+                val endNs = startNs + framesToNs(FRAMES.toLong())
+                if (chunks.maxOf { it.endNs } + 10_000 < endNs) break
+                // 多会话批次错开到达时等到该量子末端，避免先到的流抢先发出。
+                // 单会话仍在收到完整量子时立即发送。
+                if (active.any { (streams[it]?.chunks?.lastOrNull()?.endNs ?: Long.MIN_VALUE) + 10_000 < endNs }
+                    && System.nanoTime() < endNs) break
+                mixed.fill(0f)
+                for (chunk in chunks) {
+                    val offset = Math.round((chunk.startNs - startNs) * SAMPLE_RATE / 1_000_000_000.0).toInt()
+                    val destination = maxOf(0, offset)
+                    val sourceFrame = maxOf(0, -offset)
+                    val count = minOf(FRAMES - destination, chunk.frames - sourceFrame)
+                    for (frame in 0 until count) for (channel in 0..1) {
+                        mixed[(destination + frame) * 2 + channel] += chunk.samples[(sourceFrame + frame) * 2 + channel]
+                    }
+                }
+                for (sample in mixed.indices) {
+                    val pcm = (mixed[sample] * 32768f).toInt().coerceIn(-32768, 32767)
+                    data.putShort(AUDIO_HEADER + sample * 2, pcm.toShort())
+                }
+                data.putInt(8, sequence++)
+                data.putLong(12, startNs / 1000 + latencyUs)
+                synchronized(diagnosticsLock) {
+                    val age = System.nanoTime() - startNs
+                    ageCount++; ageSumNs += age
+                    ageMinNs = minOf(ageMinNs, age); ageMaxNs = maxOf(ageMaxNs, age)
+                }
+                publishAudio(udp, data)
+                cursorNs = endNs
+                for (stream in streams.values) while (stream.chunks.firstOrNull()?.let { it.endNs <= endNs + 10_000 } == true) {
+                    stream.chunks.removeFirst()
                 }
             }
         }
@@ -417,7 +463,10 @@ object CaptureMain {
                     if (data.remaining() < 10) continue
                     data.long // receiverId；订阅按源地址和端口识别。
                     val nameLength = data.short.toInt() and 0xffff
-                    if (data.remaining() >= nameLength) subscribers[sender] = System.nanoTime()
+                    if (data.remaining() >= nameLength) {
+                        subscribers[sender] = System.nanoTime()
+                        subscribeCount.incrementAndGet()
+                    }
                 }
                 3 -> {
                     if (data.remaining() < 12) continue

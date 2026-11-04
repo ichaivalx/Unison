@@ -15,7 +15,7 @@ struct UnisonTapHeader {
     uint64_t droppedFrames;
     uint64_t droppedBatches;
     int32_t localDelayMs;
-    uint32_t reserved;
+    int32_t sessionId;
 };
 #ifdef __cplusplus
 static_assert(sizeof(UnisonTapHeader) == 64);

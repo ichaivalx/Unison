@@ -1,58 +1,149 @@
 package io.github.ichaivalx.unison.capture
 
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
 import android.media.audiofx.AudioEffect
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import java.util.UUID
 import kotlin.concurrent.thread
 
 internal class EffectSource {
+    private class Session(val uid: Int, val id: Int, val effect: AudioEffect) {
+        @Volatile var io: Int? = null
+    }
+    private val lock = Any()
+    private val sessions = linkedMapOf<Int, Session>()
+    private val failed = mutableSetOf<Int>()
     private var socket = -1
-    private var effect: AudioEffect? = null
     private var factory: IBinder? = null
+    private lateinit var manager: AudioManager
+    private val callbacks = HandlerThread("effect-sessions")
+    private lateinit var handler: Handler
+    private var excludeUid = -1
+    @Volatile private var delayMs = 0
     @Volatile private var deathReason: String? = null
     @Volatile private var closed = false
     private var healthThread: Thread? = null
     private val deathRecipient = IBinder.DeathRecipient { deathReason = "HAL effect factory binder died" }
+    private val callback = object : AudioManager.AudioPlaybackCallback() {
+        override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
+            try { reconcile(configs) } catch (error: Exception) {
+                if (!closed) deathReason = "Playback configuration failed: ${error.cause ?: error}"
+            }
+        }
+    }
+    private val constructor = AudioEffect::class.java.getDeclaredConstructor(UUID::class.java, UUID::class.java,
+        Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).apply { isAccessible = true }
+    private val setParameter = AudioEffect::class.java.getDeclaredMethod("setParameter", Int::class.javaPrimitiveType,
+        Int::class.javaPrimitiveType).apply { isAccessible = true }
+    private val getParameter = AudioEffect::class.java.getDeclaredMethod("getParameter", Int::class.javaPrimitiveType,
+        IntArray::class.java).apply { isAccessible = true }
+    private val getUid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientUid")
+    private val getSession = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getAudioSessionId")
+    private val isActive = AudioPlaybackConfiguration::class.java.getDeclaredMethod("isActive")
     private external fun openTap(): Int
     private external fun readTap(fd: Int): ByteArray?
     private external fun closeTap(fd: Int)
 
-    fun start(localDelayMs: Int) {
-        PlaybackCapture.systemContext()
+    fun start(appUid: Int, localDelayMs: Int) {
+        val context = PlaybackCapture.systemContext()
+        excludeUid = appUid
+        delayMs = localDelayMs
+        manager = AudioManager::class.java.getDeclaredConstructor(Context::class.java).newInstance(context)
         socket = openTap()
         val binder = Class.forName("android.os.ServiceManager").getDeclaredMethod("checkService", String::class.java)
             .invoke(null, "android.hardware.audio.effect.IFactory/default") as? IBinder
         check(binder != null) { "HAL effect factory is unavailable" }
         factory = binder
         binder.linkToDeath(deathRecipient, 0)
-        val constructor = AudioEffect::class.java.getDeclaredConstructor(UUID::class.java, UUID::class.java,
-            Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).apply { isAccessible = true }
-        val instance = constructor.newInstance(
-            UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8201"),
-            UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, 0)
-        effect = instance
-        setLocalDelay(localDelayMs)
-        check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable Unison Tap" }
-        // 健康探测不占采集线程；HAL 死亡时，即使探测中的同步 Binder 调用卡住也能退出。
+        callbacks.start()
+        handler = Handler(callbacks.looper)
+        manager.registerAudioPlaybackCallback(callback, handler)
+        reconcile(manager.activePlaybackConfigurations)
+        // 探测不占采集线程；HAL 死亡后只退出，不重新创建效果。
         healthThread = thread(name = "effect-health", isDaemon = true) {
             while (!closed) {
-                try { probeEffect() } catch (error: Exception) {
-                    if (!closed) deathReason = "AudioEffect invalid: ${error.cause ?: error}"
-                    return@thread
+                val snapshot = synchronized(lock) { sessions.values.toList() }
+                for (session in snapshot) {
+                    try {
+                        check(session.effect.hasControl() && session.effect.enabled) { "lost control or disabled" }
+                        val value = IntArray(1)
+                        check(getParameter.invoke(session.effect, 1, value) == 1) { "health getParameter failed" }
+                    } catch (error: Exception) {
+                        if (!closed && synchronized(lock) { sessions[session.id] === session }) {
+                            deathReason = "AudioEffect invalid session=${session.id}: ${error.cause ?: error}"
+                            return@thread
+                        }
+                    }
                 }
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { return@thread }
             }
         }
-        println("INFO effect=Unison_Tap session=0 local_delay_ms=$localDelayMs")
+        println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_ms=$localDelayMs")
+    }
+
+    private fun reconcile(configs: List<AudioPlaybackConfiguration>) = synchronized(lock) {
+        if (closed || deathReason != null) return@synchronized
+        val wanted = linkedMapOf<Int, Int>()
+        for (config in configs) {
+            val usage = config.audioAttributes.usage
+            if (isActive.invoke(config) != true || usage !in intArrayOf(AudioAttributes.USAGE_MEDIA,
+                    AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN)) continue
+            val uid = getUid.invoke(config) as Int
+            val session = getSession.invoke(config) as Int
+            // session 0 是输出混音，不是播放器会话。
+            if (uid >= 0 && uid != excludeUid && session > 0) wanted[session] = uid
+        }
+        for (id in sessions.keys.toList()) if (id !in wanted) {
+            val session = sessions.remove(id)!!
+            release(session)
+            println("INFO effect_detached uid=${session.uid} session=$id io=${session.io ?: "pending"}")
+        }
+        failed.retainAll(wanted.keys)
+        for ((id, uid) in wanted) {
+            if (id in sessions || id in failed) continue
+            var instance: AudioEffect? = null
+            try {
+                instance = constructor.newInstance(UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8201"),
+                    UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, id)
+                check(setParameter.invoke(instance, 1, delayMs) == AudioEffect.SUCCESS) { "Cannot set local delay" }
+                check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
+                sessions[id] = Session(uid, id, instance)
+                println("INFO effect_attached uid=$uid session=$id local_delay_ms=$delayMs")
+            } catch (error: Exception) {
+                runCatching { instance?.release() }
+                failed.add(id)
+                // FAST/DIRECT 等拒绝挂载时保持播放器原路播放；不循环创建或改动其音量。
+                println("ERROR effect_attach uid=$uid session=$id error=${error.cause ?: error}")
+            }
+        }
     }
 
     fun setLocalDelay(ms: Int) {
         require(ms >= 0) { "本机延迟不能为负数" }
-        val instance = checkNotNull(effect)
-        val method = AudioEffect::class.java.getDeclaredMethod("setParameter", Int::class.javaPrimitiveType,
-            Int::class.javaPrimitiveType).apply { isAccessible = true }
-        val result = method.invoke(instance, 1, ms) as Int
-        check(result == AudioEffect.SUCCESS) { "Effect setParameter(delay=$ms) returned $result" }
+        synchronized(lock) {
+            delayMs = ms
+            for (session in sessions.values) check(setParameter.invoke(session.effect, 1, ms) == AudioEffect.SUCCESS) {
+                "Effect setParameter(delay=$ms) failed session=${session.id}"
+            }
+        }
+    }
+
+    fun acceptStream(session: Int, io: Int): Boolean = synchronized(lock) {
+        val entry = sessions[session] ?: return@synchronized false
+        entry.io = io
+        true
+    }
+
+    fun activeSessions(): Set<Int> = synchronized(lock) { sessions.keys.toSet() }
+
+    fun status(): String = synchronized(lock) {
+        "sessions=[${sessions.values.joinToString(",") { "${it.uid}/${it.id}/io:${it.io ?: "pending"}" }}] " +
+            "attach_failed=[${failed.joinToString(",")}]"
     }
 
     fun read(): ByteArray? {
@@ -67,32 +158,25 @@ internal class EffectSource {
         deathReason?.let { error(it) }
     }
 
-    private fun probeEffect() {
-        val instance = checkNotNull(effect)
-        check(instance.hasControl() && instance.enabled) { "AudioEffect lost control or became disabled" }
-        val value = IntArray(1)
-        val method = AudioEffect::class.java.getDeclaredMethod("getParameter", Int::class.javaPrimitiveType,
-            IntArray::class.java).apply { isAccessible = true }
-        val result = method.invoke(instance, 1, value) as Int
-        // int[] 重载返回有效整数个数，不是底层 byte[] 接口的字节数。
-        check(result == value.size) { "AudioEffect health getParameter returned $result" }
+    private fun release(session: Session) {
+        if (deathReason == null && factory?.isBinderAlive == true) {
+            try { session.effect.setEnabled(false) } finally { session.effect.release() }
+        }
     }
 
     fun close() {
         closed = true
         healthThread?.interrupt()
-        try {
-            effect?.takeIf { deathReason == null && factory?.isBinderAlive == true }?.let { instance ->
-                try { instance.setEnabled(false) } finally { instance.release() }
-            }
-            // 死亡的 HAL/失效效果不再做同步 Binder 调用，也不重建；进程退出释放客户端引用。
-            if (deathReason != null) println("INFO release_effect=dead_endpoint reason=$deathReason")
-        } finally {
-            runCatching { factory?.unlinkToDeath(deathRecipient, 0) }
-            factory = null
-            effect = null
-            closeTap(socket)
-            socket = -1
+        if (::handler.isInitialized) manager.unregisterAudioPlaybackCallback(callback)
+        callbacks.quitSafely()
+        synchronized(lock) {
+            for (session in sessions.values) runCatching { release(session) }
+                .onFailure { println("ERROR release_effect session=${session.id} error=$it") }
+            sessions.clear()
         }
+        runCatching { factory?.unlinkToDeath(deathRecipient, 0) }
+        factory = null
+        closeTap(socket)
+        socket = -1
     }
 }
