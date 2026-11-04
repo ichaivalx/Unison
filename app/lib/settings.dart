@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:unison_native/unison_native.dart';
 
 import 'control/models.dart';
 
@@ -24,6 +25,7 @@ abstract final class LocalSettings {
   static const _deviceIdKey = 'deviceId';
   static const _lastSourceKey = 'lastSource';
   static const _outputDeviceKey = 'outputDevice';
+  static const _outputNameKey = 'outputDeviceName';
 
   static late final ValueNotifier<DarkVariant> theme;
 
@@ -64,8 +66,22 @@ abstract final class LocalSettings {
   static set lastSource(String? value) =>
       value == null ? prefs.remove(_lastSourceKey) : prefs.setString(_lastSourceKey, value);
 
-  /// Windows 的输出设备，null 为跟随系统默认
-  static String? get outputDevice => prefs.getString(_outputDeviceKey);
-  static set outputDevice(String? value) =>
-      value == null ? prefs.remove(_outputDeviceKey) : prefs.setString(_outputDeviceKey, value);
+  /// Windows 选定的输出设备（endpoint id 与显示名），null 为跟随系统默认；设备
+  /// 暂时不在列表中时仍保留
+  static OutputDevice? get outputDevice => switch (prefs.getString(_outputDeviceKey)) {
+    final id? => OutputDevice(id: id, name: prefs.getString(_outputNameKey) ?? id),
+    null => null,
+  };
+
+  static set outputDevice(OutputDevice? value) {
+    if (value == null) {
+      prefs
+        ..remove(_outputDeviceKey)
+        ..remove(_outputNameKey);
+    } else {
+      prefs
+        ..setString(_outputDeviceKey, value.id)
+        ..setString(_outputNameKey, value.name);
+    }
+  }
 }

@@ -18,7 +18,9 @@ Future<void> main() async {
   await LocalSettings.init();
   final console = ValueNotifier<Console?>(null);
   runApp(UnisonApp(console: console));
-  console.value = await _open();
+  final opened = console.value = await _open();
+  // 界面已在前台时补一次唤醒；之后由回到前台触发
+  if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) opened.wake();
 }
 
 Future<Console> _open() async {

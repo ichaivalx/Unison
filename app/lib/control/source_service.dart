@@ -187,6 +187,12 @@ class SourceService implements Console {
       _media = media;
       _publish();
     }, onError: (_) {});
+    // 通知上的“退出”：原生已停止音源，下次启动 App 不再自动启动
+    UnisonNative.exitRequests.listen((_) {
+      _enabled = false;
+      _prefs.setBool(_enabledKey, false);
+      _publish();
+    }, onError: (_) {});
     UnisonNative.volumeChanges.listen((volume) {
       _volume = volume;
       // 临时提高期间用户调整了本机音量：以调整为准，不再恢复

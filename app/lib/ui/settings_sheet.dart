@@ -22,8 +22,8 @@ class _SettingsSheet extends StatefulWidget {
 }
 
 class _SettingsSheetState extends State<_SettingsSheet> {
-  List<String>? _outputs;
-  String? _output = LocalSettings.outputDevice;
+  List<OutputDevice>? _outputs;
+  OutputDevice? _output = LocalSettings.outputDevice;
 
   @override
   void initState() {
@@ -40,11 +40,12 @@ class _SettingsSheetState extends State<_SettingsSheet> {
     }
   }
 
-  Future<void> _setOutput(String? name) async {
-    setState(() => _output = name);
-    LocalSettings.outputDevice = name;
+  Future<void> _setOutput(String? id) async {
+    final device = id == null ? null : _outputs?.firstWhere((d) => d.id == id, orElse: () => _output!);
+    setState(() => _output = device);
+    LocalSettings.outputDevice = device;
     try {
-      await UnisonNative.setOutputDevice(name);
+      await UnisonNative.setOutputDevice(id);
     } catch (_) {}
   }
 
@@ -80,16 +81,30 @@ class _SettingsSheetState extends State<_SettingsSheet> {
             const SizedBox(height: 6),
             if (_outputs case final outputs?)
               RadioGroup<String?>(
-                groupValue: _output,
+                groupValue: _output?.id,
                 onChanged: _setOutput,
                 child: Column(
                   children: [
-                    for (final name in <String?>[null, ...outputs])
+                    const RadioListTile<String?>(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      value: null,
+                      title: Text('跟随系统默认'),
+                    ),
+                    for (final device in outputs)
                       RadioListTile<String?>(
                         contentPadding: EdgeInsets.zero,
                         dense: true,
-                        value: name,
-                        title: Text(name ?? '跟随系统默认'),
+                        value: device.id,
+                        title: Text(device.name),
+                      ),
+                    // 选定的设备暂时不在时仍保留，重新出现后原生自动切回
+                    if (_output case final selected? when !outputs.any((d) => d.id == selected.id))
+                      RadioListTile<String?>(
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        value: selected.id,
+                        title: Text('${selected.name}（未连接）'),
                       ),
                   ],
                 ),

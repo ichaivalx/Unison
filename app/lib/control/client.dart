@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:unison_native/unison_native.dart';
@@ -41,13 +42,18 @@ class ConsoleClient implements Console {
   @override
   bool get isSource => false;
 
-  late final _transport = ConsoleTransport(
+  late ConsoleTransport _transport = _newTransport();
+
+  ConsoleTransport _newTransport() => ConsoleTransport(
     onConnected: _onConnected,
     onMessage: _onMessage,
     onDisconnected: () => _connected.value = false,
     onSource: (source) => LocalSettings.lastSource = source,
     lastSource: LocalSettings.lastSource,
   );
+
+  /// 用户从通知退出后不再连接，回到前台时重新开始
+  bool _exited = false;
 
   int? _receiverId;
 
@@ -73,6 +79,7 @@ class ConsoleClient implements Console {
   Future<void> _start() async {
     UnisonNative.receiverStats.listen(_onStats, onError: (_) {});
     UnisonNative.volumeChanges.listen(_onVolume, onError: (_) {});
+    UnisonNative.exitRequests.listen((_) => _exit(), onError: (_) {});
     await _transport.start();
     Timer.periodic(const Duration(seconds: 1), (_) => _report());
     _initNative();
@@ -86,7 +93,7 @@ class ConsoleClient implements Console {
     } catch (_) {}
     if (LocalSettings.outputDevice case final device?) {
       try {
-        await UnisonNative.setOutputDevice(device);
+        await UnisonNative.setOutputDevice(device.id);
       } catch (_) {}
     }
     try {
@@ -94,10 +101,30 @@ class ConsoleClient implements Console {
     } catch (_) {}
   }
 
+  /// 回到前台：Android 上保持常驻（首次会申请通知权限），并确认连接
   @override
   void wake() {
+    if (Platform.isAndroid) UnisonNative.setKeepAlive(true).catchError((_) {});
+    if (_exited) {
+      _exited = false;
+      _transport = _newTransport();
+      _transport.start().catchError((_) {});
+      return;
+    }
     _transport.wake();
     _report();
+  }
+
+  /// 通知上的“退出”：原生已停止接收与常驻；同步关闭本机接收开关，断开且不再重连
+  Future<void> _exit() async {
+    if (_exited) return;
+    _exited = true;
+    _clearReceiver();
+    // 未送达时重连后补发，确认前不按旧设置重新接收
+    _stoppedNatively = true;
+    _sendReceiveOff();
+    await _transport.dispose();
+    _connected.value = false;
   }
 
   @override
