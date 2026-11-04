@@ -73,6 +73,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             result.putString("receiverStats", background.toString());
             result.putLong("receiverId", (Long)engineClass.getMethod("receiverId").invoke(engine));
             await(call("stopReceiver", new Class<?>[]{}));
+            activity = startActivitySync(launch);
             Object available = await(call("root", new Class<?>[]{String.class, JSONObject.class}, "available", new JSONObject()));
             if (!Boolean.TRUE.equals(available)) throw new IllegalStateException("Effect module unavailable");
             await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250)));
