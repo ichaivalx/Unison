@@ -334,6 +334,8 @@ object CaptureMain {
                 val interrupted = advancedFrames <= 0 || elapsedNs <= 0 || abs(residualNs) > toleranceNs
                 if (interrupted) {
                     originNs = measuredOrigin
+                    // 跨中断不使用相邻 seq，防止接收端把旧包长度拉伸到新的时间轴。
+                    sequence += 2
                     filled = 0
                     synchronized(diagnosticsLock) { timelineResets++ }
                     println("INFO effect_timeline_reset residual_ms=${residualNs / 1_000_000.0} io=$io")

@@ -64,8 +64,11 @@ for remote, local in (
     url = f'{clang_base}/+archive/{clang_revision}/{remote}.tar.gz'
     with urllib.request.urlopen(url, timeout=90) as response:
         with tarfile.open(fileobj=io.BytesIO(response.read()), mode='r:gz') as archive:
-            archive.extractall(dest, filter='data')
+            # 通用头的 __config_site 指向宿主配置；只使用单独下载的平台配置。
+            members = [m for m in archive.getmembers() if not m.issym() and not m.islnk()]
+            archive.extractall(dest, members=members, filter='data')
 assert (platform_cpp / 'lib/libc++.so').read_bytes().startswith(b'\x7fELF')
+assert (platform_cpp / 'config/__config_site').is_file()
 
 # NDK 的公开链接桩缺少平台专用 C 入口；从 AOSP 导出表生成 link-only vendor 桩。
 # 不伪造任何 C++ 运行库符号；完整实现与符号由实际平台 libc++ 提供。
@@ -113,5 +116,8 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
             info.external_attr = (0o100755 if path.suffix == '.sh' else 0o100644) << 16
             archive.writestr(info, path.read_bytes().replace(b'\r\n', b'\n'))
     archive.write(BUILD / 'native-build/libunison_tap.so', 'lib64/soundfx/libunison_tap.so')
+    watcher = zipfile.ZipInfo('bin/unison_hal_watch')
+    watcher.external_attr = 0o100755 << 16
+    archive.writestr(watcher, (BUILD / 'native-build/unison_hal_watch').read_bytes())
     archive.writestr('LICENSE', license_text)
 print(out)

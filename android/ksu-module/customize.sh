@@ -4,4 +4,5 @@
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/post-fs-data.sh" 0 0 0755
 set_perm "$MODPATH/service.sh" 0 0 0755
+set_perm "$MODPATH/bin/unison_hal_watch" 0 0 0755
 ui_print "Unison Tap: 重启后加载；异常时在 KernelSU 禁用本模块并重启。"

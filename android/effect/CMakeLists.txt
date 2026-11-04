@@ -39,3 +39,6 @@ target_compile_options(unison_tap PRIVATE -Wall -Wextra -fno-rtti -fvisibility=h
     -Xclang -fdump-vtable-layouts)
 target_link_libraries(unison_tap PRIVATE effect_binding platform_abi log)
 target_link_options(unison_tap PRIVATE -Wl,--no-undefined -Wl,--exclude-libs,ALL -Wl,--as-needed)
+add_executable(unison_hal_watch hal_watch.c)
+target_include_directories(unison_hal_watch PRIVATE build/aidl/include)
+target_link_libraries(unison_hal_watch PRIVATE platform_binder)

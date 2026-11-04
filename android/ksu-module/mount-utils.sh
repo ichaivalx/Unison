@@ -37,3 +37,20 @@ unmount_module() {
   if same_inode "$ACTIVE_LIBS" "$SOUNDFX"; then umount -l "$SOUNDFX" || result=1; fi
   return "$result"
 }
+
+stage_mounted() {
+  local stage_name=${1##*/}
+  awk -v part="/runtime/$stage_name" '
+    index($4, part) && (substr($4, index($4, part) + length(part), 1) == "/" ||
+                       length($4) == index($4, part) + length(part) - 1) { found=1 }
+    END { exit !found }
+  ' /proc/self/mountinfo
+}
+
+cleanup_stages() {
+  local old
+  for old in "$RUNTIME"/boot.*; do
+    [ -d "$old" ] || continue
+    stage_mounted "$old" || rm -rf "$old"
+  done
+}

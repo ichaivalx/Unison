@@ -7,6 +7,7 @@ BOOT_ID=$(cat /proc/sys/kernel/random/boot_id) || exit 0
 mkdir -p "$RUNTIME" || exit 0
 exec 9> "$RUNTIME/post-fs.lock"
 flock -n 9 || exit 0
+cleanup_stages
 
 if [ -f "$MODDIR/boot-pending" ]; then
   IFS= read -r previous_boot < "$MODDIR/boot-pending"
@@ -26,6 +27,14 @@ mv -f "$MODDIR/boot-pending.new" "$MODDIR/boot-pending" || exit 0
 [ -f "$ORIGINAL" ] && [ -d "$SOUNDFX" ] || exit 0
 [ -f "$MODDIR/lib64/soundfx/libunison_tap.so" ] || exit 0
 STAGE=$(mktemp -d "$RUNTIME/boot.XXXXXX") || exit 0
+cleanup_current() {
+  if ! stage_mounted "$STAGE"; then
+    rm -rf "$STAGE"
+    if [ "$ACTIVE_CONFIG" = "$STAGE/audio_effects_config.xml" ]; then rm -f "$RUNTIME/mount-state"; fi
+  fi
+}
+trap cleanup_current EXIT
+trap 'exit 0' HUP INT TERM
 mkdir "$STAGE/soundfx" || exit 0
 # 本阶段只有本地文件准备与 bind mount；不等待属性，不探测或调用音频服务。
 awk '
