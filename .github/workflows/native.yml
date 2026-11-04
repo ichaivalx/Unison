@@ -30,3 +30,18 @@ jobs:
       - run: cmake -S native/core -B out/core
       - run: cmake --build out/core --config Release
       - run: ctest --test-dir out/core -C Release --output-on-failure
+  plugin-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: app/pubspec.yaml
+          cache: true
+      - run: python packages/unison_native/tool/build_smoke.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-smoke-windows
+          path: packages/unison_native/build/smoke/
