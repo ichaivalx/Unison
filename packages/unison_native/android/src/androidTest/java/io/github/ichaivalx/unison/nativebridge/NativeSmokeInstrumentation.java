@@ -31,6 +31,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
         Bundle result = new Bundle();
         Object originalSink = null;
         Double originalVolume = null;
+        JSONObject originalSource = null;
         Activity activity = null;
         Class<?> sinkClass = null;
         int code = Activity.RESULT_OK;
@@ -47,6 +48,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             call("initialize", new Class<?>[]{Context.class}, context);
             sinkClass = Class.forName("io.flutter.plugin.common.EventChannel$EventSink", true, loader);
             originalSink = call("getSink", new Class<?>[]{});
+            originalSource = new JSONObject(call("getSource", new Class<?>[]{}).toString());
             Set<String> events = Collections.synchronizedSet(new HashSet<>());
             Object listener = Proxy.newProxyInstance(loader, new Class<?>[]{sinkClass}, (proxy, method, values) -> {
                 if (method.getName().equals("success") && values[0] instanceof java.util.Map) events.add(String.valueOf(((java.util.Map<?,?>)values[0]).get("type")));
@@ -84,6 +86,10 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             if (runtime != null) {
                 try { await(call("stopReceiver", new Class<?>[]{})); } catch (Exception ignored) {}
                 try { await(call("stopSource", new Class<?>[]{})); } catch (Exception ignored) {}
+                if (originalSource != null) {
+                    try { await(call("root", new Class<?>[]{String.class, JSONObject.class}, "setLocalDelayUs", new JSONObject().put("value", originalSource.optLong("localDelayUs")))); } catch (Exception ignored) {}
+                    try { await(call("root", new Class<?>[]{String.class, JSONObject.class}, "setSourceLatencyUs", new JSONObject().put("value", originalSource.optLong("latencyUs", 50000)))); } catch (Exception ignored) {}
+                }
                 if (originalVolume != null) try { call("setVolume", new Class<?>[]{double.class}, originalVolume); } catch (Exception ignored) {}
                 if (originalSink != null && sinkClass != null) try { call("listen", new Class<?>[]{sinkClass}, originalSink); } catch (Exception ignored) {}
             }

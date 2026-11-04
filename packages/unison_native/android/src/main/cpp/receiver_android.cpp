@@ -17,7 +17,8 @@ public:
 
     bool start(const std::string& host) {
         std::lock_guard<std::mutex> lock(lifecycle);
-        if (active.load()) return true;
+        if (active.load()) { if (host == sourceHost) return true; stopLocked(); }
+        sourceHost = host;
         if (!receiver.start(host)) return false;
         rebuild.store(false);
         active.store(true);
@@ -54,10 +55,7 @@ public:
 
     void stop() {
         std::lock_guard<std::mutex> lock(lifecycle);
-        active.store(false);
-        wake.notify_all();
-        if (manager.joinable()) manager.join();
-        receiver.stop();
+        stopLocked();
     }
 
     void routeChanged() {
@@ -87,6 +85,12 @@ public:
     }
 
 private:
+    std::string sourceHost;
+    void stopLocked() {
+        active.store(false); wake.notify_all();
+        if (manager.joinable()) manager.join();
+        receiver.stop();
+    }
     std::mutex lifecycle, timestampMutex, waitMutex;
     std::condition_variable wake;
     std::thread manager;

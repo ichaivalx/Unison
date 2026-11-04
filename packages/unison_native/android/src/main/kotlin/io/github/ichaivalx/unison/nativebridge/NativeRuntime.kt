@@ -94,13 +94,15 @@ internal object NativeRuntime {
         return future
     }
     fun startSource(args: JSONObject): CompletableFuture<Any?> {
-        sourceRequested = true; keepService()
+        sourceRequested = true
+        try { keepService() } catch (error: Throwable) { sourceRequested = false; throw error }
         return root("startSource", args).whenComplete { _, error -> if (error != null) { sourceRequested = false; serviceState() } }
     }
     fun startReceiver(host: String): CompletableFuture<Any?> {
-        receiverRequested = true; keepService()
+        receiverRequested = true
+        try { keepService() } catch (error: Throwable) { receiverRequested = false; throw error }
         return background {
-            try { check(ReceiverEngine.start(host)) { "Cannot start receiver" }; forceWifi(true) }
+            try { receiverRequested = true; keepService(); check(ReceiverEngine.start(host)) { "Cannot start receiver" }; forceWifi(true) }
             catch (error: Throwable) { receiverRequested = false; serviceState(); throw error }
             null
         }

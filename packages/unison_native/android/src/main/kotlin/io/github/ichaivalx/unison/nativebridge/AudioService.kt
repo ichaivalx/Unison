@@ -55,7 +55,10 @@ class AudioService : Service() {
         instance = null
         audio.unregisterAudioDeviceCallback(devices)
         if (wifi.isHeld) wifi.release(); if (multicast.isHeld) multicast.release(); if (wake.isHeld) wake.release()
-        if (NativeRuntime.receiverRequested || NativeRuntime.sourceRequested) NativeRuntime.stopAll()
+        // 角色切换时旧服务的 stopSelf 可能已排入主线程；只重建持有者，不重建音效或接收流。
+        if (NativeRuntime.receiverRequested || NativeRuntime.sourceRequested) runCatching {
+            startForegroundService(Intent(this, AudioService::class.java).setAction("keep"))
+        }.onFailure { NativeRuntime.stopAll() }
         super.onDestroy()
     }
     override fun onBind(intent: Intent?): IBinder? = null
