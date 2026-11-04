@@ -80,6 +80,8 @@ class SourceService implements Console {
   static const _localDelayKey = 'source.localDelayUs';
   static const _weightKey = 'band.weight';
   static const _localGapsKey = 'band.localGaps';
+  static const _boostKey = 'calibration.boost';
+  static const _boostLevelKey = 'calibration.boostLevel';
 
   static const _defaultLatencyUs = 50000;
 
@@ -117,10 +119,21 @@ class SourceService implements Console {
   late int _localDelayUs = _prefs.getInt(_localDelayKey) ?? 0;
   late double _weight = _prefs.getDouble(_weightKey) ?? 0;
   late BandGaps _localGaps = gapsFromJson(_decode(_prefs.getString(_localGapsKey)));
+  late bool _boost = _prefs.getBool(_boostKey) ?? true;
+  late double _boostLevel = _prefs.getDouble(_boostLevelKey) ?? 0.6;
 
   SourceStatus? _status;
   MediaState? _media;
   double? _volume;
+
+  /// 本机设音量后此时间内的音量变化视为自身所致
+  int _selfVolumeUntil = 0;
+
+  /// 校准临时提高本机音量前的音量；未提高或期间已调整过时为 null
+  double? _boostedFrom;
+
+  /// 校准期间临时提高音量的接收端及其临时音量；期间调整过的不在其中
+  final Map<String, double> _boosted = {};
   String? _error;
   CalibrationView _calibration = const CalibrationView();
   _Snapshot? _undo;
@@ -163,6 +176,8 @@ class SourceService implements Console {
     }, onError: (_) {});
     UnisonNative.volumeChanges.listen((volume) {
       _volume = volume;
+      // 临时提高期间用户调整了本机音量：以调整为准，不再恢复
+      if (nowUs >= _selfVolumeUntil) _boostedFrom = null;
       _publish();
     }, onError: (_) {});
     await _transport.start();
@@ -175,6 +190,15 @@ class SourceService implements Console {
   }
 
   bool get _running => _status?.running ?? false;
+
+  /// 跟随音源的设备按此音量换算：临时提高期间为提高前的音量
+  double? get _sourceVolume => _boostedFrom ?? _volume;
+
+  Future<void> _setLocalVolume(double volume) {
+    _volume = volume;
+    _selfVolumeUntil = nowUs + 1000000;
+    return _guard(() => UnisonNative.setVolume(volume));
+  }
 
   int _effectiveOffset(_Peer peer) => peer.baseOffsetUs + bandShift(_weight, peer.gaps, _localGaps);
 
@@ -211,9 +235,10 @@ class SourceService implements Console {
       case MessageType.localVolume:
         if (_links[connection] case final peer?) {
           if (message['volume'] case final num volume) {
+            _boosted.remove(peer.id);
             peer
               ..actualVolume = volume.toDouble()
-              ..volume = peer.volume.withVolume(volume.toDouble(), _volume);
+              ..volume = peer.volume.withVolume(volume.toDouble(), _sourceVolume);
             _savePeers();
             _publish();
           }
@@ -254,6 +279,7 @@ class SourceService implements Console {
   void _onDisconnected(Connection connection) {
     final peer = _links.remove(connection);
     if (peer == null || !identical(peer.connection, connection)) return;
+    _boosted.remove(peer.id);
     peer
       ..connection = null
       ..stats = null;
@@ -303,17 +329,19 @@ class SourceService implements Console {
         if (args['value'] case final num value) {
           final volume = value.toDouble().clamp(0.0, 1.0).toDouble();
           if (id == selfId) {
-            _volume = volume;
-            _guard(() => UnisonNative.setVolume(volume));
+            _boostedFrom = null;
+            _setLocalVolume(volume);
           } else if (peer != null) {
-            peer.volume = peer.volume.withVolume(volume, _volume);
+            _boosted.remove(peer.id);
+            peer.volume = peer.volume.withVolume(volume, _sourceVolume);
             _savePeers();
           }
         }
       case Command.volumeMode:
         if (VolumeMode.values.asNameMap()[args['mode']] case final mode?) {
           if (peer != null) {
-            peer.volume = peer.volume.switchTo(mode, peer.actualVolume, _volume);
+            _boosted.remove(peer.id);
+            peer.volume = peer.volume.switchTo(mode, peer.actualVolume, _sourceVolume);
             _savePeers();
           }
         }
@@ -335,6 +363,15 @@ class SourceService implements Console {
         if (_calibration.stage != CalibrationStage.running) {
           _calibration = const CalibrationView();
           _undo = null;
+        }
+      case Command.boost:
+        if (args['on'] case final bool on) {
+          _boost = on;
+          _prefs.setBool(_boostKey, on);
+        }
+        if (args['level'] case final num level) {
+          _boostLevel = level.toDouble().clamp(0.0, 1.0).toDouble();
+          _prefs.setDouble(_boostLevelKey, _boostLevel);
         }
       case Command.bandWeight:
         if (args['weight'] case final num weight) {
@@ -378,6 +415,8 @@ class SourceService implements Console {
     _calibration = const CalibrationView(stage: CalibrationStage.running, description: '准备中');
     _publish(immediate: true);
     try {
+      if (_boost) await _raiseVolumes(peers.values);
+      if (_cancelled) throw const CalibrationFailure('已取消');
       final result = await UnisonNative.calibrate(
         receiverIds: peers.keys.toList(),
         bands: CalibrationBand.values,
@@ -437,7 +476,36 @@ class SourceService implements Console {
       _failCalibration(e.message);
     } catch (e) {
       _failCalibration(_cancelled ? '已取消' : (e is UnsupportedError ? '${e.message}' : '$e'));
+    } finally {
+      _restoreVolumes();
     }
+  }
+
+  /// 把本机与参与校准的设备中音量低于设定值的临时提高到该值
+  Future<void> _raiseVolumes(Iterable<_Peer> peers) async {
+    final level = _boostLevel;
+    for (final peer in peers) {
+      final actual = peer.actualVolume;
+      if (actual == null || actual < level) _boosted[peer.id] = level;
+    }
+    if (_volume case final local? when local < level) {
+      _boostedFrom = local;
+      await _setLocalVolume(level);
+    }
+    if (_boosted.isEmpty) return;
+    _publish(immediate: true);
+    // 等各设备设好音量再播放测试音
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+  }
+
+  /// 恢复临时提高的音量；期间调整过的设备已不在其中
+  void _restoreVolumes() {
+    _boosted.clear();
+    if (_boostedFrom case final volume?) {
+      _boostedFrom = null;
+      _setLocalVolume(volume);
+    }
+    _publish();
   }
 
   String _localGapsNote() {
@@ -534,6 +602,7 @@ class SourceService implements Console {
           ),
       ],
       calibration: _calibration,
+      boost: _boost ? _boostLevel : null,
       band: BandView(
         weight: _weight,
         available: available,
@@ -554,7 +623,7 @@ class SourceService implements Console {
       final apply = jsonEncode({
         'receive': peer.receive,
         'offsetUs': _effectiveOffset(peer),
-        'volume': peer.volume.target(_volume),
+        'volume': _boosted[peer.id] ?? peer.volume.target(_sourceVolume),
       });
       if (apply == peer.applied) continue;
       peer.applied = apply;

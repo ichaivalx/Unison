@@ -367,6 +367,7 @@ class ConsoleState {
     required this.devices,
     required this.calibration,
     required this.band,
+    required this.boost,
     required this.sentAtUs,
   });
 
@@ -378,6 +379,9 @@ class ConsoleState {
   final List<DeviceView> devices;
   final CalibrationView calibration;
   final BandView band;
+
+  /// 校准时临时提高到的音量，关闭时为 null
+  final double? boost;
 
   /// 生成此状态时的音源时刻
   final int sentAtUs;
@@ -396,6 +400,7 @@ class ConsoleState {
     'devices': [for (final device in devices) device.toJson()],
     'calibration': calibration.toJson(),
     'band': band.toJson(),
+    'boost': boost,
     'sentAtUs': sentAtUs,
   };
 
@@ -409,6 +414,7 @@ class ConsoleState {
         devices: [for (final d in json['devices'] as List) DeviceView.fromJson(d as Map)],
         calibration: CalibrationView.fromJson(json['calibration'] as Map),
         band: BandView.fromJson(json['band'] as Map),
+        boost: (json['boost'] as num?)?.toDouble(),
         sentAtUs: (json['sentAtUs'] as num).toInt(),
       );
     } catch (_) {

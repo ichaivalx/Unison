@@ -79,4 +79,7 @@ abstract final class Command {
   static const calibrateUndo = 'calibrateUndo';
   static const calibrateClose = 'calibrateClose';
   static const bandWeight = 'bandWeight';
+
+  /// 校准时临时提高音量：`on` 开关，`level` 目标音量（0~1）
+  static const boost = 'boost';
 }

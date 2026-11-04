@@ -33,6 +33,12 @@ class _CalibrationSheetState extends State<_CalibrationSheet> {
   /// 拖动中的对齐位置
   double? _weight;
 
+  /// 拖动中的临时音量
+  double? _boostLevel;
+
+  /// 关闭时滑块显示的上次音量
+  double _lastBoost = 0.6;
+
   void _command(String command, [Map<String, Object?> args = const {}]) => widget.console.command(command, args);
 
   @override
@@ -120,6 +126,8 @@ class _CalibrationSheetState extends State<_CalibrationSheet> {
             const Divider(),
             const SizedBox(height: 16),
             _band(state.band, texts, colors, hint),
+            const SizedBox(height: 18),
+            _boost(state.boost, texts, colors, hint),
           ],
           const SizedBox(height: 20),
           Row(
@@ -193,6 +201,53 @@ class _CalibrationSheetState extends State<_CalibrationSheet> {
           ],
         ),
         for (final note in band.notes) Text(note, style: hint),
+      ],
+    );
+  }
+
+  /// 校准时临时提高音量：开关与目标音量
+  Widget _boost(double? boost, TextTheme texts, ColorScheme colors, TextStyle? hint) {
+    if (boost != null) _lastBoost = boost;
+    final level = _boostLevel ?? boost ?? _lastBoost;
+    final percent = '${(level * 100).round()}%';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(child: Text('校准时临时提高音量', style: texts.titleSmall?.copyWith(fontWeight: FontWeight.w600))),
+            Switch(value: boost != null, onChanged: (on) => _command(Command.boost, {'on': on})),
+          ],
+        ),
+        Text(
+          boost != null ? '音量低于 $percent 的设备校准期间临时提高到此值，结束后恢复' : '按各设备当前的音量播放测试音',
+          style: hint,
+        ),
+        if (boost != null)
+          Row(
+            children: [
+              Expanded(
+                child: Slider(
+                  min: 0.3,
+                  divisions: 7,
+                  value: level.clamp(0.3, 1.0).toDouble(),
+                  onChanged: (value) {
+                    setState(() => _boostLevel = value);
+                    _command(Command.boost, {'level': value});
+                  },
+                  onChangeEnd: (_) => setState(() => _boostLevel = null),
+                ),
+              ),
+              SizedBox(
+                width: 44,
+                child: Text(
+                  percent,
+                  textAlign: TextAlign.end,
+                  style: texts.labelLarge?.copyWith(color: colors.primary, fontFeatures: tabular),
+                ),
+              ),
+            ],
+          ),
       ],
     );
   }
