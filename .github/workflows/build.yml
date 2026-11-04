@@ -30,6 +30,13 @@ jobs:
           name: unison-android
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+      - name: Build AIDL V2 effect and KernelSU module
+        run: python3 android/effect/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unison-tap-ksu
+          path: android/effect/build/unison-tap-ksu.zip
+          if-no-files-found: error
   windows:
     runs-on: windows-latest
     steps:

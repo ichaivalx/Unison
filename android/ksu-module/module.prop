@@ -1,0 +1,6 @@
+id=unison_tap
+name=Unison Tap (AIDL V2)
+version=0.1
+versionCode=1
+author=ichaivalx
+description=输出混音 tap 与可调本机延迟线；原型，适用于已确认的 AIDL V2 音效配置。
