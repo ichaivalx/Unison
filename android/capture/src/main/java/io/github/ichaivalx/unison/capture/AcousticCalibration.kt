@@ -113,7 +113,8 @@ internal class AcousticCalibration(
             track.play()
             playThread = thread(name = "calibration-output", isDaemon = true) { writeAudio(track) }
             pause(2500)
-            check(micOriginNs != null) { "麦克风单调时钟时间戳不可用" }
+            val microphoneAnchor = checkNotNull(micOriginNs) { "麦克风单调时钟时间戳不可用" }
+            // 两阶段共用同一个 getTimestamp 锚点，按已读帧数推进；共同输入延迟才能相减抵消。
             val delays = mutableListOf<List<Double>>()
             val settlingMs = maxOf(localDelayMs, latencyUs / 1000).coerceAtLeast(0) + 500L
             val periodMs = maxOf(localDelayMs, latencyUs / 1000).coerceAtLeast(0) + 1500L
@@ -150,7 +151,7 @@ internal class AcousticCalibration(
                     val received = checkNotNull(detect(mic, sine, cosine, true)) { "麦克风录音过短" }
                     val micOrigin = checkNotNull(micOriginNs)
                     val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
-                    val micTime = micOrigin + (current.micFirstFrame + received[0]) * 1_000_000_000.0 / RATE
+                    val micTime = microphoneAnchor + (current.micFirstFrame + received[0]) * 1_000_000_000.0 / RATE
                     val offset = (micTime - tapTime) / 1_000_000.0
                     val tapMatch = reference[1] >= 8 && reference[2] >= 0.1
                     val micMatch = received[1] >= 8 && received[2] >= 0.1
