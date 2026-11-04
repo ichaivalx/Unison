@@ -53,8 +53,8 @@ object CaptureMain {
                             source = session; session.start(); null
                         }
                         "stopSource" -> { source?.close(); source = null; RootEvents.emit("source", stopped()); null }
-                        "setSourceLatencyUs" -> { latencyUs = data.getInt("value"); source?.setLatency(latencyUs); null }
-                        "setLocalDelayUs" -> { delayUs = data.getLong("value"); check(delayUs >= 0); source?.setDelay(delayUs); null }
+                        "setSourceLatencyUs" -> { val value = data.getInt("value"); source?.setLatency(value); latencyUs = value; if (source == null) RootEvents.emit("source", stopped()); null }
+                        "setLocalDelayUs" -> { val value = data.getLong("value"); check(value >= 0); source?.setDelay(value); delayUs = value; if (source == null) RootEvents.emit("source", stopped()); null }
                         "calibrate" -> {
                             val session = checkNotNull(source) { "Source is not running" }
                             val ids = data.getJSONArray("receiverIds").let { array -> List(array.length()) { array.getLong(it) } }

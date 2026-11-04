@@ -12,6 +12,7 @@ import java.util.UUID
 import kotlin.concurrent.thread
 
 internal class EffectSource {
+    var onSessionsChanged: (() -> Unit)? = null
     private class Session(val uid: Int, val id: Int, val effect: AudioEffect) {
         @Volatile var io: Int? = null
     }
@@ -145,6 +146,7 @@ internal class EffectSource {
         playingSessions = wanted.keys.toSet()
         synchronized(lock) {
             if (closed || deathReason != null) return@synchronized
+            val before = sessions.keys.toSet()
             for (id in sessions.keys.toList()) if (id !in wanted) {
                 val session = sessions.remove(id)!!
                 release(session)
@@ -169,6 +171,7 @@ internal class EffectSource {
                     println("ERROR effect_attach uid=$uid session=$id error=${error.cause ?: error}")
                 }
             }
+            if (before != sessions.keys) onSessionsChanged?.invoke()
         }
     }
 

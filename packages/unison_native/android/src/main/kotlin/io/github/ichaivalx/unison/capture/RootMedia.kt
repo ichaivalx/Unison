@@ -15,7 +15,7 @@ internal class RootMedia(context: Context) {
     private val thread = HandlerThread("root-media").apply { start() }
     private val handler = Handler(thread.looper)
     @Volatile private var controller: MediaController? = null
-    private var closed = false
+    @Volatile private var closed = false
     private var previous = ""
     private val update = object : Runnable {
         override fun run() {
@@ -23,7 +23,8 @@ internal class RootMedia(context: Context) {
             runCatching {
                 val sessions = manager.getActiveSessions(null)
                 val active = sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-                    ?: sessions.firstOrNull { it.playbackState != null && it.metadata != null }
+                    ?: sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PAUSED }
+                    ?: sessions.firstOrNull { it.playbackState?.state != PlaybackState.STATE_NONE && it.metadata != null }
                 controller = active
                 val state = active?.playbackState
                 val metadata = active?.metadata

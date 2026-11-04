@@ -12,6 +12,9 @@
 #include <unistd.h>
 #endif
 int main() {
+#ifdef _WIN32
+    WSADATA data{}; if (WSAStartup(MAKEWORD(2, 2), &data)) return 5;
+#endif
     unison::Receiver receiver;
     const uint64_t id = receiver.receiverId();
     if (!receiver.start("127.0.0.1")) return 1;
@@ -37,6 +40,7 @@ int main() {
     receiver.stop();
 #ifdef _WIN32
     closesocket(socketFd);
+    WSACleanup();
 #else
     close(socketFd);
 #endif

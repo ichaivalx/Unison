@@ -1,5 +1,9 @@
 package io.github.ichaivalx.unison.nativebridge
 
+import android.app.Activity
+import android.media.AudioManager
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -10,7 +14,16 @@ import io.github.ichaivalx.unison.ReceiverEngine
 import org.json.JSONObject
 import java.util.concurrent.CompletableFuture
 
-class UnisonNativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
+class UnisonNativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel.StreamHandler, ActivityAware {
+    private var activity: Activity? = null
+    private var previousVolumeStream = 0
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        activity = binding.activity; previousVolumeStream = binding.activity.volumeControlStream
+        binding.activity.volumeControlStream = AudioManager.STREAM_MUSIC
+    }
+    override fun onDetachedFromActivity() { activity?.volumeControlStream = previousVolumeStream; activity = null }
+    override fun onDetachedFromActivityForConfigChanges() = onDetachedFromActivity()
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) = onAttachedToActivity(binding)
     private lateinit var methods: MethodChannel
     private lateinit var events: EventChannel
     private val main = Handler(Looper.getMainLooper())

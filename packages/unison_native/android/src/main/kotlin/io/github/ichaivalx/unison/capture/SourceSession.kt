@@ -10,13 +10,11 @@ import java.nio.channels.DatagramChannel
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.util.Collections
-import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import kotlin.math.abs
-import kotlin.system.exitProcess
 
 internal class SourceSession(private val excludeUid: Int, @Volatile var latencyUs: Int,
     @Volatile var localDelayUs: Long, private val onFatal: (Throwable) -> Unit) {
@@ -69,7 +67,8 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
     fun start() {
         try {
             channel = DatagramChannel.open().apply { configureBlocking(false); socket().broadcast = true; bind(InetSocketAddress(SOURCE_PORT)) }
-            effect = EffectSource().also { it.start(excludeUid, localDelayUs) }
+            effect = EffectSource().also { it.onSessionsChanged = { RootEvents.emit("source", status()) } }
+            checkNotNull(effect).start(excludeUid, localDelayUs)
             val udp = checkNotNull(channel)
             val name = android.os.Build.MODEL.toByteArray(Charsets.UTF_8)
             val beacon = message(1, 4 + name.size).apply { putShort(SOURCE_PORT.toShort()).putShort(name.size.toShort()).put(name) }
@@ -95,8 +94,8 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
         .put("receiverIds", org.json.JSONArray(receiverIds())).put("error", error ?: org.json.JSONObject.NULL)
 
     fun receiverIds(): List<Long> = subscribers.values.filter { System.nanoTime() - it.lastNs < SUBSCRIBE_TIMEOUT_NS }.map { it.id }.distinct()
-    fun setDelay(us: Long) { check(calibration?.isRunning != true) { "校准中" }; check(us >= 0); effect?.setLocalDelay(us); localDelayUs = us }
-    fun setLatency(us: Int) { check(calibration?.isRunning != true) { "校准中" }; latencyUs = us }
+    fun setDelay(us: Long) { check(calibration?.isRunning != true) { "校准中" }; check(us >= 0); effect?.setLocalDelay(us); localDelayUs = us; RootEvents.emit("source", status()) }
+    fun setLatency(us: Int) { check(calibration?.isRunning != true) { "校准中" }; latencyUs = us; RootEvents.emit("source", status()) }
     fun cancelCalibration() { calibration?.cancel() }
     fun calibrate(ids: List<Long>, bands: List<String>, progress: (org.json.JSONObject) -> Unit,
         complete: (org.json.JSONObject?, Throwable?) -> Unit) {
@@ -291,7 +290,8 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     val receiverId = data.long
                     val nameLength = data.short.toInt() and 0xffff
                     if (data.remaining() >= nameLength) {
-                        subscribers[sender] = Subscriber(receiverId, System.nanoTime())
+                        val previous = subscribers.put(sender, Subscriber(receiverId, System.nanoTime()))
+                        if (previous?.id != receiverId) RootEvents.emit("source", status())
                         subscribeCount.incrementAndGet()
                     }
                 }
@@ -304,7 +304,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     }
                     send(udp, pong, sender, "pong_send")
                 }
-                6 -> subscribers.remove(sender)
+                6 -> if (subscribers.remove(sender) != null) RootEvents.emit("source", status())
                 7 -> if (sender.address.hostAddress == "127.0.0.1" && data.remaining() >= 4 && calibration?.isRunning != true) latencyUs = data.int
             }
         }
