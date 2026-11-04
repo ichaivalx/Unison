@@ -30,8 +30,7 @@ while :; do
     if [ "$restarts" -ge 3 ]; then
       load_mount_state
       unmount_module
-      : > "$MODDIR/disable"
-      rm -f "$MODDIR/boot-pending"
+      if : > "$MODDIR/disable"; then rm -f "$MODDIR/boot-pending"; fi
       printf 'audio_hal_restarted count=%s pid=%s uptime=%s\n' "$restarts" "$current_pid" "$now" > "$MODDIR/rollback-reason"
       # 配置已恢复后，只结束一次 HAL，由 init 使用原始配置拉起；不做循环重启。
       if ! same_inode "$ACTIVE_CONFIG" "$ORIGINAL"; then

@@ -91,7 +91,7 @@ object SourceController {
             stop()
         } else {
             // 启动命令只是快照；授权/启动等待期间 UI 仍可更新期望值。
-            setLocalDelay(localDelayMs)
+            enqueueLocalDelay(child)
         }
         return started
     }
@@ -143,6 +143,10 @@ object SourceController {
         require(ms >= 0) { "本机延迟不能为负数" }
         localDelayMs = ms
         val current = process ?: return
+        enqueueLocalDelay(current)
+    }
+
+    private fun enqueueLocalDelay(current: java.lang.Process) {
         commands.execute {
             if (process !== current || !isRunning) return@execute
             runCatching {

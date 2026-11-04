@@ -26,7 +26,6 @@ class PlaybackService : Service() {
         const val SOURCE_START = "source.start"
         const val SOURCE_STOP = "source.stop"
         const val LATENCY = "source.latency"
-        const val LOCAL_DELAY = "source.local_delay"
         const val STOP_ALL = "stop.all"
         @Volatile var receiverRunning = false
         @Volatile var busy = false
@@ -121,13 +120,11 @@ class PlaybackService : Service() {
                         RECEIVE_STOP -> stopReceiver()
                         SOURCE_START -> {
                             if (receiverRunning) stopReceiver()
-                            SourceController.setLocalDelay(localDelayMs)
                             val started = SourceController.start(applicationContext, latencyMs, ::log)
                             message = if (started) "" else "音源启动失败，请检查 root 授权与下方输出"
                         }
                         SOURCE_STOP -> SourceController.stop()
                         LATENCY -> SourceController.setLatency(latencyMs)
-                        LOCAL_DELAY -> SourceController.setLocalDelay(localDelayMs)
                         STOP_ALL -> {
                             try { SourceController.stop() } finally { stopReceiver() }
                         }

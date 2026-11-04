@@ -11,8 +11,7 @@ flock -n 9 || exit 0
 if [ -f "$MODDIR/boot-pending" ]; then
   IFS= read -r previous_boot < "$MODDIR/boot-pending"
   if [ "$previous_boot" != "$BOOT_ID" ]; then
-    : > "$MODDIR/disable"
-    rm -f "$MODDIR/boot-pending"
+    if : > "$MODDIR/disable"; then rm -f "$MODDIR/boot-pending"; fi
     printf 'boot_incomplete previous_boot=%s current_boot=%s\n' "$previous_boot" "$BOOT_ID" > "$MODDIR/rollback-reason"
     exit 0
   fi
