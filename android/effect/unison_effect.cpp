@@ -155,9 +155,12 @@ private:
     void allocateData() {
         const auto in = static_cast<size_t>(common_.input.frameCount) * 2;
         const auto out = static_cast<size_t>(common_.output.frameCount) * 2;
-        input_ = std::make_unique<Fmq<float>>(in);
-        output_ = std::make_unique<Fmq<float>>(out);
-        work_.resize(std::max(in, out));
+        auto input = std::make_unique<Fmq<float>>(in);
+        auto output = std::make_unique<Fmq<float>>(out);
+        std::vector<float> work(std::max(in, out));
+        input_ = std::move(input);
+        output_ = std::move(output);
+        work_.swap(work);
     }
     void descriptors(IEffect::OpenEffectReturn* result) {
         result->statusMQ = status_->descriptor();
@@ -179,6 +182,7 @@ private:
         collectRetired();
     }
     ScopedAStatus parameter(const Parameter& param) {
+        if (state_ == State::INIT) return error("parameter before open");
         if (param.getTag() == Parameter::common) {
             const auto& c = param.get<Parameter::common>();
             if (!valid(c)) return error("unsupported common format");

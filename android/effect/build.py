@@ -17,10 +17,10 @@ def run(*args):
     subprocess.run([str(arg) for arg in args], check=True)
 
 
-def checkout(repo, name, paths):
+def checkout(repo, name, paths, ref=TAG):
     dest = BUILD / name
     if not dest.exists():
-        run('git', 'clone', '--depth=1', '--filter=blob:none', '--sparse', '--branch', TAG,
+        run('git', 'clone', '--depth=1', '--filter=blob:none', '--sparse', '--branch', ref,
             f'https://github.com/aosp-mirror-neo/{repo}.git', dest)
     run('git', '-C', dest, 'sparse-checkout', 'set', *paths)
     return dest
@@ -37,7 +37,8 @@ groups = [
 hardware = checkout('platform_hardware_interfaces', 'hardware', [path for path, _ in groups])
 media_path = 'media/aidl_api/android.media.audio.common.types/3'
 system = checkout('platform_system_hardware_interfaces', 'system', [media_path])
-native = checkout('platform_frameworks_native', 'native', ['libs/binder/ndk/include_cpp'])
+# SDK 36 的生成器需要新版 defineClass/asBinderReference；这些辅助头不改变 V2 线格式。
+native = checkout('platform_frameworks_native', 'native', ['libs/binder/ndk/include_cpp'], 'android-16.0.0_r1')
 include = BUILD / 'aidl/include'
 src = BUILD / 'aidl/src'
 include.mkdir(parents=True, exist_ok=True)
