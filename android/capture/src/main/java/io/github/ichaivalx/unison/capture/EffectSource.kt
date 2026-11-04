@@ -74,7 +74,8 @@ internal class EffectSource {
         val method = AudioEffect::class.java.getDeclaredMethod("getParameter", Int::class.javaPrimitiveType,
             IntArray::class.java).apply { isAccessible = true }
         val result = method.invoke(instance, 1, value) as Int
-        check(result == 4) { "AudioEffect health getParameter returned $result" }
+        // int[] 重载返回有效整数个数，不是底层 byte[] 接口的字节数。
+        check(result == value.size) { "AudioEffect health getParameter returned $result" }
     }
 
     fun close() {
