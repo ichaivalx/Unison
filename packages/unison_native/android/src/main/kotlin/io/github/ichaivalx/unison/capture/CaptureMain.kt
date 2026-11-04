@@ -64,6 +64,7 @@ object CaptureMain {
                             return@forEachLine
                         }
                         "cancelCalibration" -> { source?.cancelCalibration(); null }
+                        "mediaSnapshot" -> media?.snapshot()
                         "mediaCommand" -> { media?.command(data.getString("value")); null }
                         "mediaSeek" -> { media?.seek(data.getLong("value")); null }
                         else -> error("Unknown root command")

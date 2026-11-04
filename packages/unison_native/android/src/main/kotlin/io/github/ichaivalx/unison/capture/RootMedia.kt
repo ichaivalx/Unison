@@ -21,24 +21,7 @@ internal class RootMedia(context: Context) {
         override fun run() {
             if (closed) return
             runCatching {
-                val sessions = manager.getActiveSessions(null)
-                val active = sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-                    ?: sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PAUSED }
-                    ?: sessions.firstOrNull { it.playbackState?.state != PlaybackState.STATE_NONE && it.metadata != null }
-                controller = active
-                val state = active?.playbackState
-                val metadata = active?.metadata
-                val value = if (active == null || state == null) null else JSONObject()
-                    .put("packageName", active.packageName)
-                    .put("title", metadata?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: JSONObject.NULL)
-                    .put("artist", metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: JSONObject.NULL)
-                    .put("durationUs", metadata?.takeIf { it.containsKey(MediaMetadata.METADATA_KEY_DURATION) }
-                        ?.getLong(MediaMetadata.METADATA_KEY_DURATION)?.times(1000) ?: JSONObject.NULL)
-                    .put("positionUs", state.position.coerceAtLeast(0) * 1000)
-                    .put("positionUpdatedAtUs", System.nanoTime() / 1000 - (SystemClock.elapsedRealtime() - state.lastPositionUpdateTime) * 1000)
-                    .put("speed", state.playbackSpeed.toDouble())
-                    .put("playing", state.state == PlaybackState.STATE_PLAYING)
-                    .put("canSeek", state.actions and PlaybackState.ACTION_SEEK_TO != 0L)
+                val value = snapshot()
                 val text = value?.toString() ?: "null"
                 if (text != previous) { previous = text; RootEvents.emit("media", value) }
             }
@@ -46,6 +29,27 @@ internal class RootMedia(context: Context) {
         }
     }
     init { handler.post(update) }
+    fun snapshot(): JSONObject? {
+        val sessions = manager.getActiveSessions(null)
+        val active = sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+            ?: sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PAUSED }
+            ?: sessions.firstOrNull { it.playbackState?.state != PlaybackState.STATE_NONE && it.metadata != null }
+        controller = active
+        val state = active?.playbackState
+        val metadata = active?.metadata
+        val value = if (active == null || state == null) null else JSONObject()
+            .put("packageName", active.packageName)
+            .put("title", metadata?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: JSONObject.NULL)
+            .put("artist", metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: JSONObject.NULL)
+            .put("durationUs", metadata?.takeIf { it.containsKey(MediaMetadata.METADATA_KEY_DURATION) }
+                ?.getLong(MediaMetadata.METADATA_KEY_DURATION)?.times(1000) ?: JSONObject.NULL)
+            .put("positionUs", state.position.coerceAtLeast(0) * 1000)
+            .put("positionUpdatedAtUs", System.nanoTime() / 1000 - (SystemClock.elapsedRealtime() - state.lastPositionUpdateTime) * 1000)
+            .put("speed", state.playbackSpeed.toDouble())
+            .put("playing", state.state == PlaybackState.STATE_PLAYING)
+            .put("canSeek", state.actions and PlaybackState.ACTION_SEEK_TO != 0L)
+        return value
+    }
     fun command(command: String) {
         val controls = checkNotNull(controller) { "No media session" }.transportControls
         when (command) { "play" -> controls.play(); "pause" -> controls.pause(); "next" -> controls.skipToNext(); "previous" -> controls.skipToPrevious(); else -> error("Unknown media command") }

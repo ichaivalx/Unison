@@ -159,9 +159,27 @@ abstract final class UnisonNative {
     try { return (await _methods.invokeMethod<T>(method, args)) as T; }
     on PlatformException catch (e) { if (e.code == 'unsupported') throw UnsupportedError(e.message ?? method); rethrow; }
   }
+  static final Map<String, dynamic> _latest = {};
+  static int _streamListeners = 0;
   static Stream<dynamic> _stream(String type) {
-    if (!Platform.isAndroid && (type == 'source' || type == 'media' || type == 'calibration')) throw UnsupportedError('Requires rooted Android');
-    return _events.where((e) => e['type'] == type).map((e) => e['data'] is String ? jsonDecode(e['data'] as String) : e['data']);
+    if (!Platform.isAndroid && (type == 'source' || type == 'media' || type == 'calibration')) {
+      throw UnsupportedError('Requires rooted Android');
+    }
+    return Stream<dynamic>.multi((controller) {
+      if (_streamListeners++ == 0) _latest.clear();
+      final subscription = _events.listen((event) {
+        final tag = event['type'] as String;
+        final raw = event['data'];
+        final data = raw is String ? jsonDecode(raw) : raw;
+        if (tag != 'calibration') _latest[tag] = data;
+        if (tag == type) controller.add(data);
+      }, onError: controller.addError);
+      if (type != 'calibration' && _latest.containsKey(type)) controller.add(_latest[type]);
+      controller.onCancel = () {
+        if (--_streamListeners == 0) _latest.clear();
+        subscription.cancel();
+      };
+    }, isBroadcast: true);
   }
   static Future<int> receiverId() => _call<int>('receiverId');
   static Future<void> startReceiver({required String sourceHost}) => _call<void>('startReceiver', {'sourceHost': sourceHost});

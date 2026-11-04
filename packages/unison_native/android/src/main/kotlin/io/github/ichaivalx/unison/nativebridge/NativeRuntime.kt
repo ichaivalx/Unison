@@ -21,6 +21,8 @@ internal object NativeRuntime {
     @Volatile var receiverRequested = false
     @Volatile var sourceRequested = false
     @Volatile var source = stoppedSource()
+    @Volatile private var currentMedia: Any? = null
+    @Volatile private var haveMedia = false
     private var lastVolume = -1.0
     private var polling = false
     private fun stoppedSource() = JSONObject().put("running", false).put("latencyUs", 50000).put("localDelayUs", 0)
@@ -32,12 +34,15 @@ internal object NativeRuntime {
                 source = data as JSONObject
                 sourceRequested = source.optBoolean("running")
                 emit(type, source); serviceState()
+            } else if (type == "media") {
+                currentMedia = data; haveMedia = true; emit(type, data)
             } else if (type == "rootExit") {
+                currentMedia = null; haveMedia = true; emit("media", null)
                 val active = sourceRequested; sourceRequested = false
                 source = source.put("running", false).put("sessions", JSONArray()).put("receiverIds", JSONArray())
                 if (active && source.isNull("error")) source.put("error", "Root process exited")
                 emit("source", source); serviceState()
-            } else if (type == "media" || type == "calibration") emit(type, data)
+            } else if (type == "calibration") emit(type, data)
         }
         if (!polling) { polling = true; main.post(poll) }
     }
@@ -60,9 +65,15 @@ internal object NativeRuntime {
     }
     fun listen(value: EventChannel.EventSink) {
         sink = value; emit("source", source); emit("volume", volume())
-        worker.execute { if (!SourceController.ensure(context)) emit("media", null) }
+        if (haveMedia) emit("media", currentMedia)
+        worker.execute {
+            if (!SourceController.ensure(context)) { currentMedia = null; haveMedia = true; emit("media", null) }
+            else SourceController.request("mediaSnapshot").whenComplete { value, error ->
+                if (error == null) { currentMedia = value; haveMedia = true; emit("media", value) }
+            }
+        }
     }
-    fun detach() { sink = null; if (!receiverRequested && !sourceRequested) worker.execute { SourceController.shutdown() } }
+    fun detach() { sink = null; if (!receiverRequested && !sourceRequested) { currentMedia = null; haveMedia = false; worker.execute { SourceController.shutdown() } } }
     fun emit(type: String, value: Any?) { main.post { sink?.success(mapOf("type" to type, "data" to convert(value))) } }
     private fun convert(value: Any?): Any? = when (value) {
         null, JSONObject.NULL -> null
