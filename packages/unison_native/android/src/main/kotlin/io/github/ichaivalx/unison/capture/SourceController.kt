@@ -16,6 +16,7 @@ object SourceController {
     @Volatile private var ready = false
     @Volatile private var rootPid = 0
     @Volatile var onEvent: ((String, Any?) -> Unit)? = null
+    val isRunning: Boolean get() = ready && process?.isAlive == true
     private val ids = AtomicLong()
     private val pending = ConcurrentHashMap<Long, CompletableFuture<Any?>>()
     @Synchronized fun ensure(context: Context): Boolean {

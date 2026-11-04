@@ -147,10 +147,20 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             if (packets.get() == 0) throw new IllegalStateException("Background source did not capture audio packets");
             result.putInt("backgroundAudioPackets", packets.get()); result.putBoolean("backgroundSourceReused", true);
             await(call("stopSource", new Class<?>[]{}));
+            await(call("root", new Class<?>[]{String.class, JSONObject.class}, "cancelCalibration", new JSONObject()));
+            if (rootField.get(null) != rootProcess) throw new IllegalStateException("Cancellation replaced existing root process");
             context.startService(new Intent(context, serviceClass).setAction("exit"));
             deadline = System.nanoTime() + 5_000_000_000L;
             while ((!events.contains("exit") || service() != null) && System.nanoTime() < deadline) Thread.sleep(50);
             if (service() != null || (Boolean)call("getKeepAliveRequested", new Class<?>[]{}) || stats().optBoolean("running")) throw new IllegalStateException("Notification exit did not release service/audio");
+            await(call("root", new Class<?>[]{String.class, JSONObject.class}, "cancelCalibration", new JSONObject()));
+            java.lang.reflect.Field exiting = runtimeClass.getDeclaredField("exiting"); exiting.setAccessible(true);
+            deadline = System.nanoTime() + 5_000_000_000L;
+            while (exiting.getBoolean(null) && System.nanoTime() < deadline) Thread.sleep(50);
+            if (exiting.getBoolean(null) || rootField.get(null) != null) throw new IllegalStateException("Exit cleanup did not complete");
+            await(call("root", new Class<?>[]{String.class, JSONObject.class}, "cancelCalibration", new JSONObject()));
+            if (rootField.get(null) != null) throw new IllegalStateException("Cancellation started root after exit");
+            result.putBoolean("cancelDoesNotStartRoot", true);
             if (!events.containsAll(java.util.Arrays.asList("source", "volume", "media", "receiver", "calibration", "exit"))) throw new IllegalStateException("Missing initial/progress events: " + events);
             result.putString("events", events.toString()); result.putBoolean("ok", true);
         } catch (Throwable error) {

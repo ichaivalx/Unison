@@ -91,6 +91,7 @@ internal object NativeRuntime {
         else -> value
     }
     fun root(method: String, args: JSONObject = JSONObject()): CompletableFuture<Any?> {
+        if (method == "cancelCalibration") return cancelCalibration()
         val future = CompletableFuture<Any?>()
         val epoch = exitEpoch.get()
         worker.execute {
@@ -101,6 +102,19 @@ internal object NativeRuntime {
                     if (error != null) future.completeExceptionally(error) else future.complete(convert(result))
                 }
             } catch (error: Throwable) { future.completeExceptionally(error) }
+        }
+        return future
+    }
+    private fun cancelCalibration(): CompletableFuture<Any?> {
+        if (exiting || !SourceController.isRunning) return CompletableFuture.completedFuture(null)
+        val future = CompletableFuture<Any?>()
+        val epoch = exitEpoch.get()
+        worker.execute {
+            // 取消只作用于现存进程；排队期间若已退出，也不重新拉起 root。
+            if (exiting || epoch != exitEpoch.get() || !SourceController.isRunning) future.complete(null)
+            else SourceController.request("cancelCalibration").whenComplete { _, error ->
+                if (error != null) future.completeExceptionally(error) else future.complete(null)
+            }
         }
         return future
     }
