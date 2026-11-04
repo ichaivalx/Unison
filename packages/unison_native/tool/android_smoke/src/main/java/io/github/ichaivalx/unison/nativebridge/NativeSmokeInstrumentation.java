@@ -64,11 +64,14 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             });
             call("listen", new Class<?>[]{sinkClass}, listener);
             originalVolume = (Double)call("volume", new Class<?>[]{});
-            AudioManager audio = context.getSystemService(AudioManager.class);
+            Context nativeContext = (Context)call("getContext", new Class<?>[]{});
+            AudioManager audio = nativeContext.getSystemService(AudioManager.class);
             int maximum = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
             int level = Math.max(1, maximum / 2);
             call("setVolume", new Class<?>[]{double.class}, (level - 0.25) / maximum);
-            if (audio.getStreamVolume(AudioManager.STREAM_MUSIC) != level) throw new IllegalStateException("Volume was rounded down");
+            Thread.sleep(100);
+            int observed = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (observed != level) throw new IllegalStateException("Volume rounding mismatch: max=" + maximum + " expected=" + level + " observed=" + observed + " getter=" + call("volume", new Class<?>[]{}));
             result.putBoolean("volumeRounding", true);
             await(call("setKeepAlive", new Class<?>[]{boolean.class}, true));
             Object holder = service();
