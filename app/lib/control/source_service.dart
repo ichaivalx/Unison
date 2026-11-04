@@ -165,12 +165,13 @@ class SourceService implements Console {
       _volume = volume;
       _publish();
     }, onError: (_) {});
-    try {
-      _volume = await UnisonNative.volume();
-    } catch (_) {}
     await _transport.start();
-    if (_enabled) await _startSource();
     _publish();
+    UnisonNative.volume().then((volume) {
+      _volume = volume;
+      _publish();
+    }, onError: (_) {});
+    if (_enabled) _startSource();
   }
 
   bool get _running => _status?.running ?? false;

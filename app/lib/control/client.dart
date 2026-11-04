@@ -61,21 +61,27 @@ class ConsoleClient implements Console {
   Future<void> _applying = Future.value();
 
   Future<void> _start() async {
+    UnisonNative.receiverStats.listen((stats) => _stats = stats, onError: (_) {});
+    UnisonNative.volumeChanges.listen(_onVolume, onError: (_) {});
+    await _transport.start();
+    Timer.periodic(const Duration(seconds: 1), (_) => _report());
+    _initNative();
+  }
+
+  /// 原生调用可能排在音源进程启动之后，不阻塞连接；取得接收端 id 后重新登记
+  Future<void> _initNative() async {
     try {
       _receiverId = await UnisonNative.receiverId();
+      if (_transport.isConnected) _hello();
     } catch (_) {}
     if (LocalSettings.outputDevice case final device?) {
       try {
         await UnisonNative.setOutputDevice(device);
       } catch (_) {}
     }
-    UnisonNative.receiverStats.listen((stats) => _stats = stats, onError: (_) {});
-    UnisonNative.volumeChanges.listen(_onVolume, onError: (_) {});
     try {
       _volume = await UnisonNative.volume();
     } catch (_) {}
-    await _transport.start();
-    Timer.periodic(const Duration(seconds: 1), (_) => _report());
   }
 
   @override
@@ -92,6 +98,11 @@ class ConsoleClient implements Console {
 
   void _onConnected() {
     _connected.value = true;
+    _hello();
+    _report();
+  }
+
+  void _hello() {
     _transport.send({
       't': MessageType.hello,
       'version': Protocol.version,
@@ -100,7 +111,6 @@ class ConsoleClient implements Console {
       'platform': LocalSettings.platform.name,
       'receiverId': _receiverId,
     });
-    _report();
   }
 
   void _onMessage(Message message) {

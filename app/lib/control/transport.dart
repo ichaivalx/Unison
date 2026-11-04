@@ -102,11 +102,17 @@ class _Discovery {
   Future<void> bind() async {
     close();
     _targetsAt = -_refreshUs;
-    final socket = _socket = await RawDatagramSocket.bind(
-      InternetAddress.anyIPv4,
-      Protocol.discoveryPort,
-      reuseAddress: true,
-    );
+    _binding = true;
+    final RawDatagramSocket socket;
+    try {
+      socket = _socket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        Protocol.discoveryPort,
+        reuseAddress: true,
+      );
+    } finally {
+      _binding = false;
+    }
     socket
       ..broadcastEnabled = true
       ..listen(
@@ -114,8 +120,17 @@ class _Discovery {
           if (event == RawSocketEvent.read) _receive(socket);
         },
         onError: (_) {},
+        // 系统可能关闭后台应用的套接字，由定时检查重新绑定
+        onDone: () {
+          if (identical(_socket, socket)) _socket = null;
+        },
       );
   }
+
+  bool _binding = false;
+
+  /// 已绑定或正在绑定
+  bool get isOpen => _socket != null || _binding;
 
   void close() {
     _socket?.close();
@@ -251,10 +266,18 @@ class SourceTransport {
   final Set<Connection> connections = {};
   late final _discovery = _Discovery(_onDatagram);
   ServerSocket? _server;
+  bool _rebinding = false;
   Timer? _timer;
   bool _disposed = false;
 
   Future<void> start() async {
+    await _bindServer();
+    await _discovery.bind();
+    _timer = Timer.periodic(_beaconInterval, (_) => _onTimer());
+    _beacon();
+  }
+
+  Future<void> _bindServer() async {
     ServerSocket server;
     try {
       server = await ServerSocket.bind(
@@ -264,11 +287,18 @@ class SourceTransport {
     } on SocketException {
       server = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
     }
+    if (_disposed) {
+      server.close();
+      return;
+    }
     _server = server;
-    server.listen(_onSocket, onError: (_) {});
-    await _discovery.bind();
-    _timer = Timer.periodic(_beaconInterval, (_) => _onTimer());
-    _beacon();
+    server.listen(
+      _onSocket,
+      onError: (_) {},
+      onDone: () {
+        if (identical(_server, server)) _server = null;
+      },
+    );
   }
 
   /// 网络变化后重新绑定发现端口并立即广播
@@ -322,6 +352,11 @@ class SourceTransport {
   }
 
   void _onTimer() {
+    if (_server == null && !_rebinding) {
+      _rebinding = true;
+      _bindServer().catchError((_) {}).whenComplete(() => _rebinding = false);
+    }
+    if (!_discovery.isOpen) refresh();
     final now = nowUs;
     for (final connection in connections.toList()) {
       if (now - connection.lastReceived > _silenceTimeoutUs) {
@@ -438,6 +473,10 @@ class ConsoleTransport {
   }
 
   void _check() {
+    if (!_discovery.isOpen) {
+      refresh();
+      return;
+    }
     final connection = _connection;
     if (connection == null) {
       _search();
