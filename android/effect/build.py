@@ -13,7 +13,7 @@ import re
 ROOT = Path(__file__).resolve().parent
 BUILD = ROOT / 'build'
 BUILD.mkdir(exist_ok=True)
-TAG = 'android-15.0.0_r1'
+TAG = 'android-16.0.0_r1'
 
 
 def run(*args):
@@ -38,7 +38,7 @@ groups = [
     ('audio/aidl/aidl_api/android.hardware.audio.effect/2', 2),
 ]
 hardware = checkout('platform_hardware_interfaces', 'hardware', [path for path, _ in groups])
-media_path = 'media/aidl_api/android.media.audio.common.types/3'
+media_path = 'media/aidl_api/android.media.audio.common.types/4'
 system = checkout('platform_system_hardware_interfaces', 'system', [media_path])
 # SDK 36 的生成器需要新版 defineClass/asBinderReference；这些辅助头不改变 V2 线格式。
 native = checkout('platform_frameworks_native', 'native', ['libs/binder/ndk'], 'android-16.0.0_r1')
@@ -75,7 +75,7 @@ assert (platform_cpp / 'config/__config_site').is_file()
 binder_map = (native / 'libs/binder/ndk/libbinder_ndk.map.txt').read_text()
 exports = re.findall(r'^\s*(A[A-Za-z0-9_]+)\s*;', binder_map, re.M)
 (BUILD / 'binder_stub.c').write_text('\n'.join(f'void {name}(void) {{ __builtin_trap(); }}' for name in exports))
-roots = [(hardware / path, version) for path, version in groups] + [(system / media_path, 3)]
+roots = [(hardware / path, version) for path, version in groups] + [(system / media_path, 4)]
 sdk = Path(os.environ['ANDROID_HOME'])
 aidls = sorted(sdk.glob('build-tools/*/aidl'), key=lambda p: tuple(int(x) for x in p.parent.name.split('.') if x.isdigit()))
 if not aidls:
