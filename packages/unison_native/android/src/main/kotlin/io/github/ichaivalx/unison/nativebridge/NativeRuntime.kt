@@ -23,6 +23,7 @@ internal object NativeRuntime {
     @Volatile var sourceRequested = false
     @Volatile var keepAliveRequested = false
     @Volatile private var exiting = false
+    @Volatile private var exitComplete = CompletableFuture.completedFuture<Any?>(null)
     private val exitEpoch = AtomicLong()
     private val serviceWaiters = mutableListOf<CompletableFuture<Any?>>()
     @Volatile private var keepAliveReady = CompletableFuture.completedFuture<Any?>(null)
@@ -117,7 +118,10 @@ internal object NativeRuntime {
             // 前台阶段已建立服务；远端命令到来时只使用该服务，不从后台启动新的 FGS。
             check(!exiting && epoch == exitEpoch.get()) { "Unison 已退出" }
             check(keepAliveRequested && AudioService.instance != null) { "请先在前台开启 Unison 常驻" }
-            try { receiverRequested = true; check(ReceiverEngine.start(host)) { "Cannot start receiver" }; serviceState(); forceWifi(true) }
+            try {
+                receiverRequested = true; check(ReceiverEngine.start(host)) { "Cannot start receiver" }; serviceState(); forceWifi(true)
+                check(!exiting && epoch == exitEpoch.get()) { "Unison 已退出" }
+            }
             catch (error: Throwable) { receiverRequested = false; serviceState(); throw error }
             null
         } }
@@ -126,7 +130,7 @@ internal object NativeRuntime {
     fun stopSource(): CompletableFuture<Any?> = if (exiting) CompletableFuture.completedFuture(null)
         else root("stopSource").whenComplete { _, _ -> sourceRequested = false; serviceState() }
     fun setKeepAlive(on: Boolean): CompletableFuture<Any?> {
-        check(!exiting) { "Unison 正在退出" }
+        if (exiting) return if (on) exitComplete.thenCompose { setKeepAlive(true) } else exitComplete
         keepAliveRequested = on
         if (!on) { serviceState(); return CompletableFuture.completedFuture(null) }
         keepAliveReady = keepService().whenComplete { _, error -> if (error != null) { keepAliveRequested = false; serviceState() } }
@@ -148,7 +152,7 @@ internal object NativeRuntime {
     fun serviceStarted() { val waiting = serviceWaiters.toList(); serviceWaiters.clear(); waiting.forEach { it.complete(null) } }
     fun notificationExit() {
         if (exiting) return
-        exiting = true; exitEpoch.incrementAndGet()
+        exitComplete = CompletableFuture(); exiting = true; exitEpoch.incrementAndGet()
         keepAliveRequested = false; receiverRequested = false; sourceRequested = false
         // 先通知控制面停止远端命令和重连；清理顺序在同一 worker 中执行。
         emit("exit", null)
@@ -159,7 +163,7 @@ internal object NativeRuntime {
                 source = source.put("running", false).put("sessions", JSONArray()).put("receiverIds", JSONArray())
                 currentMedia = null; haveMedia = true
                 emit("source", source); emit("media", null)
-                exiting = false; serviceState()
+                exiting = false; exitComplete.complete(null); serviceState()
             }
         }
         serviceState()
