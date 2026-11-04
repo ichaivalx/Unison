@@ -125,7 +125,11 @@ class SourceService implements Console {
   @override
   void wake({required bool returned}) {
     if (!returned) return;
-    UnisonNative.setKeepAlive(true).catchError((_) {});
+    UnisonNative.setKeepAlive(true).then((_) {
+      // 音源只复用已建立的常驻服务
+      if (_autoStart && _enabled) _startSource();
+      _autoStart = false;
+    }, onError: (_) {});
     if (_exited) {
       _exited = false;
       _transport = _newTransport();
@@ -234,8 +238,12 @@ class SourceService implements Console {
       _volume = volume;
       _publish();
     }, onError: (_) {});
-    if (_enabled) _startSource();
+    // 上次启用的音源等界面在前台、常驻就绪后再启动（见 wake）
+    _autoStart = _enabled;
   }
+
+  /// 启动 App 时待恢复的音源
+  bool _autoStart = false;
 
   bool get _running => _status?.running ?? false;
 
