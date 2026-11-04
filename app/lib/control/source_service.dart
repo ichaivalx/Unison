@@ -121,8 +121,11 @@ class SourceService implements Console {
   @override
   int localTimeOf(int sourceUs) => sourceUs;
 
+  /// 从后台回到前台时保持常驻，使其他控制台随时能开启音源
   @override
-  void wake() {}
+  void wake({required bool returned}) {
+    if (returned) UnisonNative.setKeepAlive(true).catchError((_) {});
+  }
 
   final _prefs = LocalSettings.prefs;
   final Map<String, _Peer> _peers = {};
@@ -352,9 +355,10 @@ class SourceService implements Console {
       case Command.localDelay:
         if (args['us'] case final num us) _setLocalDelay(max(0, us.toInt()));
       case Command.offset:
-        if (args['us'] case final num us) {
+        // 按增量调整：归一化会平移所有偏移，连续调节时绝对值的基准会变
+        if (args['deltaUs'] case final num delta) {
           if (peer != null) {
-            peer.baseOffsetUs += us.toInt() - _effectiveOffset(peer);
+            peer.baseOffsetUs += delta.toInt();
             _savePeers();
             _normalize();
           }
@@ -417,10 +421,10 @@ class SourceService implements Console {
     _publish();
   }
 
-  /// 使所有已知设备（含离线的）的生效偏移不小于 0，且本机延迟尽量小
-  void _normalize() {
+  /// 使所有已知设备（含离线的）的生效偏移不小于 0；[minimize] 时并使本机延迟尽量小
+  void _normalize({bool minimize = true}) {
     final shift = normalizationShift(_localDelayUs, [for (final peer in _peers.values) _effectiveOffset(peer)]);
-    if (shift == 0) return;
+    if (shift == 0 || (!minimize && shift < 0)) return;
     for (final peer in _peers.values) {
       peer.baseOffsetUs += shift;
     }
@@ -582,7 +586,8 @@ class SourceService implements Console {
     }
     _setLocalDelay(undo.localDelayUs);
     _saveCalibration();
-    _normalize();
+    // 快照本身合法，只在其后调过对齐频段而出现负偏移时修正
+    _normalize(minimize: false);
     _calibration = const CalibrationView(message: '已撤销本次校准');
   }
 

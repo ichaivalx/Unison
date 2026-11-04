@@ -314,10 +314,10 @@ class DeviceCard extends StatelessWidget {
                     DialField(
                       label: '偏移',
                       value: (device.offsetUs / _offsetStep).round(),
-                      format: (v) => formatOffset(v == (device.offsetUs / _offsetStep).round() ? device.offsetUs : v * _offsetStep),
+                      format: (_) => formatOffset(device.offsetUs),
                       ends: const ('更早', '更晚'),
                       enabled: !calibrating,
-                      onChanged: (v) => _command(Command.offset, {'us': v * _offsetStep}),
+                      onDelta: (steps) => _command(Command.offset, {'deltaUs': steps * _offsetStep}),
                     ),
                   ],
                 ],

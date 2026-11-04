@@ -73,8 +73,8 @@ class ConsoleClient implements Console {
   Future<void> _applying = Future.value();
   bool _busy = false;
 
-  /// 原生侧自行停止了接收（如通知栏停止），尚待音源确认关闭接收开关
-  bool _stoppedNatively = false;
+  /// 用户从通知退出后，尚待音源确认关闭本机接收开关
+  bool _receiveOffPending = false;
 
   Future<void> _start() async {
     UnisonNative.receiverStats.listen(_onStats, onError: (_) {});
@@ -101,18 +101,20 @@ class ConsoleClient implements Console {
     } catch (_) {}
   }
 
-  /// 回到前台：Android 上保持常驻（首次会申请通知权限），并确认连接
+  /// 从后台回到前台时解除退出、保持常驻（首次会申请通知权限）；只是焦点恢复（如
+  /// 收起通知栏）时只确认现有连接，不撤销退出
   @override
-  void wake() {
-    if (Platform.isAndroid) UnisonNative.setKeepAlive(true).catchError((_) {});
+  void wake({required bool returned}) {
     if (_exited) {
+      if (!returned) return;
       _exited = false;
       _transport = _newTransport();
       _transport.start().catchError((_) {});
-      return;
+    } else {
+      _transport.wake();
+      _report();
     }
-    _transport.wake();
-    _report();
+    if (returned && Platform.isAndroid) UnisonNative.setKeepAlive(true).catchError((_) {});
   }
 
   /// 通知上的“退出”：原生已停止接收与常驻；同步关闭本机接收开关，断开且不再重连
@@ -121,7 +123,7 @@ class ConsoleClient implements Console {
     _exited = true;
     _clearReceiver();
     // 未送达时重连后补发，确认前不按旧设置重新接收
-    _stoppedNatively = true;
+    _receiveOffPending = true;
     _sendReceiveOff();
     await _transport.dispose();
     _connected.value = false;
@@ -139,7 +141,7 @@ class ConsoleClient implements Console {
   void _onConnected() {
     _connected.value = true;
     _hello();
-    if (_stoppedNatively) _sendReceiveOff();
+    if (_receiveOffPending) _sendReceiveOff();
     _report();
   }
 
@@ -173,10 +175,12 @@ class ConsoleClient implements Console {
   Future<void> _apply(Message message, String host) async {
     _busy = true;
     final receive = message['receive'] == true;
-    // 原生侧停止接收后，等音源确认关闭前不再按旧设置启动
-    if (!receive) _stoppedNatively = false;
-    if (receive && !_stoppedNatively) {
+    // 退出后，等音源确认关闭前不再按旧设置启动
+    if (!receive) _receiveOffPending = false;
+    if (receive && !_receiveOffPending) {
       if (!_receiverOn || _receiverHost != host) {
+        // 换音源地址时原生先停旧流：新流启动成功前按未接收回报，失败由音源重发
+        _clearReceiver();
         try {
           await UnisonNative.startReceiver(sourceHost: host);
           _receiverOn = true;
@@ -222,10 +226,8 @@ class ConsoleClient implements Console {
   void _onStats(ReceiverStats stats) {
     _stats = stats;
     if (!_receiverOn || stats.running || _busy || nowUs - _startedAt < _startGraceUs) return;
-    // 不是控制面停止的：同步关闭接收开关，否则重连后不会再启动
+    // 接收意外停止：按未接收回报，由音源按接收开关重发恢复
     _clearReceiver();
-    _stoppedNatively = true;
-    _sendReceiveOff();
     _report();
   }
 

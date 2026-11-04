@@ -30,4 +30,17 @@ void main() {
     expect(normalizationShift(1000, [0, 2000]), 0);
     expect(normalizationShift(1000, []), 0);
   });
+
+  test('连续按增量调早偏移，本机延迟按实际调节量增加', () {
+    var localDelay = 0;
+    final offsets = {'a': 0, 'b': 2000};
+    for (var i = 0; i < 3; i++) {
+      offsets['a'] = offsets['a']! - 500;
+      final shift = normalizationShift(localDelay, offsets.values);
+      localDelay += shift;
+      offsets.updateAll((_, offset) => offset + shift);
+    }
+    expect(localDelay, 1500);
+    expect(offsets, {'a': 0, 'b': 3500});
+  });
 }

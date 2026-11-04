@@ -127,15 +127,17 @@ class _DialPainter extends CustomPainter {
       index != old.index || drag != old.drag || color != old.color || indicatorColor != old.indicatorColor;
 }
 
-/// 带标题与数值的拨轮。拖动期间以本地值为准、按绝对值提交，避免状态回传前的
-/// 连续调节相互覆盖
+/// 带标题与数值的拨轮。给出 [onChanged] 时拖动期间以本地值为准、按绝对值提交，
+/// 避免状态回传前的连续调节相互覆盖；给出 [onDelta] 时按格数增量提交、显示以状态为准，
+/// 用于提交后会被整体平移的值
 class DialField extends StatefulWidget {
   const DialField({
     super.key,
     required this.label,
     required this.value,
     required this.format,
-    required this.onChanged,
+    this.onChanged,
+    this.onDelta,
     this.min,
     this.max,
     this.trailing,
@@ -148,7 +150,10 @@ class DialField extends StatefulWidget {
   /// 当前值（格）
   final int value;
   final String Function(int value) format;
-  final ValueChanged<int> onChanged;
+  final ValueChanged<int>? onChanged;
+
+  /// 拖过的格数
+  final ValueChanged<int>? onDelta;
   final int? min;
   final int? max;
 
@@ -178,13 +183,17 @@ class _DialFieldState extends State<DialField> {
   }
 
   void _onSteps(int steps) {
+    if (widget.onDelta case final onDelta?) {
+      onDelta(steps);
+      return;
+    }
     final current = _pending ?? widget.value;
     var next = current + steps;
     if (widget.min case final min?) next = next < min ? min : next;
     if (widget.max case final max?) next = next > max ? max : next;
     if (next == current) return;
     setState(() => _pending = next);
-    widget.onChanged(next);
+    widget.onChanged?.call(next);
     _release?.cancel();
     _release = Timer(_hold, () {
       if (mounted) setState(() => _pending = null);

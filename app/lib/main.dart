@@ -20,7 +20,7 @@ Future<void> main() async {
   runApp(UnisonApp(console: console));
   final opened = console.value = await _open();
   // 界面已在前台时补一次唤醒；之后由回到前台触发
-  if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) opened.wake();
+  if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) opened.wake(returned: true);
 }
 
 Future<Console> _open() async {
@@ -45,10 +45,24 @@ class UnisonApp extends StatefulWidget {
 class _UnisonAppState extends State<UnisonApp> {
   late final AppLifecycleListener _lifecycle;
 
+  /// 上次进入前台后曾转入后台；只是失去焦点（inactive）不算
+  bool _away = true;
+
   @override
   void initState() {
     super.initState();
-    _lifecycle = AppLifecycleListener(onResume: () => widget.console.value?.wake());
+    _lifecycle = AppLifecycleListener(
+      onStateChange: (state) {
+        switch (state) {
+          case AppLifecycleState.resumed:
+            widget.console.value?.wake(returned: _away);
+            _away = false;
+          case AppLifecycleState.hidden || AppLifecycleState.paused || AppLifecycleState.detached:
+            _away = true;
+          case AppLifecycleState.inactive:
+        }
+      },
+    );
   }
 
   @override

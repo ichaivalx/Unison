@@ -20,6 +20,6 @@ abstract interface class Console {
   /// 音源时刻 [sourceUs] 对应的本机单调时刻
   int localTimeOf(int sourceUs);
 
-  /// 回到前台：确认连接
-  void wake();
+  /// 回到前台：[returned] 为从后台返回（而非只是焦点恢复，如收起通知栏）
+  void wake({required bool returned});
 }
