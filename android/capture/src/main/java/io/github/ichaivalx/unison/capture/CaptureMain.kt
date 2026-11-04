@@ -54,8 +54,8 @@ object CaptureMain {
     private var intervalSumNs = 0L
     private var intervalMinNs = Long.MAX_VALUE
     private var intervalMaxNs = 0L
-    private var effectDroppedFrames = 0L
-    private var effectDroppedBatches = 0L
+    private var effectDroppedFrames: Long? = null
+    private var effectDroppedBatches: Long? = null
     private var effectActualDelayMs = 0
     private var effectIo = 0
     @Volatile private var localDelayMs = 0
@@ -188,8 +188,8 @@ object CaptureMain {
                                 val intervals = if (intervalCount == 0L) "n/a" else String.format(Locale.ROOT, "%.2f/%.2f/%.2f",
                                     intervalMinNs / 1_000_000.0, intervalSumNs / intervalCount / 1_000_000.0, intervalMaxNs / 1_000_000.0)
                                 val text = "effect_frames/s=$effectFrames batch_frames_min_avg_max=$batches " +
-                                    "call_interval_ms_min_avg_max=$intervals effect_dropped_frames=$effectDroppedFrames " +
-                                    "effect_dropped_batches=$effectDroppedBatches local_delay_ms=$effectActualDelayMs io=$effectIo "
+                                    "call_interval_ms_min_avg_max=$intervals effect_dropped_frames=${effectDroppedFrames ?: "n/a"} " +
+                                    "effect_dropped_batches=${effectDroppedBatches ?: "n/a"} local_delay_ms=$effectActualDelayMs io=$effectIo "
                                 effectFrames = 0; effectBatches = 0; batchMin = Int.MAX_VALUE; batchMax = 0
                                 intervalCount = 0; intervalSumNs = 0; intervalMinNs = Long.MAX_VALUE; intervalMaxNs = 0
                                 text

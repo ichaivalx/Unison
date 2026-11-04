@@ -7,12 +7,14 @@
 #include <android/log.h>
 #include <atomic>
 #include <chrono>
+#include <dlfcn.h>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/resource.h>
 #include "fmq.h"
 #include "tap_packet.h"
 
@@ -65,6 +67,7 @@ public:
             status_ = std::make_unique<Fmq<IEffect::Status>>(1, true);
             allocateData();
             socket_ = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (socket_ < 0) __android_log_print(ANDROID_LOG_ERROR, "UnisonTap", "tap socket: %s", strerror(errno));
             // socket 失败不影响本机音频，tap 丢弃数会随 process 增长。
             streamId_ = static_cast<uint64_t>(nowNs());
             state_ = State::IDLE;
@@ -226,6 +229,8 @@ private:
         frames_ = 0; droppedFrames_ = 0; droppedBatches_ = 0; delayMs_ = 0;
     }
     void process() noexcept {
+        if (setpriority(PRIO_PROCESS, 0, -16) != 0)
+            __android_log_print(ANDROID_LOG_WARN, "UnisonTap", "cannot raise worker priority: %s", strerror(errno));
         sockaddr_un destination{};
         destination.sun_family = AF_UNIX;
         memcpy(destination.sun_path + 1, UNISON_TAP_SOCKET, sizeof(UNISON_TAP_SOCKET) - 1);
@@ -287,7 +292,20 @@ extern "C" __attribute__((visibility("default"))) binder_exception_t queryEffect
 }
 extern "C" __attribute__((visibility("default"))) binder_exception_t createEffect(const AudioUuid* uuid, std::shared_ptr<IEffect>* result) {
     if (!uuid || !result) return EX_ILLEGAL_ARGUMENT;
-    try { if (*uuid != implUuid()) return EX_ILLEGAL_ARGUMENT; *result = ndk::SharedRefBase::make<UnisonEffect>(); return EX_NONE; }
+    try {
+        if (*uuid != implUuid()) return EX_ILLEGAL_ARGUMENT;
+        // 该 VINTF 标记符号由系统 libbinder_ndk 导出，但不在 NDK 公共链接桩中。
+        // 在发布 binder 前解析并标记，不引入任何设备库作为构建依赖。
+        using MarkVintf = void (*)(AIBinder*);
+        const auto mark = reinterpret_cast<MarkVintf>(dlsym(RTLD_DEFAULT, "AIBinder_markVintfStability"));
+        if (!mark) return EX_UNSUPPORTED_OPERATION;
+        auto instance = ndk::SharedRefBase::make<UnisonEffect>();
+        auto binder = instance->asBinder();
+        if (!binder.get()) return EX_ILLEGAL_STATE;
+        mark(binder.get());
+        *result = std::move(instance);
+        return EX_NONE;
+    }
     catch (...) { return EX_ILLEGAL_STATE; }
 }
 extern "C" __attribute__((visibility("default"))) binder_exception_t destroyEffect(const std::shared_ptr<IEffect>& instance) {

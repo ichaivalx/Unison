@@ -6,5 +6,5 @@ file(GLOB_RECURSE BINDINGS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/build/
 add_library(unison_tap SHARED unison_effect.cpp ${BINDINGS})
 target_include_directories(unison_tap PRIVATE build/aidl/include)
 target_compile_options(unison_tap PRIVATE -Wall -Wextra -fvisibility=hidden -fvisibility-inlines-hidden)
-target_link_libraries(unison_tap PRIVATE binder_ndk log)
+target_link_libraries(unison_tap PRIVATE binder_ndk log dl)
 target_link_options(unison_tap PRIVATE -Wl,--no-undefined -Wl,--exclude-libs,ALL)
