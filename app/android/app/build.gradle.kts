@@ -17,7 +17,7 @@ android {
 
     defaultConfig {
         applicationId = "io.github.ichaivalx.unison"
-        minSdk = 29
+        minSdk = 33
         targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
