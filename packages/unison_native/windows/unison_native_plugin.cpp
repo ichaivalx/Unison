@@ -56,19 +56,25 @@ class UnisonNativePlugin : public flutter::Plugin {
         sink_ = std::move(sink); emit("receiver", Value(unison_windows::stats())); emit("volume", Value(unison_windows::volume())); return nullptr;
       }, [this](const Value*) -> std::unique_ptr<flutter::StreamHandlerError<Value>> { sink_.reset(); return nullptr; }));
     window_ = registrar->GetView()->GetNativeWindow();
-    timer_ = reinterpret_cast<UINT_PTR>(this);
+
     delegate_ = registrar->RegisterTopLevelWindowProcDelegate([this](HWND, UINT message, WPARAM wparam, LPARAM) -> std::optional<LRESULT> {
-      if (message == WM_TIMER && wparam == timer_) {
+      if (message == WM_APP + 0x537 && wparam == reinterpret_cast<WPARAM>(this)) {
         emit("receiver", Value(unison_windows::stats()));
         double volume = unison_windows::volume(); if (volume != previousVolume_) { previousVolume_ = volume; emit("volume", Value(volume)); }
         return 0;
       }
       return std::nullopt;
     });
-    SetTimer(window_, timer_, 250, nullptr);
+    CreateTimerQueueTimer(&timer_, nullptr, [](void* context, BOOLEAN) {
+      auto* self = static_cast<UnisonNativePlugin*>(context);
+      // RegisterPlugins 在父窗口挂接前运行，回调时再取父窗口。
+      HWND parent = GetAncestor(self->window_, GA_ROOT);
+      if (parent) PostMessage(parent, WM_APP + 0x537, reinterpret_cast<WPARAM>(self), 0);
+    }, this, 250, 250, WT_EXECUTEDEFAULT);
   }
   ~UnisonNativePlugin() override {
-    KillTimer(window_, timer_); registrar_->UnregisterTopLevelWindowProcDelegate(delegate_);
+    if (timer_) DeleteTimerQueueTimer(nullptr, timer_, INVALID_HANDLE_VALUE);
+    registrar_->UnregisterTopLevelWindowProcDelegate(delegate_);
     unison_windows::stop(); channel_->SetMethodCallHandler(nullptr); events_->SetStreamHandler(nullptr);
   }
  private:
@@ -76,7 +82,7 @@ class UnisonNativePlugin : public flutter::Plugin {
     if (sink_) sink_->Success(Value(flutter::EncodableMap{{Value("type"), Value(type)}, {Value("data"), std::move(data)}}));
   }
   flutter::PluginRegistrarWindows* registrar_;
-  HWND window_ = nullptr; UINT_PTR timer_ = 0; int delegate_ = -1;
+  HWND window_ = nullptr; HANDLE timer_ = nullptr; int delegate_ = -1;
   double previousVolume_ = -1;
   std::unique_ptr<flutter::MethodChannel<Value>> channel_;
   std::unique_ptr<flutter::EventChannel<Value>> events_;
