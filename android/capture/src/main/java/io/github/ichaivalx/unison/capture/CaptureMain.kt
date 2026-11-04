@@ -295,7 +295,7 @@ object CaptureMain {
             position(20)
             putInt(SAMPLE_RATE).put(2.toByte()).put(1.toByte()).putShort(FRAMES.toShort())
         }
-        class Chunk(val startNs: Long, val samples: FloatArray) {
+        class Chunk(var startNs: Long, val samples: FloatArray) {
             val frames get() = samples.size / 2
             val endNs get() = startNs + framesToNs(frames.toLong())
         }
@@ -352,7 +352,12 @@ object CaptureMain {
                             sequence += 2
                             synchronized(diagnosticsLock) { timelineResets++ }
                             println("INFO effect_timeline_reset session=$session residual_ms=${residualNs / 1_000_000.0} io=$io")
-                        } else stream.originNs += (measuredOrigin - stream.originNs) / 16
+                        } else {
+                            val correction = (measuredOrigin - stream.originNs) / 16
+                            stream.originNs += correction
+                            // 同一流尚未发出的批次共用当前零点，避免平滑后批边界重叠被重复相加。
+                            for (chunk in stream.chunks) chunk.startNs += correction
+                        }
                         if (firstFrame != stream.expectedFrame) {
                             sequence += 2
                             stream.chunks.clear()
