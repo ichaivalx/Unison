@@ -41,8 +41,6 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
     private var ageSumNs = 0L
     private var ageMinNs = Long.MAX_VALUE
     private var ageMaxNs = Long.MIN_VALUE
-    private var diagnosticTimestampFrame: Long? = null
-    private var diagnosticReadFrames = 0L
     private var effectFrames = 0L
     private var effectBatches = 0L
     private var batchMin = Int.MAX_VALUE
@@ -53,12 +51,10 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
     private var intervalMaxNs = 0L
     private var effectDroppedFrames: Long? = null
     private var effectDroppedBatches: Long? = null
-    private var effectActualDelayMs = 0
     private var timelineResets = 0L
     @Volatile private var running = true
-    @Volatile private var timestampSource = "read-fallback"
     @Volatile private var lastError = "none"
-    @Volatile private var stage = "arguments"
+    @Volatile private var fatalError: String? = null
     private var closed = false
     private var channel: DatagramChannel? = null
     private var effect: EffectSource? = null
@@ -81,7 +77,9 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     broadcast(udp, beacon)
                     RootEvents.emit("source", status())
                     println("STATUS subscribers=${subscribers.size} peers=[${subscribers.keys.joinToString(",")}] latency_us=$latencyUs local_delay_us=$localDelayUs " +
-                        "packets/s=${packetCount.getAndSet(0)} sent/s=${sendCount.getAndSet(0)} dropped=${droppedCount.get()} ${effect?.status()} last_error=$lastError")
+                        "packets/s=${packetCount.getAndSet(0)} sent/s=${sendCount.getAndSet(0)} dropped=${droppedCount.get()} " +
+                        "peak=${peak.getAndSet(0)} subscriptions/s=${subscribeCount.getAndSet(0)} errors=${errorCount.get()} " +
+                        "${diagnostics()} ${effect?.status()} last_error=$lastError")
                     Thread.sleep(1000)
                 } } catch (error: Throwable) { if (running) fatal(error) }
             }
@@ -90,9 +88,22 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
         } catch (error: Throwable) { close("start_failed"); throw error }
     }
 
-    fun status(error: String? = null): org.json.JSONObject = org.json.JSONObject().put("running", running && !closed)
+    fun status(): org.json.JSONObject = org.json.JSONObject().put("running", running && !closed)
         .put("latencyUs", latencyUs).put("localDelayUs", localDelayUs).put("sessions", effect?.sessionStatus() ?: org.json.JSONArray())
-        .put("receiverIds", org.json.JSONArray(receiverIds())).put("error", error ?: org.json.JSONObject.NULL)
+        .put("receiverIds", org.json.JSONArray(receiverIds())).put("error", fatalError ?: org.json.JSONObject.NULL)
+
+    private fun diagnostics(): String = synchronized(diagnosticsLock) {
+        fun ms(ns: Long) = ns / 1_000_000.0
+        val age = if (ageCount == 0L) "-" else "${ms(ageMinNs)}/${ms(ageSumNs / ageCount)}/${ms(ageMaxNs)}"
+        val batch = if (effectBatches == 0L) "-" else "$batchMin/${effectFrames / effectBatches}/$batchMax"
+        val interval = if (intervalCount == 0L) "-" else "${ms(intervalMinNs)}/${ms(intervalSumNs / intervalCount)}/${ms(intervalMaxNs)}"
+        val text = "effect_frames/s=$effectFrames batch=$batch call_ms=$interval capture_age_ms=$age " +
+            "effect_dropped_frames=$effectDroppedFrames effect_dropped_batches=$effectDroppedBatches timeline_resets=$timelineResets"
+        effectFrames = 0; effectBatches = 0; batchMin = Int.MAX_VALUE; batchMax = 0
+        intervalCount = 0; intervalSumNs = 0; intervalMinNs = Long.MAX_VALUE; intervalMaxNs = 0
+        ageCount = 0; ageSumNs = 0; ageMinNs = Long.MAX_VALUE; ageMaxNs = Long.MIN_VALUE
+        text
+    }
 
     fun receiverIds(): List<Long> = subscribers.values.filter { System.nanoTime() - it.lastNs < SUBSCRIBE_TIMEOUT_NS }.map { it.id }.distinct()
     fun setDelay(us: Long) { check(calibration?.isRunning != true) { "校准中" }; check(us >= 0); effect?.setLocalDelay(us); localDelayUs = us; RootEvents.emit("source", status()) }
@@ -128,7 +139,6 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
         val mixed = FloatArray(FRAMES * 2)
         var cursorNs: Long? = null
         var sequence = 0
-        timestampSource = "effect-session-clock"
         while (running) {
             val raw = source.read()
             val active = if (calibration?.isRunning == true) setOfNotNull(calibration?.sessionId) else source.activeSessions()
@@ -144,7 +154,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                 val callNs = batch.long
                 val droppedFrames = batch.long
                 val droppedBatches = batch.long
-                val actualDelay = batch.int
+                batch.int // 本机延迟的毫秒诊断值；实际设置保留微秒精度。
                 val session = batch.int
                 check(frames > 0 && raw.size.toLong() == 64L + frames.toLong() * 8) { "Invalid effect batch size" }
                 check(rate == SAMPLE_RATE) { "Effect tap rate=$rate; UDP prototype requires $SAMPLE_RATE" }
@@ -188,8 +198,6 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                             intervalCount++; intervalSumNs += interval
                             intervalMinNs = minOf(intervalMinNs, interval); intervalMaxNs = maxOf(intervalMaxNs, interval)
                         }
-                        effectActualDelayMs = actualDelay
-                        diagnosticReadFrames += frames
                     }
                     stream.previousCallNs = callNs; stream.previousFrame = firstFrame; stream.previousBatch = frames
                     stream.expectedFrame = firstFrame + frames
@@ -235,7 +243,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                 }
                 val currentCalibration = calibration
                 currentCalibration?.onTap(startNs, mixed)
-                                for (sample in mixed.indices) {
+                for (sample in mixed.indices) {
                     val pcm = (mixed[sample] * 32768f).toInt().coerceIn(-32768, 32767)
                     data.putShort(AUDIO_HEADER + sample * 2, pcm.toShort())
                 }
@@ -363,7 +371,8 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
 
     private fun fatal(error: Throwable) {
         lastError = describe(error)
-        RootEvents.emit("source", status(lastError).put("running", false))
+        fatalError = lastError
+        RootEvents.emit("source", status().put("running", false))
         close("fatal")
         onFatal(error)
     }

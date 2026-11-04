@@ -92,7 +92,7 @@ internal class EffectSource {
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { return@thread }
             }
         }
-        println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_ms=$localDelayUs")
+        println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_us=$localDelayUs")
     }
 
     private fun refresh(configs: List<AudioPlaybackConfiguration>? = null) {
