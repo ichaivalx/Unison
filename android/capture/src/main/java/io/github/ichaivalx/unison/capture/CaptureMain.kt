@@ -322,7 +322,10 @@ object CaptureMain {
             check(rate == SAMPLE_RATE) { "Effect tap rate=$rate; UDP prototype requires $SAMPLE_RATE" }
             val measuredOrigin = callNs - framesToNs(firstFrame)
             if (stream != id) {
-                if (stream != null) println("INFO effect_stream_changed io=$io stream=$id")
+                if (stream != null) {
+                    sequence += 2
+                    println("INFO effect_stream_changed io=$io stream=$id")
+                }
                 stream = id; originNs = measuredOrigin; filled = 0; previousCallNs = 0
                 println("INFO effect_stream io=$io stream=$id rate=$rate")
             } else {

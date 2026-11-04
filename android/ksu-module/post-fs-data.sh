@@ -7,6 +7,7 @@ BOOT_ID=$(cat /proc/sys/kernel/random/boot_id) || exit 0
 mkdir -p "$RUNTIME" || exit 0
 exec 9> "$RUNTIME/post-fs.lock"
 flock -n 9 || exit 0
+load_mount_state
 cleanup_stages
 
 if [ -f "$MODDIR/boot-pending" ]; then
@@ -21,6 +22,9 @@ fi
 load_mount_state
 # 同一次开机重复执行时绝不触碰正在挂载的配置或库目录。
 module_mounted && exit 0
+rm -f "$RUNTIME/mount-state"
+ACTIVE_CONFIG=
+ACTIVE_LIBS=
 printf '%s\n' "$BOOT_ID" > "$MODDIR/boot-pending.new" || exit 0
 mv -f "$MODDIR/boot-pending.new" "$MODDIR/boot-pending" || exit 0
 

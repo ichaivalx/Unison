@@ -97,6 +97,14 @@ build_result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess
 print(build_result.stdout, flush=True)
 (BUILD / 'abi-vtables.txt').write_text(build_result.stdout)
 build_result.check_returncode()
+vtable = re.search(r"Vtable for 'UnisonEffect' \(19 entries\)\.(.*?)\n\n", build_result.stdout, re.S)
+if not vtable:
+    raise RuntimeError('缺少完整平台 UnisonEffect vtable 布局')
+for slot, method in ((7, 'handleShellCommand'), (8, 'UnisonEffect::open'), (15, 'UnisonEffect::reopen'),
+                     (16, 'getInterfaceVersion'), (17, 'getInterfaceHash'), (18, 'createBinder')):
+    if not re.search(rf'\n\s*{slot}\s*\|[^\n]*{re.escape(method)}', vtable.group(1)):
+        raise RuntimeError(f'平台 vtable 槽位不匹配: {slot} {method}')
+print('PLATFORM VTABLE VERIFIED:' + vtable.group(1), flush=True)
 toolchain = ndk / 'toolchains/llvm/prebuilt/linux-x86_64'
 run('python3', ROOT / 'verify_abi.py', '--plugin', BUILD / 'native-build/libunison_tap.so',
     '--providers', BUILD / 'native-build', '--providers', platform_cpp / 'lib',
