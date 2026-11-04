@@ -33,16 +33,16 @@ class UnisonNativePlugin : public flutter::Plugin {
           if (!unison_windows::start(std::get<std::string>(data.at(Value("sourceHost"))))) throw std::runtime_error("Cannot start receiver");
           result->Success();
         } else if (method == "stopReceiver") { unison_windows::stop(); result->Success(); }
+        else if (method == "setKeepAlive") result->Success();
         else if (method == "setReceiverOffsetUs") { unison_windows::offset(integer(args)); result->Success(); }
         else if (method == "outputDevices") {
-          flutter::EncodableList names; for (const auto& name : unison_windows::devices()) names.emplace_back(name);
-          result->Success(Value(names));
+          flutter::EncodableList devices;
+          for (const auto& device : unison_windows::devices()) devices.emplace_back(flutter::EncodableMap{{Value("id"), Value(device.id)}, {Value("name"), Value(device.name)}});
+          result->Success(Value(devices));
         } else if (method == "setOutputDevice") {
-          std::string name;
-          if (args && !std::holds_alternative<std::monostate>(*args)) name = std::get<std::string>(*args);
-          const auto devices = unison_windows::devices();
-          if (!name.empty() && std::find(devices.begin(), devices.end(), name) == devices.end()) throw std::runtime_error("Output device not found");
-          unison_windows::device(name); result->Success();
+          std::string id;
+          if (args && !std::holds_alternative<std::monostate>(*args)) id = std::get<std::string>(*args);
+          unison_windows::device(id); result->Success();
         } else if (method == "volume") result->Success(Value(unison_windows::volume()));
         else if (method == "setVolume") {
           double value = std::get<double>(*args); if (!std::isfinite(value) || value < 0 || value > 1) throw std::runtime_error("Invalid volume");

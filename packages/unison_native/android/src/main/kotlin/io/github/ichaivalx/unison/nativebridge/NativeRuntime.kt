@@ -12,6 +12,7 @@ import org.json.JSONObject
 import org.json.JSONArray
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 internal object NativeRuntime {
     lateinit var context: Context
@@ -20,6 +21,11 @@ internal object NativeRuntime {
     @Volatile var sink: EventChannel.EventSink? = null
     @Volatile var receiverRequested = false
     @Volatile var sourceRequested = false
+    @Volatile var keepAliveRequested = false
+    @Volatile private var exiting = false
+    private val exitEpoch = AtomicLong()
+    private val serviceWaiters = mutableListOf<CompletableFuture<Any?>>()
+    @Volatile private var keepAliveReady = CompletableFuture.completedFuture<Any?>(null)
     @Volatile var source = stoppedSource()
     @Volatile private var currentMedia: Any? = null
     @Volatile private var haveMedia = false
@@ -29,7 +35,8 @@ internal object NativeRuntime {
         .put("sessions", JSONArray()).put("receiverIds", JSONArray()).put("error", JSONObject.NULL)
     fun initialize(value: Context) {
         context = value.applicationContext
-        SourceController.onEvent = { type, data ->
+        SourceController.onEvent = events@{ type, data ->
+            if (exiting) return@events
             if (type == "source") {
                 source = data as JSONObject
                 sourceRequested = source.optBoolean("running")
@@ -73,7 +80,7 @@ internal object NativeRuntime {
             }
         }
     }
-    fun detach() { sink = null; if (!receiverRequested && !sourceRequested) { currentMedia = null; haveMedia = false; worker.execute { SourceController.shutdown() } } }
+    fun detach() { sink = null; if (!receiverRequested && !sourceRequested && !keepAliveRequested) { currentMedia = null; haveMedia = false; worker.execute { SourceController.shutdown() } } }
     fun emit(type: String, value: Any?) { main.post { sink?.success(mapOf("type" to type, "data" to convert(value))) } }
     private fun convert(value: Any?): Any? = when (value) {
         null, JSONObject.NULL -> null
@@ -83,8 +90,10 @@ internal object NativeRuntime {
     }
     fun root(method: String, args: JSONObject = JSONObject()): CompletableFuture<Any?> {
         val future = CompletableFuture<Any?>()
+        val epoch = exitEpoch.get()
         worker.execute {
             try {
+                check(!exiting && epoch == exitEpoch.get()) { "Unison 已退出" }
                 check(SourceController.ensure(context)) { "Root is unavailable" }
                 SourceController.request(method, args).whenComplete { result, error ->
                     if (error != null) future.completeExceptionally(error) else future.complete(convert(result))
@@ -94,23 +103,67 @@ internal object NativeRuntime {
         return future
     }
     fun startSource(args: JSONObject): CompletableFuture<Any?> {
+        val epoch = exitEpoch.get()
+        check(!exiting) { "Unison 正在退出" }
         sourceRequested = true
-        try { keepService() } catch (error: Throwable) { sourceRequested = false; throw error }
-        return root("startSource", args).whenComplete { _, error -> if (error != null) { sourceRequested = false; serviceState() } }
+        return keepService().thenCompose {
+            check(!exiting && epoch == exitEpoch.get()) { "Unison 已退出" }
+            root("startSource", args)
+        }.whenComplete { _, error -> if (error != null && epoch == exitEpoch.get()) { sourceRequested = false; serviceState() } }
     }
     fun startReceiver(host: String): CompletableFuture<Any?> {
-        receiverRequested = true
-        try { keepService() } catch (error: Throwable) { receiverRequested = false; throw error }
-        return background {
-            try { receiverRequested = true; keepService(); check(ReceiverEngine.start(host)) { "Cannot start receiver" }; forceWifi(true) }
+        val epoch = exitEpoch.get()
+        return keepAliveReady.thenCompose { background {
+            // 前台阶段已建立服务；远端命令到来时只使用该服务，不从后台启动新的 FGS。
+            check(!exiting && epoch == exitEpoch.get()) { "Unison 已退出" }
+            check(keepAliveRequested && AudioService.instance != null) { "请先在前台开启 Unison 常驻" }
+            try { receiverRequested = true; check(ReceiverEngine.start(host)) { "Cannot start receiver" }; serviceState(); forceWifi(true) }
             catch (error: Throwable) { receiverRequested = false; serviceState(); throw error }
             null
-        }
+        } }
     }
     fun stopReceiver() = background { receiverRequested = false; ReceiverEngine.stop(); forceWifi(false); serviceState(); null }
-    fun stopSource() = root("stopSource").whenComplete { _, _ -> sourceRequested = false; serviceState() }
-    fun stopAll() { stopReceiver(); stopSource() }
-    private fun keepService() { context.startForegroundService(Intent(context, AudioService::class.java).setAction("keep")) }
+    fun stopSource(): CompletableFuture<Any?> = if (exiting) CompletableFuture.completedFuture(null)
+        else root("stopSource").whenComplete { _, _ -> sourceRequested = false; serviceState() }
+    fun setKeepAlive(on: Boolean): CompletableFuture<Any?> {
+        check(!exiting) { "Unison 正在退出" }
+        keepAliveRequested = on
+        if (!on) { serviceState(); return CompletableFuture.completedFuture(null) }
+        keepAliveReady = keepService().whenComplete { _, error -> if (error != null) { keepAliveRequested = false; serviceState() } }
+        return keepAliveReady
+    }
+    fun holdsService() = keepAliveRequested || sourceRequested || receiverRequested
+    private fun keepService(): CompletableFuture<Any?> {
+        val future = CompletableFuture<Any?>()
+        main.post {
+            if (AudioService.instance != null) { AudioService.instance?.refresh(); future.complete(null) }
+            else {
+                serviceWaiters.add(future)
+                try { context.startForegroundService(Intent(context, AudioService::class.java).setAction("keep")) }
+                catch (error: Throwable) { serviceWaiters.remove(future); future.completeExceptionally(error) }
+            }
+        }
+        return future
+    }
+    fun serviceStarted() { val waiting = serviceWaiters.toList(); serviceWaiters.clear(); waiting.forEach { it.complete(null) } }
+    fun notificationExit() {
+        if (exiting) return
+        exiting = true; exitEpoch.incrementAndGet()
+        keepAliveRequested = false; receiverRequested = false; sourceRequested = false
+        // 先通知控制面停止远端命令和重连；清理顺序在同一 worker 中执行。
+        emit("exit", null)
+        worker.execute {
+            try {
+                ReceiverEngine.stop(); forceWifi(false); SourceController.shutdown()
+            } finally {
+                source = source.put("running", false).put("sessions", JSONArray()).put("receiverIds", JSONArray())
+                currentMedia = null; haveMedia = true
+                emit("source", source); emit("media", null)
+                exiting = false; serviceState()
+            }
+        }
+        serviceState()
+    }
     private fun serviceState() { main.post { AudioService.instance?.refresh() } }
     fun background(block: () -> Any?): CompletableFuture<Any?> {
         val future = CompletableFuture<Any?>()

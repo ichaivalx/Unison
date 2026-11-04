@@ -30,6 +30,11 @@ jobs:
       - run: cmake -S native/core -B out/core
       - run: cmake --build out/core --config Release
       - run: ctest --test-dir out/core -C Release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: native-core-windows
+          path: out/core/Release/receiver-test.exe
   plugin-smoke:
     runs-on: windows-latest
     steps:

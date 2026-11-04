@@ -8,8 +8,9 @@ bool start(const std::string& source);
 void stop();
 void offset(int64_t us);
 std::string stats();
-std::vector<std::string> devices();
-void device(const std::string& name);
+struct OutputDevice { std::string id, name; };
+std::vector<OutputDevice> devices();
+void device(const std::string& id);
 void volume(double value);
 double volume();
 }

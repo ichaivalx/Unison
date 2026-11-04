@@ -1,6 +1,8 @@
 package io.github.ichaivalx.unison.nativebridge
 
 import android.app.Activity
+import android.Manifest
+import android.content.pm.PackageManager
 import android.media.AudioManager
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -43,13 +45,17 @@ class UnisonNativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, Event
             val args = (call.arguments as? Map<*, *>)?.let { JSONObject(it) } ?: JSONObject()
             val future: CompletableFuture<Any?> = when (call.method) {
                 "receiverId" -> NativeRuntime.background { ReceiverEngine.receiverId() }
+                "setKeepAlive" -> {
+                    if (call.arguments == true) requestNotificationPermission()
+                    NativeRuntime.setKeepAlive(call.arguments == true)
+                }
                 "startReceiver" -> NativeRuntime.startReceiver(args.getString("sourceHost"))
                 "stopReceiver" -> NativeRuntime.stopReceiver()
                 "setReceiverOffsetUs" -> NativeRuntime.background { ReceiverEngine.setOffsetUs((call.arguments as Number).toLong()); null }
                 "volume" -> CompletableFuture.completedFuture(NativeRuntime.volume())
                 "setVolume" -> NativeRuntime.background { NativeRuntime.setVolume((call.arguments as Number).toDouble()); null }
                 "sourceAvailable" -> NativeRuntime.root("available").exceptionally { false }
-                "startSource" -> NativeRuntime.startSource(args)
+                "startSource" -> { requestNotificationPermission(); NativeRuntime.startSource(args) }
                 "stopSource" -> NativeRuntime.stopSource()
                 "setSourceLatencyUs", "setLocalDelayUs", "mediaSeek", "mediaCommand" -> NativeRuntime.root(call.method, JSONObject().put("value", call.arguments))
                 "calibrate" -> NativeRuntime.root("calibrate", args)
@@ -60,5 +66,11 @@ class UnisonNativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, Event
                 if (error != null) result.error("native", error.cause?.message ?: error.message, null) else result.success(value)
             } }
         } catch (error: Throwable) { result.error("native", error.message, null) }
+    }
+    private fun requestNotificationPermission() {
+        activity?.let {
+            if (it.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                it.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 47812)
+        }
     }
 }

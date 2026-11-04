@@ -21,6 +21,8 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
     private Class<?> runtimeClass;
     private Object engine;
     private Class<?> engineClass;
+    private Object serviceCompanion;
+    private Object service() throws Exception { return serviceCompanion.getClass().getMethod("getInstance").invoke(serviceCompanion); }
     private Object call(String method, Class<?>[] types, Object... values) throws Exception {
         return runtimeClass.getMethod(method, types).invoke(runtime, values);
     }
@@ -32,6 +34,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
         Object originalSink = null;
         Double originalVolume = null;
         JSONObject originalSource = null;
+        Boolean originalKeepAlive = null;
         Activity activity = null;
         Class<?> sinkClass = null;
         int code = Activity.RESULT_OK;
@@ -42,6 +45,8 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             runtime = runtimeClass.getField("INSTANCE").get(null);
             engineClass = Class.forName("io.github.ichaivalx.unison.ReceiverEngine", true, loader);
             engine = engineClass.getField("INSTANCE").get(null);
+            Class<?> serviceClass = Class.forName("io.github.ichaivalx.unison.nativebridge.AudioService", true, loader);
+            serviceCompanion = serviceClass.getField("Companion").get(null);
             Intent launch = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             activity = startActivitySync(launch);
@@ -49,6 +54,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             sinkClass = Class.forName("io.flutter.plugin.common.EventChannel$EventSink", true, loader);
             originalSink = call("getSink", new Class<?>[]{});
             originalSource = new JSONObject(call("getSource", new Class<?>[]{}).toString());
+            originalKeepAlive = (Boolean)call("getKeepAliveRequested", new Class<?>[]{});
             Set<String> events = Collections.synchronizedSet(new HashSet<>());
             Object listener = Proxy.newProxyInstance(loader, new Class<?>[]{sinkClass}, (proxy, method, values) -> {
                 if (method.getName().equals("success") && values[0] instanceof java.util.Map) events.add(String.valueOf(((java.util.Map<?,?>)values[0]).get("type")));
@@ -59,27 +65,39 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             call("setVolume", new Class<?>[]{double.class}, 0.5);
             double actual = (Double)call("volume", new Class<?>[]{});
             if (Math.abs(actual - 0.5) > 0.1) throw new IllegalStateException("Volume write mismatch");
+            await(call("setKeepAlive", new Class<?>[]{boolean.class}, true));
+            Object holder = service();
+            if (holder == null) throw new IllegalStateException("Keep-alive returned before service ready");
+            final Activity toFinish = activity;
+            runOnMainSync(toFinish::finish);
+            Thread.sleep(1000);
+            // 已无 Activity、尚未接收时，远端启用也必须复用同一个前台服务。
             await(call("startReceiver", new Class<?>[]{String.class}, args.getString("sourceHost", "192.168.50.55")));
             long deadline = System.nanoTime() + 5_000_000_000L;
             JSONObject receiving;
             do { Thread.sleep(100); receiving = stats(); } while (!receiving.optBoolean("clockReady") && System.nanoTime() < deadline);
             if (!receiving.optBoolean("running") || !receiving.optBoolean("clockReady")) throw new IllegalStateException("Receiver did not synchronize: " + receiving);
             long before = receiving.getLong("outputFramesWritten");
-            final Activity toFinish = activity;
-            runOnMainSync(toFinish::finish);
             Thread.sleep(1500);
             JSONObject background = stats();
             if (!background.optBoolean("running") || background.getLong("outputFramesWritten") <= before) throw new IllegalStateException("Audio stopped after Activity finish");
+            if (service() != holder) throw new IllegalStateException("Background receiver replaced keep-alive service");
             result.putString("receiverStats", background.toString());
             result.putLong("receiverId", (Long)engineClass.getMethod("receiverId").invoke(engine));
             await(call("stopReceiver", new Class<?>[]{}));
+            Thread.sleep(300);
+            if (service() != holder) throw new IllegalStateException("Stopping receiver stopped keep-alive service");
             activity = startActivitySync(launch);
             Object available = await(call("root", new Class<?>[]{String.class, JSONObject.class}, "available", new JSONObject()));
             if (!Boolean.TRUE.equals(available)) throw new IllegalStateException("Effect module unavailable");
             await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250)));
             await(call("root", new Class<?>[]{String.class, JSONObject.class}, "calibrate", new JSONObject().put("receiverIds", new org.json.JSONArray()).put("bands", new org.json.JSONArray().put("midHigh"))));
             await(call("stopSource", new Class<?>[]{}));
-            if (!events.containsAll(java.util.Arrays.asList("source", "volume", "media", "receiver", "calibration"))) throw new IllegalStateException("Missing initial/progress events: " + events);
+            context.startService(new Intent(context, serviceClass).setAction("exit"));
+            deadline = System.nanoTime() + 5_000_000_000L;
+            while ((!events.contains("exit") || service() != null) && System.nanoTime() < deadline) Thread.sleep(50);
+            if (service() != null || (Boolean)call("getKeepAliveRequested", new Class<?>[]{}) || stats().optBoolean("running")) throw new IllegalStateException("Notification exit did not release service/audio");
+            if (!events.containsAll(java.util.Arrays.asList("source", "volume", "media", "receiver", "calibration", "exit"))) throw new IllegalStateException("Missing initial/progress events: " + events);
             result.putString("events", events.toString()); result.putBoolean("ok", true);
         } catch (Throwable error) {
             code = Activity.RESULT_CANCELED; result.putBoolean("ok", false); result.putString("error", android.util.Log.getStackTraceString(error));
@@ -92,6 +110,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
                     try { await(call("root", new Class<?>[]{String.class, JSONObject.class}, "setSourceLatencyUs", new JSONObject().put("value", originalSource.optLong("latencyUs", 50000)))); } catch (Exception ignored) {}
                 }
                 if (originalVolume != null) try { call("setVolume", new Class<?>[]{double.class}, originalVolume); } catch (Exception ignored) {}
+                if (originalKeepAlive != null) try { await(call("setKeepAlive", new Class<?>[]{boolean.class}, originalKeepAlive)); } catch (Exception ignored) {}
                 if (originalSink != null && sinkClass != null) try { call("listen", new Class<?>[]{sinkClass}, originalSink); } catch (Exception ignored) {}
             }
         }

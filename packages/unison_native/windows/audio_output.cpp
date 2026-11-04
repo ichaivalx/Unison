@@ -17,10 +17,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <cwctype>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -30,10 +30,12 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 std::atomic<bool> running{false}, rebuild{false};
-std::atomic<float> gain{1.0f};
-std::atomic<bool> gainDirty{true};
+std::mutex volumeMutex;
+float desiredGain = 1.0f, actualGain = 1.0f;
+bool volumePending = false;
 std::mutex settingsMutex;
 std::wstring selectedOutput, endpointId;
+bool usingDefaultOutput = true;
 std::string actualDevice;
 void setStatus(const std::string& value) { std::lock_guard<std::mutex> lock(settingsMutex); actualDevice = value; }
 unison::Receiver networkReceiver;
@@ -44,10 +46,6 @@ std::string utf8(const std::wstring& value) {
     std::string out(size, '\0');
     WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), size, nullptr, nullptr);
     return out;
-}
-std::wstring lower(std::wstring value) {
-    for (auto& c : value) c = static_cast<wchar_t>(std::towlower(c));
-    return value;
 }
 std::wstring deviceName(IMMDevice* device) {
     ComPtr<IPropertyStore> store;
@@ -65,22 +63,16 @@ HRESULT enumerator(ComPtr<IMMDeviceEnumerator>& out) {
     return CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&out));
 }
 HRESULT chooseDevice(IMMDeviceEnumerator* devices, const std::wstring& selection, ComPtr<IMMDevice>& out) {
-    if (selection.empty()) return devices->GetDefaultAudioEndpoint(eRender, eConsole, &out);
-    ComPtr<IMMDeviceCollection> collection;
-    HRESULT hr = devices->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
-    if (FAILED(hr)) return hr;
-    UINT count = 0;
-    if (FAILED(hr = collection->GetCount(&count))) return hr;
-    std::wstring wanted = lower(selection);
-    for (UINT i = 0; i < count; ++i) {
-        ComPtr<IMMDevice> device;
-        if (FAILED(collection->Item(i, &device))) continue;
-        if (lower(deviceName(device.Get())) == wanted) {
-            out = device;
-            return S_OK;
-        }
+    bool selectedActive = false;
+    if (!selection.empty() && SUCCEEDED(devices->GetDevice(selection.c_str(), &out))) {
+        DWORD state = 0;
+        selectedActive = SUCCEEDED(out->GetState(&state)) && state == DEVICE_STATE_ACTIVE;
     }
-    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    { std::lock_guard<std::mutex> lock(settingsMutex); usingDefaultOutput = !selectedActive; }
+    if (selectedActive) return S_OK;
+    // 只替换实际流，不清除用户选择；设备恢复通知会使其重新打开。
+    out.Reset();
+    return devices->GetDefaultAudioEndpoint(eRender, eConsole, &out);
 }
 
 struct AudioOutput {
@@ -105,6 +97,34 @@ struct AudioOutput {
     int validBits = 0;
     std::vector<float> stereo;
 
+    HRESULT synchronizeVolume(bool initial = false) {
+        std::optional<float> command;
+        {
+            std::lock_guard<std::mutex> lock(volumeMutex);
+            if (volumePending) { command = desiredGain; volumePending = false; }
+            else if (initial) command = actualGain;
+        }
+        if (command) {
+            HRESULT hr = sessionVolume->SetMasterVolume(*command, nullptr);
+            if (SUCCEEDED(hr)) hr = sessionVolume->SetMute(FALSE, nullptr);
+            std::lock_guard<std::mutex> lock(volumeMutex);
+            if (FAILED(hr)) {
+                // 设备切换导致写入失败时保留命令；更新的命令优先。
+                if (!volumePending) { desiredGain = *command; volumePending = true; }
+            } else actualGain = *command;
+            return hr;
+        }
+        float value = 0; BOOL muted = FALSE;
+        HRESULT hr = sessionVolume->GetMasterVolume(&value);
+        if (SUCCEEDED(hr)) hr = sessionVolume->GetMute(&muted);
+        if (SUCCEEDED(hr)) {
+            std::lock_guard<std::mutex> lock(volumeMutex);
+            // 回读只修改实际值；并发到来的期望值仍在 pending 中等待下一轮消费。
+            actualGain = muted ? 0.0f : value;
+        }
+        return hr;
+    }
+
     ~AudioOutput() {
         if (client) client->Stop();
         renderer.Reset();
@@ -119,7 +139,7 @@ struct AudioOutput {
         HRESULT hr = enumerator(devices);
         if (FAILED(hr)) return hr;
         ComPtr<IMMDevice> device;
-        hr = id.empty() ? devices->GetDefaultAudioEndpoint(eRender, eConsole, &device) : chooseDevice(devices.Get(), id, device);
+        hr = chooseDevice(devices.Get(), id, device);
         if (FAILED(hr)) return hr;
         if (FAILED(hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client))) return hr;
         if (FAILED(hr = client->GetMixFormat(&format))) return hr;
@@ -161,7 +181,8 @@ struct AudioOutput {
         if (FAILED(hr = client->GetBufferSize(&capacity))) return hr;
         if (FAILED(hr = client->GetService(IID_PPV_ARGS(&renderer)))) return hr;
         if (FAILED(hr = client->GetService(IID_PPV_ARGS(&clock)))) return hr;
-        if (SUCCEEDED(client->GetService(IID_PPV_ARGS(&sessionVolume)))) { sessionVolume->SetMasterVolume(gain.load(), nullptr); }
+        if (FAILED(hr = client->GetService(IID_PPV_ARGS(&sessionVolume)))) return hr;
+        if (FAILED(hr = synchronizeVolume(true))) return hr;
         if (FAILED(hr = clock->GetFrequency(&frequency))) return hr;
         client->GetStreamLatency(&latency);
         stereo.resize(static_cast<size_t>(capacity) * 2);
@@ -261,10 +282,7 @@ struct AudioOutput {
         BYTE* target = nullptr;
         if (FAILED(hr = renderer->GetBuffer(frames, &target))) return hr;
         receiver.render(stereo.data(), static_cast<int>(frames), static_cast<int>(format->nSamplesPerSec), firstFrameUs, real);
-        if (sessionVolume) {
-            if (gainDirty.exchange(false)) { sessionVolume->SetMasterVolume(gain.load(), nullptr); sessionVolume->SetMute(FALSE, nullptr); }
-            else { float value; BOOL muted; if (SUCCEEDED(sessionVolume->GetMasterVolume(&value)) && SUCCEEDED(sessionVolume->GetMute(&muted))) gain = muted ? 0.0f : value; }
-        }
+        if (FAILED(hr = synchronizeVolume())) { renderer->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT); return hr; }
         encode(target, frames);
         hr = renderer->ReleaseBuffer(frames, 0);
         if (SUCCEEDED(hr)) written += frames;
@@ -293,12 +311,12 @@ public:
     }
     HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
         std::lock_guard<std::mutex> lock(settingsMutex);
-        if (selectedOutput.empty() && flow == eRender && role == eConsole) rebuild = true;
+        if (flow == eRender && role == eConsole && usingDefaultOutput) rebuild = true;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR id) override { std::lock_guard<std::mutex> lock(settingsMutex); if (selectedOutput == id) rebuild = true; return S_OK; }
     HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override { std::lock_guard<std::mutex> lock(settingsMutex); if (endpointId == id) rebuild = true; return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD) override { std::lock_guard<std::mutex> lock(settingsMutex); if (endpointId == id) rebuild = true; return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD) override { std::lock_guard<std::mutex> lock(settingsMutex); if (endpointId == id || selectedOutput == id) rebuild = true; return S_OK; }
     HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
 };
 void renderLoop() {
@@ -346,19 +364,24 @@ std::string stats() {
     std::lock_guard<std::mutex> lock(settingsMutex);
     return data + ",\"outputDevice\":" + jsonString(running.load() ? actualDevice : "") + "}";
 }
-std::vector<std::string> devices() {
+std::vector<OutputDevice> devices() {
     HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    std::vector<std::string> values;
+    std::vector<OutputDevice> values;
     ComPtr<IMMDeviceEnumerator> list; ComPtr<IMMDeviceCollection> collection;
     if (SUCCEEDED(enumerator(list)) && SUCCEEDED(list->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection))) {
         UINT count = 0; collection->GetCount(&count);
-        for (UINT i = 0; i < count; ++i) { ComPtr<IMMDevice> current; if (SUCCEEDED(collection->Item(i, &current))) values.push_back(utf8(deviceName(current.Get()))); }
+        for (UINT i = 0; i < count; ++i) {
+            ComPtr<IMMDevice> current;
+            if (FAILED(collection->Item(i, &current))) continue;
+            LPWSTR id = nullptr;
+            if (SUCCEEDED(current->GetId(&id))) { values.push_back({utf8(id), utf8(deviceName(current.Get()))}); CoTaskMemFree(id); }
+        }
     }
     collection.Reset(); list.Reset(); if (SUCCEEDED(initialized)) CoUninitialize(); return values;
 }
-void device(const std::string& name) {
-    std::lock_guard<std::mutex> lock(settingsMutex); selectedOutput = wide(name); rebuild = true;
+void device(const std::string& id) {
+    std::lock_guard<std::mutex> lock(settingsMutex); selectedOutput = wide(id); rebuild = true;
 }
-void volume(double value) { gain = static_cast<float>(std::clamp(value, 0.0, 1.0)); gainDirty = true; }
-double volume() { return gain.load(); }
+void volume(double value) { std::lock_guard<std::mutex> lock(volumeMutex); desiredGain = static_cast<float>(std::clamp(value, 0.0, 1.0)); volumePending = true; }
+double volume() { std::lock_guard<std::mutex> lock(volumeMutex); return volumePending ? desiredGain : actualGain; }
 }

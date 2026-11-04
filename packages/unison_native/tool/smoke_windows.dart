@@ -19,9 +19,11 @@ Future<void> main(List<String> args) async {
     if (UnisonNative.monotonicUs <= before) throw StateError('Clock did not advance');
     final id = await UnisonNative.receiverId();
     final devices = await UnisonNative.outputDevices();
-    data['receiverId'] = id; data['devices'] = devices;
-    final selected = devices.where((s) => s.contains('Steam Streaming Speakers')).firstOrNull;
-    await UnisonNative.setOutputDevice(selected);
+    data['receiverId'] = id; data['devices'] = devices.map((d) => {'id': d.id, 'name': d.name}).toList();
+    if (devices.map((d) => d.id).toSet().length != devices.length) throw StateError('Duplicate endpoint ID');
+    final selected = devices.where((d) => d.name.contains('Steam Streaming Speakers')).firstOrNull;
+    await UnisonNative.setOutputDevice(selected?.id);
+    await UnisonNative.setKeepAlive(true);
     status = UnisonNative.receiverStats.listen(stats.add);
     volume = UnisonNative.volumeChanges.listen(volumes.add);
     await UnisonNative.setVolume(0);
@@ -29,9 +31,18 @@ Future<void> main(List<String> args) async {
     await UnisonNative.startReceiver(sourceHost: args.isEmpty ? '127.0.0.1' : args.first);
     await Future<void>.delayed(const Duration(seconds: 3));
     if (!stats.any((s) => s.running)) throw StateError('Missing running statistics');
+    final hadOutput = stats.any((s) => s.outputDevice.isNotEmpty);
+    await UnisonNative.setOutputDevice('unison-native-missing-endpoint');
+    await Future<void>.delayed(const Duration(seconds: 1));
+    if (hadOutput && stats.last.outputDevice.isEmpty) throw StateError('Missing endpoint did not fall back');
+    data['fallbackDevice'] = stats.last.outputDevice;
+    await UnisonNative.setOutputDevice(selected?.id);
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    if (selected != null && stats.last.outputDevice != selected.name) throw StateError('Endpoint ID selection failed');
     await UnisonNative.stopReceiver();
     await UnisonNative.startReceiver(sourceHost: args.isEmpty ? '127.0.0.1' : args.first);
     if (await UnisonNative.receiverId() != id) throw StateError('receiverId changed after restart');
+    for (var i = 0; i < 200; ++i) { await UnisonNative.setVolume(i.isEven ? 0.1 : 0.3); }
     await UnisonNative.setVolume(0.25);
     await Future<void>.delayed(const Duration(milliseconds: 500));
     if ((await UnisonNative.volume() - 0.25).abs() > 0.01 || !volumes.any((v) => (v - 0.25).abs() < 0.01)) {

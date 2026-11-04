@@ -117,6 +117,7 @@ struct Receiver::State {
         uint64_t lost, late, relocations, xruns;
         uint64_t latePacketsPerSecond;
         double lateAvgMs, lateMaxMs;
+        size_t queuedPackets;
     };
 
     std::mutex mutex;
@@ -145,6 +146,7 @@ struct Receiver::State {
     double minRtt = 0;
     double userOffsetUs = 0;
     double readTime = 0;
+    int64_t lastRenderAtUs = 0;
     bool reading = false;
     bool haveAudio = false;
     int64_t firstAudioTime = 0;
@@ -177,6 +179,7 @@ struct Receiver::State {
             packets.swap(retired);
             clockReady = false;
             reading = haveAudio = false;
+            lastRenderAtUs = 0;
             clockOffset = minRtt = errorUs = integral = correction = bufferMs = 0;
             accounted = false;
             haveSequence = false;
@@ -194,10 +197,27 @@ struct Receiver::State {
         PacketMap retired;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!reading) return;
             // 锁内只摘取节点，锁外释放；回调只读包，不负责回收。
-            while (packets.size() > 1 && std::next(packets.begin())->first.first < readTime - kFrameUs)
-                retired.insert(packets.extract(packets.begin()));
+            const int64_t now = monotonicUs();
+            if (lastRenderAtUs && now - lastRenderAtUs < 100'000) {
+                if (!reading) return;
+                while (packets.size() > 1 && std::next(packets.begin())->first.first < readTime - kFrameUs)
+                    retired.insert(packets.extract(packets.begin()));
+            } else if (clockReady) {
+                const double due = now + clockOffset - userOffsetUs;
+                // 没有输出回调时仍按本机时钟回收，队列只覆盖尚未到期的目标延迟。
+                while (!packets.empty() && packets.begin()->first.first + kPacketUs <= due)
+                    retired.insert(packets.extract(packets.begin()));
+                reading = false; accounted = false; realTimestamp = false;
+                errorUs = integral = correction = 0;
+                haveAudio = !packets.empty();
+                if (haveAudio) {
+                    firstAudioTime = packets.begin()->first.first;
+                    lossBaseTime = static_cast<double>(firstAudioTime);
+                    lossBaseSeq = packets.begin()->second.seq;
+                }
+                bufferMs = packets.empty() ? 0 : std::max(0.0, (packets.rbegin()->first.first + kPacketUs - due) / 1000.0);
+            }
         }
     }
 
@@ -205,7 +225,7 @@ struct Receiver::State {
         std::lock_guard<std::mutex> lock(mutex);
         return {running.load(), selected, clockReady, realTimestamp, source.sin_addr,
                 clockOffset, minRtt, bufferMs, errorUs, correction, userOffsetUs,
-                lost, late, relocations, xruns.load(), latePacketsPerSecond, lateAvgMs, lateMaxMs};
+                lost, late, relocations, xruns.load(), latePacketsPerSecond, lateAvgMs, lateMaxMs, packets.size()};
     }
 
     void publishLateStatistics(int64_t now) {
@@ -275,6 +295,11 @@ struct Receiver::State {
             uint32_t seq = static_cast<uint32_t>(readLe(p, 4));
             int64_t playTime = static_cast<int64_t>(readLe(p + 4, 8));
             lastSeen = now;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                // 未同步时无法判断播放期限，也尚不能输出；不积压无法排期的音频。
+                if (!clockReady) return;
+            }
             auto key = std::make_pair(playTime, seq);
             Packet packet{};
             packet.seq = seq;
@@ -516,6 +541,7 @@ void Receiver::resetOutputTiming() {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (s.reading) ++s.relocations;
     s.reading = false;
+    s.lastRenderAtUs = 0;
     s.errorUs = s.integral = s.correction = 0;
 }
 
@@ -525,6 +551,7 @@ void Receiver::render(float* stereo, int frames, int deviceRate, int64_t firstFr
     auto& s = *state_;
     std::fill(stereo, stereo + frames * 2, 0.0f);
     std::lock_guard<std::mutex> lock(s.mutex);
+    s.lastRenderAtUs = monotonicUs();
     s.realTimestamp = realTimestamp;
     if (!s.running.load() || !s.clockReady || !s.haveAudio) return;
     double desired = firstFrameUs + s.clockOffset - s.userOffsetUs;
@@ -565,6 +592,7 @@ std::string Receiver::statsJson() {
         << ",\"clockOffsetUs\":" << s.clockOffset
         << ",\"rttUs\":" << s.minRtt
         << ",\"bufferUs\":" << s.bufferMs * 1000
+        << ",\"queuedPackets\":" << s.queuedPackets
         << ",\"lostPackets\":" << s.lost << ",\"latePackets\":" << s.late
         << ",\"latePacketsPerSecond\":" << s.latePacketsPerSecond
         << ",\"lateAvgMs\":" << s.lateAvgMs << ",\"lateMaxMs\":" << s.lateMaxMs

@@ -45,6 +45,13 @@ class ReceiverStats {
   final String outputDevice;
 }
 
+/// Windows 播放设备；保存 id，name 仅用于显示。
+class OutputDevice {
+  const OutputDevice({required this.id, required this.name});
+  final String id;
+  final String name;
+}
+
 /// 音源端正在采集的一个播放会话。
 class CapturedSession {
   const CapturedSession({required this.uid, required this.packageName, required this.sessionId});
@@ -165,6 +172,7 @@ abstract final class UnisonNative {
   }
   static final Map<String, dynamic> _latest = {};
   static int _streamListeners = 0;
+  static const _transientEvents = {'calibration', 'exit'};
   static Stream<dynamic> _stream(String type) {
     if (!Platform.isAndroid && (type == 'source' || type == 'media' || type == 'calibration')) {
       throw UnsupportedError('Requires rooted Android');
@@ -175,10 +183,10 @@ abstract final class UnisonNative {
         final tag = event['type'] as String;
         final raw = event['data'];
         final data = raw is String ? jsonDecode(raw) : raw;
-        if (tag != 'calibration') _latest[tag] = data;
+        if (!_transientEvents.contains(tag)) _latest[tag] = data;
         if (tag == type) controller.add(data);
       }, onError: controller.addError);
-      if (type != 'calibration' && _latest.containsKey(type)) controller.add(_latest[type]);
+      if (!_transientEvents.contains(type) && _latest.containsKey(type)) controller.add(_latest[type]);
       controller.onCancel = () {
         if (--_streamListeners == 0) _latest.clear();
         subscription.cancel();
@@ -186,6 +194,14 @@ abstract final class UnisonNative {
     }, isBroadcast: true);
   }
   static Future<int> receiverId() => _call<int>('receiverId');
+
+  /// Android 控制端在前台调用并等待完成，之后可在后台启停接收；断线重连时保持开启。
+  /// Windows 无需常驻服务，此调用不执行操作。
+  static Future<void> setKeepAlive(bool on) => _call<void>('setKeepAlive', on);
+
+  /// Android 通知上的“退出”；不重放。原生停止音频与常驻，调用方同步接收开关并关闭控制连接。
+  static Stream<void> get exitRequests => _stream('exit').map<void>((_) {});
+
   static Future<void> startReceiver({required String sourceHost}) => _call<void>('startReceiver', {'sourceHost': sourceHost});
   static Future<void> stopReceiver() => _call<void>('stopReceiver');
   static Future<void> setReceiverOffsetUs(int offsetUs) => _call<void>('setReceiverOffsetUs', offsetUs);
@@ -196,8 +212,10 @@ abstract final class UnisonNative {
     latePackets: (e['latePackets'] as num?)?.toInt() ?? 0, xruns: (e['xruns'] as num?)?.toInt() ?? 0,
     speedPpm: (e['speedPpm'] as num?)?.toDouble() ?? 0, realTimestamp: e['realTimestamp'] == true,
     outputDevice: e['outputDevice'] as String? ?? ''));
-  static Future<List<String>> outputDevices() async => (await _call<List<Object?>>('outputDevices')).cast<String>();
-  static Future<void> setOutputDevice(String? name) => _call<void>('setOutputDevice', name);
+  static Future<List<OutputDevice>> outputDevices() async => (await _call<List<Object?>>('outputDevices'))
+      .map((e) { final value = e as Map; return OutputDevice(id: value['id'] as String, name: value['name'] as String); }).toList();
+  /// null 跟随系统默认；指定设备离线时临时使用默认设备，重连后自动切回。
+  static Future<void> setOutputDevice(String? id) => _call<void>('setOutputDevice', id);
   static Future<double> volume() async => (await _call<num>('volume')).toDouble();
   static Future<void> setVolume(double volume) => _call<void>('setVolume', volume);
   static Stream<double> get volumeChanges => _stream('volume').map((dynamic e) => (e as num).toDouble());
