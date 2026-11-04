@@ -51,9 +51,10 @@ internal class RootMedia(context: Context) {
         return value
     }
     fun command(command: String) {
+        snapshot()
         val controls = checkNotNull(controller) { "No media session" }.transportControls
         when (command) { "play" -> controls.play(); "pause" -> controls.pause(); "next" -> controls.skipToNext(); "previous" -> controls.skipToPrevious(); else -> error("Unknown media command") }
     }
-    fun seek(us: Long) { require(us >= 0); checkNotNull(controller) { "No media session" }.transportControls.seekTo(us / 1000) }
+    fun seek(us: Long) { snapshot(); require(us >= 0); checkNotNull(controller) { "No media session" }.transportControls.seekTo(us / 1000) }
     fun close() { closed = true; handler.removeCallbacksAndMessages(null); thread.quitSafely() }
 }

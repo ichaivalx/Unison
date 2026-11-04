@@ -37,6 +37,9 @@ Future<void> main(List<String> args) async {
     if ((await UnisonNative.volume() - 0.25).abs() > 0.01 || !volumes.any((v) => (v - 0.25).abs() < 0.01)) {
       throw StateError('Volume getter/events mismatch');
     }
+    final replayed = await UnisonNative.volumeChanges.first.timeout(const Duration(seconds: 1));
+    if ((replayed - 0.25).abs() > 0.01) throw StateError('New subscriber did not receive current volume');
+    data['replayedVolume'] = replayed;
     await UnisonNative.setVolume(0);
     await UnisonNative.stopReceiver();
     await UnisonNative.setOutputDevice(null);

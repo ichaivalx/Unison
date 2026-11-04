@@ -151,6 +151,8 @@ struct Receiver::State {
     double lossBaseTime = 0;
     uint32_t lossBaseSeq = 0, accountedSeq = 0;
     bool accounted = false;
+    bool haveSequence = false;
+    uint32_t highestSequence = 0;
     double errorUs = 0;
     double integral = 0;
     double correction = 0;
@@ -177,6 +179,7 @@ struct Receiver::State {
             reading = haveAudio = false;
             clockOffset = minRtt = errorUs = integral = correction = bufferMs = 0;
             accounted = false;
+            haveSequence = false;
             latePacketsPerSecond = 0;
             lateAvgMs = lateMaxMs = 0;
         }
@@ -285,6 +288,7 @@ struct Receiver::State {
             auto node = prepared.extract(prepared.begin());
             {
                 std::lock_guard<std::mutex> lock(mutex);
+                if (!haveSequence || static_cast<int32_t>(seq - highestSequence) > 0) { highestSequence = seq; haveSequence = true; }
                 if (reading && playTime + kPacketUs <= readTime) {
                     ++late;
                     // 收包减去本机应播时刻；仅错过输出队列写入期限时可能为负。
@@ -424,6 +428,9 @@ struct Receiver::State {
             int64_t slot = static_cast<int64_t>(std::floor((time - lossBaseTime) / kPacketUs));
             if (slot >= 1) {
                 uint32_t missingSeq = lossBaseSeq + static_cast<uint32_t>(slot);
+                // 只统计后续包证实的序号缺口；音源静默时不无限虚构丢包。
+                if (!haveSequence) return;
+                if (static_cast<int32_t>(missingSeq - (highestSequence - 1)) > 0) missingSeq = highestSequence - 1;
                 if (!accounted) { accounted = true; accountedSeq = missingSeq - 1; }
                 int32_t gap = static_cast<int32_t>(missingSeq - accountedSeq);
                 if (gap > 0) {

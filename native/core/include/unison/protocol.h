@@ -1,4 +1,4 @@
-// Unison 网络协议（原型）。音源端（Android root 进程，Kotlin）与接收端（C++）共同遵守。
+// Unison 网络协议。音源端（Android root 进程，Kotlin）与接收端（C++）共同遵守。
 //
 // 全部为 UDP，小端序。每个报文以 8 字节报头开始：
 //   u32 magic = 0x4E534E55（字节序列 'U' 'N' 'S' 'N'）
@@ -24,7 +24,7 @@
 //   AUDIO     音源 → 各订阅者
 //             u32 seq（每包加 1）, i64 playTimeUs（该包第 0 帧应当发声的音源时刻）,
 //             u32 sampleRate, u8 channels, u8 sampleFormat（1 = s16 交错）, u16 frames, 然后 PCM
-//             原型固定 48000 Hz、2 声道、s16、每包 240 帧（5 ms，960 字节 PCM）
+//             音频固定 48000 Hz、2 声道、s16、每包 240 帧（5 ms，960 字节 PCM）
 //   BYE       任一方 → 对方，无负载：接收端退订 / 音源停止
 //   SET_LATENCY 仅接受来自 127.0.0.1：本机 App → 音源进程
 //             i32 latencyUs（目标延迟，playTimeUs = 采集时刻 + latencyUs）
