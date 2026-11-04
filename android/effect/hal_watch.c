@@ -1,6 +1,5 @@
 // init.svc serial 记录两次采样之间的短暂 running/restarting，不能只依赖 pidof。
 #include <android/binder_ibinder.h>
-#include <android/binder_manager.h>
 #include <sys/system_properties.h>
 #include <dirent.h>
 #include <errno.h>
@@ -10,6 +9,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+// 平台 binder_manager.h 含仅 C++ 有效的声明；本 C helper 只需这个既有 C ABI 入口。
+extern AIBinder* AServiceManager_checkService(const char* instance);
 
 struct snapshot { uint32_t serial; char value[PROP_VALUE_MAX]; };
 static void property_callback(void* cookie, const char* name, const char* value, uint32_t serial) {
