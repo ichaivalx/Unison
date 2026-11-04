@@ -110,7 +110,7 @@ class _MediaCardState extends State<MediaCard> {
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                media.packageName,
+                media.appName,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: texts.labelMedium?.copyWith(color: colors.onSurfaceVariant, letterSpacing: 0.3),

@@ -221,6 +221,7 @@ class SourceView {
 class MediaView {
   const MediaView({
     required this.packageName,
+    required this.appName,
     required this.title,
     required this.artist,
     required this.durationUs,
@@ -233,6 +234,7 @@ class MediaView {
 
   factory MediaView.of(MediaState s) => MediaView(
     packageName: s.packageName,
+    appName: s.appName,
     title: s.title,
     artist: s.artist,
     durationUs: s.durationUs,
@@ -244,6 +246,9 @@ class MediaView {
   );
 
   final String packageName;
+
+  /// 来源应用的显示名称
+  final String appName;
   final String? title;
   final String? artist;
   final int? durationUs;
@@ -255,6 +260,7 @@ class MediaView {
 
   Map<String, Object?> toJson() => {
     'packageName': packageName,
+    'appName': appName,
     'title': title,
     'artist': artist,
     'durationUs': durationUs,
@@ -267,6 +273,7 @@ class MediaView {
 
   static MediaView fromJson(Map json) => MediaView(
     packageName: json['packageName'] as String? ?? '',
+    appName: json['appName'] as String? ?? '',
     title: json['title'] as String?,
     artist: json['artist'] as String?,
     durationUs: (json['durationUs'] as num?)?.toInt(),
