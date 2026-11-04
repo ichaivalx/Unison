@@ -17,6 +17,11 @@
 #include "fmq.h"
 #include "tap_packet.h"
 
+#if !defined(HAS_BINDER_SHELL_COMMAND) || !defined(__ANDROID_VENDOR__) || !defined(BINDER_STABILITY_SUPPORT)
+#error "Unison Tap requires complete platform vendor Binder headers and conditions"
+#endif
+static_assert(std::is_same_v<std::string, std::__1::string>, "platform libc++ ABI required");
+
 using namespace aidl::android::hardware::audio::effect;
 using aidl::android::media::audio::common::AudioUuid;
 using aidl::android::media::audio::common::AudioChannelLayout;
