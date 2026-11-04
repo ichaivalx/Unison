@@ -19,6 +19,7 @@ object SourceController {
     @Volatile private var ready = false
     @Volatile private var rootPid = 0
     @Volatile private var output: ((String) -> Unit)? = null
+    @Volatile private var localDelayMs = 0
     private val commands = Executors.newSingleThreadExecutor { task ->
         Thread(task, "source-commands").apply { isDaemon = true }
     }
@@ -43,7 +44,7 @@ object SourceController {
             "${quote("-Dunison.capture.library=$library")} /system/bin " +
             "io.github.ichaivalx.unison.capture.CaptureMain " +
             "--exclude-uid ${context.applicationInfo.uid} --latency-us $latencyUs " +
-            "--name ${quote(Build.MODEL)} --mode intercept"
+            "--name ${quote(Build.MODEL)} --mode effect --local-delay-ms $localDelayMs"
         val child = try {
             ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
         } catch (error: Exception) {
@@ -133,6 +134,20 @@ object SourceController {
     }
 
     val isRunning: Boolean get() = ready && process?.isAlive == true
+
+    /** 本机效果直通的延迟，不改变网络目标延迟。 */
+    fun setLocalDelay(ms: Int) {
+        require(ms >= 0) { "本机延迟不能为负数" }
+        localDelayMs = ms
+        val current = process ?: return
+        commands.execute {
+            if (process !== current || !isRunning) return@execute
+            runCatching {
+                current.outputStream.write("LOCAL_DELAY $ms\n".toByteArray(Charsets.UTF_8))
+                current.outputStream.flush()
+            }.onFailure { if (isRunning) output?.invoke("ERROR local_delay: ${it.message}") }
+        }
+    }
 
     private fun signalRoot(pid: Int, signal: String) {
         runCatching {

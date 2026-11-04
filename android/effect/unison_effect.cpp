@@ -29,7 +29,7 @@ constexpr int kDelayParameter = 1;
 int64_t nowNs() { timespec t{}; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000LL + t.tv_nsec; }
 AudioUuid typeUuid() { return {static_cast<int32_t>(0x8e2581c2), 0x3d9a, 0x4e15, static_cast<int16_t>(0xa77a), {0x61,0x7f,0x6f,0x9e,0x82,0x01}}; }
 AudioUuid implUuid() { auto u = typeUuid(); u.node.back() = 2; return u; }
-Descriptor descriptor() {
+Descriptor buildDescriptor() {
     Descriptor d;
     d.common.id.type = typeUuid();
     d.common.id.uuid = implUuid();
@@ -44,9 +44,10 @@ ScopedAStatus error(const char* message) {
     return ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT, message);
 }
 struct DelayLine {
-    explicit DelayLine(size_t samples) : data(samples, 0.0f) {}
+    DelayLine(size_t samples, int32_t delay) : data(samples, 0.0f), milliseconds(delay) {}
     std::vector<float> data;
     size_t position = 0;
+    int32_t milliseconds = 0;
     DelayLine* next = nullptr;
 };
 }
@@ -85,7 +86,7 @@ public:
         return ScopedAStatus::ok();
     }
     ScopedAStatus getDescriptor(Descriptor* result) override {
-        try { *result = descriptor(); return ScopedAStatus::ok(); }
+        try { *result = buildDescriptor(); return ScopedAStatus::ok(); }
         catch (...) { return error("descriptor allocation"); }
     }
     ScopedAStatus getState(State* result) override { *result = state_.load(); return ScopedAStatus::ok(); }
@@ -172,7 +173,7 @@ private:
         const uint64_t frames = uint64_t(common_.input.base.sampleRate) * uint64_t(ms) / 1000;
         if (frames > SIZE_MAX / (2 * sizeof(float))) throw std::invalid_argument("delay size overflow");
         // 分配和回收只在 Binder 控制线程进行，process 只交换指针。
-        auto next = std::make_unique<DelayLine>(static_cast<size_t>(frames) * 2);
+        auto next = std::make_unique<DelayLine>(static_cast<size_t>(frames) * 2, ms);
         delete pending_.exchange(next.release());
         delayMs_ = ms;
         collectRetired();
@@ -238,7 +239,7 @@ private:
             }
             const auto frames = static_cast<uint32_t>(n / 2);
             UnisonTapHeader header{UNISON_TAP_MAGIC, static_cast<uint32_t>(common_.input.base.sampleRate), frames,
-                common_.ioHandle, streamId_, frames_, callNs, droppedFrames_, droppedBatches_, delayMs_.load(), 0};
+                common_.ioHandle, streamId_, frames_, callNs, droppedFrames_, droppedBatches_, activeDelay_ ? activeDelay_->milliseconds : 0, 0};
             iovec vectors[] = {{&header, sizeof(header)}, {work_.data(), n * sizeof(float)}};
             msghdr message{};
             message.msg_name = &destination; message.msg_namelen = addressSize;
@@ -277,7 +278,7 @@ private:
 
 extern "C" __attribute__((visibility("default"))) binder_exception_t queryEffect(const AudioUuid* uuid, Descriptor* result) {
     if (!uuid || !result) return EX_ILLEGAL_ARGUMENT;
-    try { if (*uuid != implUuid()) return EX_ILLEGAL_ARGUMENT; *result = descriptor(); return EX_NONE; }
+    try { if (*uuid != implUuid()) return EX_ILLEGAL_ARGUMENT; *result = buildDescriptor(); return EX_NONE; }
     catch (...) { return EX_ILLEGAL_STATE; }
 }
 extern "C" __attribute__((visibility("default"))) binder_exception_t createEffect(const AudioUuid* uuid, std::shared_ptr<IEffect>* result) {

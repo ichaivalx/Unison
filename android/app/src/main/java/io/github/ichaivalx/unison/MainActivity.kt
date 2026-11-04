@@ -22,6 +22,7 @@ class MainActivity : Activity() {
     private lateinit var stats: TextView
     private lateinit var offset: TextView
     private lateinit var latency: TextView
+    private lateinit var localDelay: TextView
     private lateinit var logs: TextView
     private lateinit var state: TextView
     private lateinit var sourceState: TextView
@@ -30,9 +31,10 @@ class MainActivity : Activity() {
     private val refresh = object : Runnable {
         override fun run() {
             state.text = "接收端：${if (PlaybackService.receiverRunning) "运行中" else "停止"}"
-            sourceState.text = "音源：${if (SourceController.isRunning) "运行中" else "停止"}"
+            sourceState.text = "音源（effect）：${if (SourceController.isRunning) "运行中" else "停止"}"
             offset.text = "本机偏移：${PlaybackService.offsetMs.toInt()} ms（正值更晚发声）"
             latency.text = "目标延迟：${PlaybackService.latencyMs} ms"
+            localDelay.text = "本机延迟：${PlaybackService.localDelayMs} ms（音效直通，无需本机接收）"
             logs.text = PlaybackService.sourceLog().ifEmpty { "音源进程输出（最近 20 行）" }
             message.text = if (PlaybackService.busy) "正在处理…" else PlaybackService.message
             val value = JSONObject(ReceiverEngine.statsJson())
@@ -106,6 +108,12 @@ class MainActivity : Activity() {
         }
         row("−50 ms" to { adjustLatency(-50) }, "−5 ms" to { adjustLatency(-5) },
             "+5 ms" to { adjustLatency(5) }, "+50 ms" to { adjustLatency(50) })
+        localDelay = label("")
+        fun adjustLocalDelay(ms: Int) {
+            PlaybackService.localDelayMs = (PlaybackService.localDelayMs + ms).coerceAtLeast(0)
+            if (SourceController.isRunning) command(PlaybackService.LOCAL_DELAY)
+        }
+        row("−5 ms" to { adjustLocalDelay(-5) }, "+5 ms" to { adjustLocalDelay(5) })
         logs = label("", 12f).apply { typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
         setContentView(scroll)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)

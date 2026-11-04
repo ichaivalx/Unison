@@ -7,6 +7,7 @@ android {
         minSdk = 33
         ndk { abiFilters += "arm64-v8a" }
         consumerProguardFiles("consumer-rules.pro")
+        externalNativeBuild { cmake { arguments += "-DANDROID_STL=c++_static" } }
     }
     externalNativeBuild {
         cmake {

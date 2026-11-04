@@ -167,39 +167,41 @@ internal class PlaybackCapture {
         return unregistered
     }
 
-    private fun systemContext(): Context {
-        if (Looper.myLooper() == null) Looper.prepareMainLooper()
-        val activityThreadClass = Class.forName("android.app.ActivityThread")
-        val constructor = activityThreadClass.getDeclaredConstructor().apply { isAccessible = true }
-        val activityThread = constructor.newInstance()
-        activityThreadClass.getDeclaredField("sCurrentActivityThread").apply { isAccessible = true }
-            .set(null, activityThread)
-        activityThreadClass.getDeclaredField("mSystemThread").apply { isAccessible = true }
-            .setBoolean(activityThread, true)
-        // Samsung 的系统 Context 会访问 ConfigurationController，必须先初始化。
-        val configurationClass = Class.forName("android.app.ConfigurationController")
-        val configuration = configurationClass.getDeclaredConstructor(Class.forName("android.app.ActivityThreadInternal"))
-            .apply { isAccessible = true }.newInstance(activityThread)
-        activityThreadClass.getDeclaredField("mConfigurationController").apply { isAccessible = true }
-            .set(activityThread, configuration)
-        val bindClass = Class.forName("android.app.ActivityThread\$AppBindData")
-        val bind = bindClass.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
-        val info = ApplicationInfo().apply { packageName = "com.android.shell" }
-        bindClass.getDeclaredField("appInfo").apply { isAccessible = true }.set(bind, info)
-        activityThreadClass.getDeclaredField("mBoundApplication").apply { isAccessible = true }.set(activityThread, bind)
-        val base = activityThreadClass.getDeclaredMethod("getSystemContext").apply { isAccessible = true }
-            .invoke(activityThread) as Context
-        val context = object : ContextWrapper(base) {
-            override fun getPackageName() = "com.android.shell"
-            override fun getOpPackageName() = packageName
-            override fun getAttributionSource(): AttributionSource = AttributionSource.Builder(2000)
-                .setPackageName(packageName).build()
-            override fun getDeviceId() = 0
-            override fun getApplicationContext(): Context = this
+    companion object {
+        fun systemContext(): Context {
+            if (Looper.myLooper() == null) Looper.prepareMainLooper()
+            val activityThreadClass = Class.forName("android.app.ActivityThread")
+            val constructor = activityThreadClass.getDeclaredConstructor().apply { isAccessible = true }
+            val activityThread = constructor.newInstance()
+            activityThreadClass.getDeclaredField("sCurrentActivityThread").apply { isAccessible = true }
+                .set(null, activityThread)
+            activityThreadClass.getDeclaredField("mSystemThread").apply { isAccessible = true }
+                .setBoolean(activityThread, true)
+            // Samsung 的系统 Context 会访问 ConfigurationController，必须先初始化。
+            val configurationClass = Class.forName("android.app.ConfigurationController")
+            val configuration = configurationClass.getDeclaredConstructor(Class.forName("android.app.ActivityThreadInternal"))
+                .apply { isAccessible = true }.newInstance(activityThread)
+            activityThreadClass.getDeclaredField("mConfigurationController").apply { isAccessible = true }
+                .set(activityThread, configuration)
+            val bindClass = Class.forName("android.app.ActivityThread\$AppBindData")
+            val bind = bindClass.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+            val info = ApplicationInfo().apply { packageName = "com.android.shell" }
+            bindClass.getDeclaredField("appInfo").apply { isAccessible = true }.set(bind, info)
+            activityThreadClass.getDeclaredField("mBoundApplication").apply { isAccessible = true }.set(activityThread, bind)
+            val base = activityThreadClass.getDeclaredMethod("getSystemContext").apply { isAccessible = true }
+                .invoke(activityThread) as Context
+            val context = object : ContextWrapper(base) {
+                override fun getPackageName() = "com.android.shell"
+                override fun getOpPackageName() = packageName
+                override fun getAttributionSource(): AttributionSource = AttributionSource.Builder(2000)
+                    .setPackageName(packageName).build()
+                override fun getDeviceId() = 0
+                override fun getApplicationContext(): Context = this
+            }
+            val application = Instrumentation.newApplication(Application::class.java, context)
+            activityThreadClass.getDeclaredField("mInitialApplication").apply { isAccessible = true }
+                .set(activityThread, application)
+            return context
         }
-        val application = Instrumentation.newApplication(Application::class.java, context)
-        activityThreadClass.getDeclaredField("mInitialApplication").apply { isAccessible = true }
-            .set(activityThread, application)
-        return context
     }
 }

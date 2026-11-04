@@ -26,12 +26,14 @@ class PlaybackService : Service() {
         const val SOURCE_START = "source.start"
         const val SOURCE_STOP = "source.stop"
         const val LATENCY = "source.latency"
+        const val LOCAL_DELAY = "source.local_delay"
         const val STOP_ALL = "stop.all"
         @Volatile var receiverRunning = false
         @Volatile var busy = false
         @Volatile var active = false
         @Volatile var offsetMs = 0f
         @Volatile var latencyMs = 50
+        @Volatile var localDelayMs = 0
         @Volatile var message = ""
         @Volatile var wifiForce = "off"
         // 引擎和 WiFi 强制模式属于进程；服务快速重建时也要按顺序完成启停。
@@ -106,19 +108,26 @@ class PlaybackService : Service() {
                 try {
                     when (action) {
                         RECEIVE_START -> {
-                            ReceiverEngine.setLocalSourceRunning(SourceController.isRunning)
-                            ReceiverEngine.setOffsetMs(offsetMs)
-                            receiverRunning = ReceiverEngine.start()
-                            message = if (receiverRunning) "" else "接收端启动失败（网络端口或输出设备不可用）"
-                            if (receiverRunning) setWifiForce(true)
+                            if (SourceController.isRunning) {
+                                message = "effect 音源已在本机直通播放；请先停止音源再启动接收"
+                            } else {
+                                ReceiverEngine.setLocalSourceRunning(false)
+                                ReceiverEngine.setOffsetMs(offsetMs)
+                                receiverRunning = ReceiverEngine.start()
+                                message = if (receiverRunning) "" else "接收端启动失败（网络端口或输出设备不可用）"
+                                if (receiverRunning) setWifiForce(true)
+                            }
                         }
                         RECEIVE_STOP -> stopReceiver()
                         SOURCE_START -> {
+                            if (receiverRunning) stopReceiver()
+                            SourceController.setLocalDelay(localDelayMs)
                             val started = SourceController.start(applicationContext, latencyMs, ::log)
                             message = if (started) "" else "音源启动失败，请检查 root 授权与下方输出"
                         }
                         SOURCE_STOP -> SourceController.stop()
                         LATENCY -> SourceController.setLatency(latencyMs)
+                        LOCAL_DELAY -> SourceController.setLocalDelay(localDelayMs)
                         STOP_ALL -> {
                             try { SourceController.stop() } finally { stopReceiver() }
                         }

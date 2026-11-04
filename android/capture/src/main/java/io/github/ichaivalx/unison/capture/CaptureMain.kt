@@ -46,6 +46,19 @@ object CaptureMain {
     private var ageMaxNs = Long.MIN_VALUE
     private var diagnosticTimestampFrame: Long? = null
     private var diagnosticReadFrames = 0L
+    private var effectFrames = 0L
+    private var effectBatches = 0L
+    private var batchMin = Int.MAX_VALUE
+    private var batchMax = 0
+    private var intervalCount = 0L
+    private var intervalSumNs = 0L
+    private var intervalMinNs = Long.MAX_VALUE
+    private var intervalMaxNs = 0L
+    private var effectDroppedFrames = 0L
+    private var effectDroppedBatches = 0L
+    private var effectActualDelayMs = 0
+    private var effectIo = 0
+    @Volatile private var localDelayMs = 0
     @Volatile private var running = true
     @Volatile private var latencyUs = 50_000
     @Volatile private var timestampSource = "read-fallback"
@@ -54,6 +67,7 @@ object CaptureMain {
     private var closed = false
     private var channel: DatagramChannel? = null
     private var capture: PlaybackCapture? = null
+    private var effect: EffectSource? = null
 
     @JvmStatic private external fun installTerminationHandler(): Int
     @JvmStatic private external fun waitForTermination(): Int
@@ -64,7 +78,7 @@ object CaptureMain {
         try {
             var excludeUid: Int? = null
             var name = Build.MODEL
-            var mode = "intercept"
+            var mode = "effect"
             var index = 0
             while (index < args.size) {
                 val option = args[index++]
@@ -75,11 +89,13 @@ object CaptureMain {
                     "--latency-us" -> latencyUs = value.toInt()
                     "--name" -> name = value
                     "--mode" -> mode = value
+                    "--local-delay-ms" -> localDelayMs = value.toInt()
                     else -> error("Unknown option $option")
                 }
             }
             val appUid = requireNotNull(excludeUid) { "--exclude-uid is required" }
-            require(mode == "intercept" || mode == "dup") { "--mode must be intercept or dup" }
+            require(mode in arrayOf("effect", "intercept", "dup")) { "--mode must be effect, intercept or dup" }
+            require(localDelayMs >= 0) { "Local delay must be nonnegative" }
             check(Process.myUid() == 0) { "CaptureMain must be run as root (uid=${Process.myUid()})" }
             stage = "signal_handler"
             val apk = System.getProperty("java.class.path")!!.substringBefore(File.pathSeparator)
@@ -100,7 +116,20 @@ object CaptureMain {
             }
             // su 的 stdin 与 App 保持连接；App 消失或 stop() 关闭管道都会触发清理。
             thread(name = "source-stdin", isDaemon = true) {
-                runCatching { while (System.`in`.read() != -1) { /* 等待 EOF */ } }
+                runCatching {
+                    System.`in`.bufferedReader().forEachLine { line ->
+                        if (line.startsWith("LOCAL_DELAY ")) {
+                            runCatching {
+                                val ms = line.substringAfter(' ').toInt()
+                                require(ms >= 0)
+                                synchronized(lifecycle) {
+                                    if (!closed) { effect?.setLocalDelay(ms); localDelayMs = ms }
+                                }
+                                println("INFO local_delay_ms=$ms")
+                            }.onFailure { reportError("local_delay=${describe(it)}") }
+                        }
+                    }
+                }
                 close("stdin_closed")
                 exitProcess(0)
             }
@@ -112,13 +141,20 @@ object CaptureMain {
                     socket().broadcast = true
                     bind(InetSocketAddress(SOURCE_PORT))
                 }
-                stage = "audio_policy"
-                val playback = PlaybackCapture()
-                capture = playback
-                playback.start(appUid, mode == "dup")
+                if (mode == "effect") {
+                    stage = "audio_effect"
+                    val source = EffectSource()
+                    effect = source
+                    source.start(localDelayMs)
+                } else {
+                    stage = "audio_policy"
+                    val playback = PlaybackCapture()
+                    capture = playback
+                    playback.start(appUid, mode == "dup")
+                }
             }
             val udp = checkNotNull(channel)
-            val record = checkNotNull(capture?.recorder)
+            val record = capture?.recorder
             val nameBytes = name.toByteArray(Charsets.UTF_8)
             require(nameBytes.size <= 65535) { "Device name does not fit protocol nameLen" }
             val beacon = message(1, 4 + nameBytes.size).apply {
@@ -147,7 +183,18 @@ object CaptureMain {
                             ageSumNs = 0
                             ageMinNs = Long.MAX_VALUE
                             ageMaxNs = Long.MIN_VALUE
-                            "capture_age_ms_min_avg_max=$ages buffer_frames=${record.bufferSizeInFrames} " +
+                            val effectStats = if (mode == "effect") {
+                                val batches = if (effectBatches == 0L) "n/a" else "$batchMin/${effectFrames / effectBatches}/$batchMax"
+                                val intervals = if (intervalCount == 0L) "n/a" else String.format(Locale.ROOT, "%.2f/%.2f/%.2f",
+                                    intervalMinNs / 1_000_000.0, intervalSumNs / intervalCount / 1_000_000.0, intervalMaxNs / 1_000_000.0)
+                                val text = "effect_frames/s=$effectFrames batch_frames_min_avg_max=$batches " +
+                                    "call_interval_ms_min_avg_max=$intervals effect_dropped_frames=$effectDroppedFrames " +
+                                    "effect_dropped_batches=$effectDroppedBatches local_delay_ms=$effectActualDelayMs io=$effectIo "
+                                effectFrames = 0; effectBatches = 0; batchMin = Int.MAX_VALUE; batchMax = 0
+                                intervalCount = 0; intervalSumNs = 0; intervalMinNs = Long.MAX_VALUE; intervalMaxNs = 0
+                                text
+                            } else ""
+                            effectStats + "capture_age_ms_min_avg_max=$ages buffer_frames=${record?.bufferSizeInFrames ?: 0} " +
                                 "ts_frame=${diagnosticTimestampFrame ?: "n/a"} read_frames=$diagnosticReadFrames " +
                                 "ts_ahead_frames=${frameLead ?: "n/a"}"
                         }
@@ -163,9 +210,9 @@ object CaptureMain {
                 }
             }
             println("READY pid=${Process.myPid()} mode=$mode rate=$SAMPLE_RATE channels=2 frames=$FRAMES " +
-                "latency_us=$latencyUs buffer_frames=${record.bufferSizeInFrames}")
-            stage = "audio_read"
-            captureAudio(record, udp)
+                "latency_us=$latencyUs local_delay_ms=$localDelayMs buffer_frames=${record?.bufferSizeInFrames ?: 0}")
+            stage = if (mode == "effect") "effect_read" else "audio_read"
+            if (mode == "effect") captureEffect(checkNotNull(effect), udp) else captureAudio(checkNotNull(record), udp)
         } catch (error: Throwable) {
             if (running) {
                 reportError("stage=$stage ${describe(error)}")
@@ -233,22 +280,99 @@ object CaptureMain {
             }
             data.putInt(8, sequence++)
             data.putLong(12, captureNs / 1000 + latencyUs)
-            var packetPeak = 0
-            for (offset in AUDIO_HEADER until bytes.size step 2) {
-                packetPeak = maxOf(packetPeak, abs(data.getShort(offset).toInt()))
-            }
-            peak.accumulateAndGet(packetPeak) { previous, current -> maxOf(previous, current) }
-            val now = System.nanoTime()
-            for ((subscriber, subscribedNs) in subscribers.entries) {
-                if (now - subscribedNs >= SUBSCRIBE_TIMEOUT_NS) {
-                    subscribers.remove(subscriber, subscribedNs)
-                    continue
-                }
-                if (send(udp, data, subscriber, "audio_send")) sendCount.incrementAndGet()
-            }
-            packetCount.incrementAndGet()
+            publishAudio(udp, data)
             firstFrame += FRAMES
         }
+    }
+
+    private fun captureEffect(source: EffectSource, udp: DatagramChannel) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+        val data = message(5, 20 + PCM_BYTES).apply {
+            position(20)
+            putInt(SAMPLE_RATE).put(2.toByte()).put(1.toByte()).putShort(FRAMES.toShort())
+        }
+        var stream: Long? = null
+        var originNs = 0L
+        var expectedFrame = 0L
+        var previousCallNs = 0L
+        var filled = 0
+        var packetTimeNs = 0L
+        var sequence = 0
+        timestampSource = "effect-mix-clock"
+        while (running) {
+            val raw = source.read() ?: continue
+            val receivedNs = System.nanoTime()
+            val batch = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+            check(raw.size >= 64 && batch.int == 0x31585455) { "Invalid effect tap header" }
+            val rate = batch.int
+            val frames = batch.int
+            val io = batch.int
+            val id = batch.long
+            val firstFrame = batch.long
+            val callNs = batch.long
+            val droppedFrames = batch.long
+            val droppedBatches = batch.long
+            val actualDelay = batch.int
+            batch.int
+            check(frames > 0 && raw.size.toLong() == 64L + frames.toLong() * 8) { "Invalid effect batch size" }
+            check(rate == SAMPLE_RATE) { "Effect tap rate=$rate; UDP prototype requires $SAMPLE_RATE" }
+            val measuredOrigin = callNs - framesToNs(firstFrame)
+            if (stream != id) {
+                if (stream != null) println("INFO effect_stream_changed io=$io stream=$id")
+                stream = id; originNs = measuredOrigin; filled = 0; previousCallNs = 0
+                println("INFO effect_stream io=$io stream=$id rate=$rate")
+            } else {
+                // 40ms 一批仅更新一次帧零点，批内仍按连续 48kHz 帧时钟展开。
+                originNs += (measuredOrigin - originNs) / 16
+                if (firstFrame != expectedFrame) {
+                    sequence += ((firstFrame - expectedFrame + filled).coerceAtLeast(0) / FRAMES).toInt()
+                    filled = 0
+                }
+            }
+            expectedFrame = firstFrame + frames
+            synchronized(diagnosticsLock) {
+                effectFrames += frames; effectBatches++
+                batchMin = minOf(batchMin, frames); batchMax = maxOf(batchMax, frames)
+                if (previousCallNs != 0L) {
+                    val interval = callNs - previousCallNs
+                    intervalCount++; intervalSumNs += interval
+                    intervalMinNs = minOf(intervalMinNs, interval); intervalMaxNs = maxOf(intervalMaxNs, interval)
+                }
+                effectDroppedFrames = droppedFrames; effectDroppedBatches = droppedBatches
+                effectActualDelayMs = actualDelay; effectIo = io; diagnosticReadFrames = expectedFrame
+            }
+            previousCallNs = callNs
+            for (frame in 0 until frames) {
+                if (filled == 0) packetTimeNs = originNs + framesToNs(firstFrame + frame)
+                repeat(2) { channel ->
+                    val pcm = (batch.float * 32768f).toInt().coerceIn(-32768, 32767)
+                    data.putShort(AUDIO_HEADER + filled * 4 + channel * 2, pcm.toShort())
+                }
+                if (++filled == FRAMES) {
+                    data.putInt(8, sequence++)
+                    data.putLong(12, packetTimeNs / 1000 + latencyUs)
+                    synchronized(diagnosticsLock) {
+                        val age = receivedNs - packetTimeNs
+                        ageCount++; ageSumNs += age
+                        ageMinNs = minOf(ageMinNs, age); ageMaxNs = maxOf(ageMaxNs, age)
+                    }
+                    publishAudio(udp, data)
+                    filled = 0
+                }
+            }
+        }
+    }
+
+    private fun publishAudio(udp: DatagramChannel, data: ByteBuffer) {
+        var packetPeak = 0
+        for (offset in AUDIO_HEADER until data.capacity() step 2) packetPeak = maxOf(packetPeak, abs(data.getShort(offset).toInt()))
+        peak.accumulateAndGet(packetPeak) { previous, current -> maxOf(previous, current) }
+        val now = System.nanoTime()
+        for ((subscriber, subscribedNs) in subscribers.entries) {
+            if (now - subscribedNs >= SUBSCRIBE_TIMEOUT_NS) { subscribers.remove(subscriber, subscribedNs); continue }
+            if (send(udp, data, subscriber, "audio_send")) sendCount.incrementAndGet()
+        }
+        packetCount.incrementAndGet()
     }
 
     private fun receiveControl(udp: DatagramChannel) = Selector.open().use { selector ->
@@ -324,6 +448,7 @@ object CaptureMain {
         running = false
         // 先恢复本机路由，再关闭网络；不依赖阻塞中的录音线程主动返回。
         val restored = capture?.close() ?: true
+        runCatching { effect?.close() }.onFailure { println("ERROR release_effect=${describe(it)}") }
         channel?.let { udp ->
             val bye = message(6, 0)
             for (subscriber in subscribers.keys) {
