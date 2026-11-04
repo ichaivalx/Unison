@@ -15,10 +15,10 @@ class AndroidReceiver {
 public:
     unison::Receiver receiver;
 
-    bool start() {
+    bool start(const std::string& host) {
         std::lock_guard<std::mutex> lock(lifecycle);
         if (active.load()) return true;
-        if (!receiver.start()) return false;
+        if (!receiver.start(host)) return false;
         rebuild.store(false);
         active.store(true);
         if (!openStream()) {
@@ -65,10 +65,6 @@ public:
         wake.notify_all();
     }
 
-    void setLocalSourceRunning(bool running) {
-        if (localSourceRunning.exchange(running) != running && active.load()) routeChanged();
-    }
-
     std::string stats() {
         bool open = outputOpen.load();
         int sharing = outputSharing.load(), performance = outputPerformance.load(), usage = outputUsage.load();
@@ -95,7 +91,6 @@ private:
     std::condition_variable wake;
     std::thread manager;
     std::atomic<bool> active{false}, rebuild{false}, outputOpen{false};
-    std::atomic<bool> localSourceRunning{false};
     std::atomic<int> outputRate{0};
     std::atomic<int> outputDeviceId{0}, outputSharing{0}, outputPerformance{0}, outputUsage{0};
     std::atomic<int64_t> outputFramesWritten{0};
@@ -147,7 +142,7 @@ private:
         AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
         AAudioStreamBuilder_setChannelCount(builder, 2);
         // 本机拦截 MEDIA/GAME/UNKNOWN 时，重放使用未被匹配的 ASSISTANT。
-        AAudioStreamBuilder_setUsage(builder, localSourceRunning.load() ? AAUDIO_USAGE_ASSISTANT : AAUDIO_USAGE_MEDIA);
+        AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
         AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
         AAudioStreamBuilder_setSpatializationBehavior(builder, AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER);
         AAudioStreamBuilder_setDataCallback(builder, audioCallback, this);
@@ -206,14 +201,17 @@ AndroidReceiver engine;
 }  // namespace
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_io_github_ichaivalx_unison_ReceiverEngine_start(JNIEnv*, jobject) {
-    return engine.start() ? JNI_TRUE : JNI_FALSE;
+Java_io_github_ichaivalx_unison_ReceiverEngine_start(JNIEnv* env, jobject, jstring host) {
+    const char* text = env->GetStringUTFChars(host, nullptr);
+    bool started = engine.start(text);
+    env->ReleaseStringUTFChars(host, text);
+    return started ? JNI_TRUE : JNI_FALSE;
 }
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_ichaivalx_unison_ReceiverEngine_stop(JNIEnv*, jobject) { engine.stop(); }
 extern "C" JNIEXPORT void JNICALL
-Java_io_github_ichaivalx_unison_ReceiverEngine_setOffsetMs(JNIEnv*, jobject, jfloat ms) {
-    engine.receiver.setOffsetMs(ms);
+Java_io_github_ichaivalx_unison_ReceiverEngine_setOffsetUs(JNIEnv*, jobject, jlong us) {
+    engine.receiver.setOffsetUs(us);
 }
 extern "C" JNIEXPORT jstring JNICALL
 Java_io_github_ichaivalx_unison_ReceiverEngine_statsJson(JNIEnv* env, jobject) {
@@ -221,9 +219,7 @@ Java_io_github_ichaivalx_unison_ReceiverEngine_statsJson(JNIEnv* env, jobject) {
 }
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_ichaivalx_unison_ReceiverEngine_routeChanged(JNIEnv*, jobject) { engine.routeChanged(); }
-extern "C" JNIEXPORT void JNICALL
-Java_io_github_ichaivalx_unison_ReceiverEngine_setLocalSourceRunning(JNIEnv*, jobject, jboolean running) {
-    engine.setLocalSourceRunning(running == JNI_TRUE);
-}
+extern "C" JNIEXPORT jlong JNICALL
+Java_io_github_ichaivalx_unison_ReceiverEngine_receiverId(JNIEnv*, jobject) { return static_cast<jlong>(engine.receiver.receiverId()); }
 
 extern "C" __attribute__((visibility("default"))) int64_t unison_monotonic_us() { return unison::monotonicUs(); }

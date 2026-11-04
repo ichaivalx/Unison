@@ -29,3 +29,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -S native/core -B out/core
       - run: cmake --build out/core --config Release
+      - run: ctest --test-dir out/core -C Release --output-on-failure

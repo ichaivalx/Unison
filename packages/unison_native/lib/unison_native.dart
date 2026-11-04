@@ -5,6 +5,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io';
 import 'package:flutter/services.dart';
@@ -158,13 +159,16 @@ abstract final class UnisonNative {
     try { return (await _methods.invokeMethod<T>(method, args)) as T; }
     on PlatformException catch (e) { if (e.code == 'unsupported') throw UnsupportedError(e.message ?? method); rethrow; }
   }
-  static Stream<dynamic> _stream(String type) => _events.where((e) => e['type'] == type).map((e) => e['data']);
+  static Stream<dynamic> _stream(String type) {
+    if (!Platform.isAndroid && (type == 'source' || type == 'media' || type == 'calibration')) throw UnsupportedError('Requires rooted Android');
+    return _events.where((e) => e['type'] == type).map((e) => e['data'] is String ? jsonDecode(e['data'] as String) : e['data']);
+  }
   static Future<int> receiverId() => _call<int>('receiverId');
   static Future<void> startReceiver({required String sourceHost}) => _call<void>('startReceiver', {'sourceHost': sourceHost});
   static Future<void> stopReceiver() => _call<void>('stopReceiver');
   static Future<void> setReceiverOffsetUs(int offsetUs) => _call<void>('setReceiverOffsetUs', offsetUs);
   static Stream<ReceiverStats> get receiverStats => _stream('receiver').map((dynamic e) => ReceiverStats(
-    running: e['running'] == true, sourceHost: e['sourceHost'] as String?, clockReady: e['clockReady'] == true,
+    running: e['running'] == true, sourceHost: (e['sourceHost'] as String?)?.isEmpty == true ? null : e['sourceHost'] as String?, clockReady: e['clockReady'] == true,
     syncErrorUs: (e['syncErrorUs'] as num?)?.round() ?? 0, bufferUs: (e['bufferUs'] as num?)?.round() ?? 0,
     rttUs: (e['rttUs'] as num?)?.round() ?? 0, lostPackets: (e['lostPackets'] as num?)?.toInt() ?? 0,
     latePackets: (e['latePackets'] as num?)?.toInt() ?? 0, xruns: (e['xruns'] as num?)?.toInt() ?? 0,

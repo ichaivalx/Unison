@@ -1,9 +1,9 @@
+#include "audio_output.h"
 #include "unison/receiver.h"
 
 #include <windows.h>
 #include <audioclient.h>
 #include <avrt.h>
-#include <conio.h>
 #include <mmdeviceapi.h>
 #include <propkeydef.h>
 #include <functiondiscoverykeys_devpkey.h>
@@ -29,19 +29,15 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
-std::atomic<bool> running{true};
-std::atomic<uint64_t> outputRebuilds{0};
-std::mutex statusMutex;
-std::string outputStatus = "正在打开输出";
-
-void setStatus(const std::string& value) {
-    std::lock_guard<std::mutex> lock(statusMutex);
-    outputStatus = value;
-}
-std::string status() {
-    std::lock_guard<std::mutex> lock(statusMutex);
-    return outputStatus;
-}
+std::atomic<bool> running{false}, rebuild{false};
+std::atomic<float> gain{1.0f};
+std::atomic<bool> gainDirty{true};
+std::mutex settingsMutex;
+std::wstring selection;
+std::string actualDevice;
+void setStatus(const std::string& value) { std::lock_guard<std::mutex> lock(settingsMutex); actualDevice = value; }
+unison::Receiver receiver;
+std::thread worker;
 std::string utf8(const std::wstring& value) {
     if (value.empty()) return {};
     int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
@@ -52,11 +48,6 @@ std::string utf8(const std::wstring& value) {
 std::wstring lower(std::wstring value) {
     for (auto& c : value) c = static_cast<wchar_t>(std::towlower(c));
     return value;
-}
-std::string errorText(HRESULT hr) {
-    std::ostringstream text;
-    text << "0x" << std::hex << static_cast<unsigned long>(hr);
-    return text.str();
 }
 std::wstring deviceName(IMMDevice* device) {
     ComPtr<IPropertyStore> store;
@@ -86,7 +77,7 @@ HRESULT chooseDevice(IMMDeviceEnumerator* devices, const std::wstring& selection
         ComPtr<IMMDevice> device;
         if (FAILED(collection->Item(i, &device))) continue;
         if ((numeric && selection == std::to_wstring(i)) ||
-            (!numeric && lower(deviceName(device.Get())).find(wanted) != std::wstring::npos)) {
+            (!numeric && lower(deviceName(device.Get())) == wanted)) {
             out = device;
             return S_OK;
         }
@@ -98,6 +89,7 @@ struct AudioOutput {
     ComPtr<IAudioClient> client;
     ComPtr<IAudioRenderClient> renderer;
     ComPtr<IAudioClock> clock;
+    ComPtr<ISimpleAudioVolume> sessionVolume;
     WAVEFORMATEX* format = nullptr;
     HANDLE event = nullptr;
     UINT32 capacity = 0;
@@ -129,7 +121,7 @@ struct AudioOutput {
         HRESULT hr = enumerator(devices);
         if (FAILED(hr)) return hr;
         ComPtr<IMMDevice> device;
-        hr = id.empty() ? devices->GetDefaultAudioEndpoint(eRender, eConsole, &device) : devices->GetDevice(id.c_str(), &device);
+        hr = id.empty() ? devices->GetDefaultAudioEndpoint(eRender, eConsole, &device) : chooseDevice(devices.Get(), id, device);
         if (FAILED(hr)) return hr;
         if (FAILED(hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client))) return hr;
         if (FAILED(hr = client->GetMixFormat(&format))) return hr;
@@ -171,6 +163,7 @@ struct AudioOutput {
         if (FAILED(hr = client->GetBufferSize(&capacity))) return hr;
         if (FAILED(hr = client->GetService(IID_PPV_ARGS(&renderer)))) return hr;
         if (FAILED(hr = client->GetService(IID_PPV_ARGS(&clock)))) return hr;
+        if (SUCCEEDED(client->GetService(IID_PPV_ARGS(&sessionVolume)))) { sessionVolume->SetMasterVolume(gain.load(), nullptr); }
         if (FAILED(hr = clock->GetFrequency(&frequency))) return hr;
         client->GetStreamLatency(&latency);
         stereo.resize(static_cast<size_t>(capacity) * 2);
@@ -179,9 +172,7 @@ struct AudioOutput {
         if (FAILED(hr = renderer->ReleaseBuffer(capacity, AUDCLNT_BUFFERFLAGS_SILENT))) return hr;
         written = capacity;
         if (FAILED(hr = client->Start())) return hr;
-        setStatus(utf8(deviceName(device.Get())) + " " + std::to_string(format->nSamplesPerSec) + " Hz " +
-            std::to_string(format->wBitsPerSample) + (floating ? "bit float " : "bit PCM ") +
-            std::to_string(format->nChannels) + "ch");
+        setStatus(utf8(deviceName(device.Get())));
         return S_OK;
     }
 
@@ -270,6 +261,10 @@ struct AudioOutput {
         BYTE* target = nullptr;
         if (FAILED(hr = renderer->GetBuffer(frames, &target))) return hr;
         receiver.render(stereo.data(), static_cast<int>(frames), static_cast<int>(format->nSamplesPerSec), firstFrameUs, real);
+        if (sessionVolume) {
+            if (gainDirty.exchange(false)) { sessionVolume->SetMasterVolume(gain.load(), nullptr); sessionVolume->SetMute(FALSE, nullptr); }
+            else { float value; BOOL muted; if (SUCCEEDED(sessionVolume->GetMasterVolume(&value)) && SUCCEEDED(sessionVolume->GetMute(&muted))) gain = muted ? 0.0f : value; }
+        }
         encode(target, frames);
         hr = renderer->ReleaseBuffer(frames, 0);
         if (SUCCEEDED(hr)) written += frames;
@@ -277,139 +272,93 @@ struct AudioOutput {
     }
 };
 
-void audioThread(unison::Receiver& receiver, const std::wstring& id) {
-    HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(initialized)) { setStatus("COM 初始化失败 " + errorText(initialized)); return; }
-    DWORD taskIndex = 0;
-    HANDLE priority = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-    bool opened = false;
+
+std::wstring wide(const std::string& text) {
+    int size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    std::wstring value(size, L'\0'); MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), value.data(), size); return value;
+}
+std::string jsonString(const std::string& text) {
+    std::string out = "\"";
+    for (unsigned char c : text) { if (c == '"' || c == '\\') out += '\\'; if (c >= 32) out += static_cast<char>(c); }
+    return out + "\"";
+}
+class Notifications : public IMMNotificationClient {
+    std::atomic<ULONG> references{1};
+public:
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override { auto n = --references; if (!n) delete this; return n; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IMMNotificationClient)) { *out = static_cast<IMMNotificationClient*>(this); AddRef(); return S_OK; }
+        *out = nullptr; return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
+        std::lock_guard<std::mutex> lock(settingsMutex);
+        if (selection.empty() && flow == eRender && role == eConsole) rebuild = true;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { rebuild = true; return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { rebuild = true; return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+};
+void renderLoop() {
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return;
+    DWORD index = 0; HANDLE priority = AvSetMmThreadCharacteristicsW(L"Pro Audio", &index);
+    ComPtr<IMMDeviceEnumerator> watcher; enumerator(watcher);
+    auto* notifications = new Notifications;
+    if (watcher) watcher->RegisterEndpointNotificationCallback(notifications);
     while (running.load()) {
+        rebuild = false;
+        std::wstring id; { std::lock_guard<std::mutex> lock(settingsMutex); id = selection; }
         bool underrun = false;
         {
+            setStatus("");
             AudioOutput output;
             HRESULT hr = output.open(id);
             if (SUCCEEDED(hr)) {
-                if (opened) outputRebuilds.fetch_add(1);
-                opened = true;
                 receiver.resetOutputTiming();
-                while (running.load()) {
-                    DWORD signaled = WaitForSingleObject(output.event, 100);
-                    if (signaled == WAIT_FAILED) { hr = HRESULT_FROM_WIN32(GetLastError()); break; }
+                while (running.load() && !rebuild.load()) {
+                    if (WaitForSingleObject(output.event, 100) == WAIT_FAILED) break;
                     if (FAILED(hr = output.fill(receiver))) break;
                 }
             }
             underrun = hr == AUDCLNT_E_BUFFER_ERROR;
-            if (underrun) setStatus("输出欠载，正在重建流");
-            else if (FAILED(hr)) setStatus("输出不可用 " + errorText(hr) + "，等待重连");
         }
         if (underrun) continue;
-        for (int i = 0; i < 10 && running.load(); ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        for (int i = 0; i < 10 && running.load() && !rebuild.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    if (watcher) watcher->UnregisterEndpointNotificationCallback(notifications);
+    notifications->Release();
     if (priority) AvRevertMmThreadCharacteristics(priority);
     CoUninitialize();
 }
-
-BOOL WINAPI consoleSignal(DWORD signal) {
-    if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT) {
-        running.store(false);
-        return TRUE;
-    }
-    return FALSE;
 }
-
-int run(int argc, wchar_t** argv) {
-    std::wstring deviceSelection, source;
-    bool list = false;
-    for (int i = 1; i < argc; ++i) {
-        std::wstring arg = argv[i];
-        if (arg == L"--list") list = true;
-        else if ((arg == L"--device" || arg == L"--source") && i + 1 < argc) {
-            auto value = argv[++i];
-            if (arg == L"--device") deviceSelection = value;
-            else source = value;
-        } else {
-            std::cerr << "用法: unison-receiver [--list] [--device 序号或名称片段] [--source IPv4]\n";
-            return 2;
-        }
-    }
-    ComPtr<IMMDeviceEnumerator> devices;
-    HRESULT hr = enumerator(devices);
-    if (FAILED(hr)) { std::cerr << "枚举设备失败 " << errorText(hr) << '\n'; return 1; }
-    if (list) {
-        ComPtr<IMMDeviceCollection> collection;
-        if (FAILED(hr = devices->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection))) return 1;
-        UINT count = 0;
-        collection->GetCount(&count);
-        for (UINT i = 0; i < count; ++i) {
-            ComPtr<IMMDevice> device;
-            if (SUCCEEDED(collection->Item(i, &device))) std::cout << i << ": " << utf8(deviceName(device.Get())) << '\n';
-        }
-        return 0;
-    }
-    std::wstring id;
-    if (!deviceSelection.empty()) {
-        ComPtr<IMMDevice> device;
-        if (FAILED(hr = chooseDevice(devices.Get(), deviceSelection, device))) {
-            std::cerr << "找不到输出设备，请先使用 --list\n";
-            return 1;
-        }
-        LPWSTR deviceId = nullptr;
-        if (FAILED(device->GetId(&deviceId))) return 1;
-        id = deviceId;
-        CoTaskMemFree(deviceId);
-    }
-    unison::Receiver receiver;
-    if (!receiver.start(utf8(source))) { std::cerr << "接收端启动失败，检查 UDP 端口与音源 IP\n"; return 1; }
-    SetConsoleCtrlHandler(consoleSignal, TRUE);
-    std::cout << "+ / -: 偏移 ±1 ms   ] / [: ±10 ms   q: 退出（正偏移更晚发声）\n";
-    std::thread output([&] { audioThread(receiver, id); });
-    float offset = 0;
-    int64_t lastStatus = 0;
-    while (running.load()) {
-        while (_kbhit()) {
-            wchar_t key = _getwch();
-            if (key == L'q' || key == L'Q') running.store(false);
-            if (key == L'+') offset += 1;
-            if (key == L'-') offset -= 1;
-            if (key == L']') offset += 10;
-            if (key == L'[') offset -= 10;
-            receiver.setOffsetMs(offset);
-        }
-        int64_t now = unison::monotonicUs();
-        if (now - lastStatus >= 1'000'000) {
-            std::string line = "rebuild=" + std::to_string(outputRebuilds.load()) + " " + receiver.statsLine() + " | " + status();
-            CONSOLE_SCREEN_BUFFER_INFO screen{};
-            if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &screen)) {
-                size_t width = static_cast<size_t>(screen.srWindow.Right - screen.srWindow.Left);
-                if (line.size() > width) {
-                    line.resize(width);
-                    // UTF-8 设备名按字节保守裁剪，保留一行且不截断字符。
-                    while (!line.empty() && (static_cast<unsigned char>(line.back()) & 0xc0) == 0x80) line.pop_back();
-                    if (!line.empty() && static_cast<unsigned char>(line.back()) >= 0xc0) line.pop_back();
-                }
-            }
-            std::cout << "\r\x1b[2K" << line << std::flush;
-            lastStatus = now;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    }
-    output.join();
-    receiver.stop();
-    SetConsoleCtrlHandler(consoleSignal, FALSE);
-    std::cout << '\n';
-    return 0;
+namespace unison_windows {
+uint64_t receiverId() { return receiver.receiverId(); }
+bool start(const std::string& source) {
+    stop(); if (!receiver.start(source)) return false;
+    running = true; worker = std::thread(renderLoop); return true;
 }
-}  // namespace
-
-int wmain(int argc, wchar_t** argv) {
-    SetConsoleOutputCP(CP_UTF8);
-    HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD mode = 0;
-    if (GetConsoleMode(console, &mode)) SetConsoleMode(console, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) return 1;
-    int result = run(argc, argv);
-    CoUninitialize();
-    return result;
+void stop() { running = false; if (worker.joinable()) worker.join(); receiver.stop(); }
+void offset(int64_t us) { receiver.setOffsetUs(us); }
+std::string stats() {
+    std::string data = receiver.statsJson(); data.pop_back();
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    return data + ",\"outputDevice\":" + jsonString(running.load() ? actualDevice : "") + "}";
+}
+std::vector<std::string> devices() {
+    HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::vector<std::string> values;
+    ComPtr<IMMDeviceEnumerator> list; ComPtr<IMMDeviceCollection> collection;
+    if (SUCCEEDED(enumerator(list)) && SUCCEEDED(list->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection))) {
+        UINT count = 0; collection->GetCount(&count);
+        for (UINT i = 0; i < count; ++i) { ComPtr<IMMDevice> current; if (SUCCEEDED(collection->Item(i, &current))) values.push_back(utf8(deviceName(current.Get()))); }
+    }
+    collection.Reset(); list.Reset(); if (SUCCEEDED(initialized)) CoUninitialize(); return values;
+}
+void device(const std::string& name) {
+    std::lock_guard<std::mutex> lock(settingsMutex); selection = wide(name); rebuild = true;
+}
+void volume(double value) { gain = static_cast<float>(std::clamp(value, 0.0, 1.0)); gainDirty = true; }
+double volume() { return gain.load(); }
 }

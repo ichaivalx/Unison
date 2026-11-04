@@ -3,214 +3,81 @@ package io.github.ichaivalx.unison.capture
 import android.content.Context
 import android.os.Build
 import java.io.File
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.concurrent.thread
+import java.util.concurrent.atomic.AtomicLong
 import org.json.JSONObject
-import java.util.Locale
+import kotlin.concurrent.thread
 
 object SourceController {
-    @Volatile private var process: java.lang.Process? = null
+    @Volatile private var process: Process? = null
     @Volatile private var ready = false
     @Volatile private var rootPid = 0
-    @Volatile private var output: ((String) -> Unit)? = null
-    @Volatile private var localDelayMs = 0
-    @Volatile var isCalibrating = false
-        private set
-    @Volatile var calibrationText = ""
-        private set
-    private val commands = Executors.newSingleThreadExecutor { task ->
-        Thread(task, "source-commands").apply { isDaemon = true }
-    }
-
-    /** 用 su 启动音源进程；su 不可用返回 false。onLine 在后台线程收到音源进程的每行输出。 */
-    @Synchronized
-    fun start(context: Context, latencyMs: Int, onLine: (String) -> Unit): Boolean {
-        if (isRunning) return true
-        stop()
-        calibrationText = ""
-        output = onLine
+    @Volatile var onEvent: ((String, Any?) -> Unit)? = null
+    private val ids = AtomicLong()
+    private val pending = ConcurrentHashMap<Long, CompletableFuture<Any?>>()
+    @Synchronized fun ensure(context: Context): Boolean {
+        if (ready && process?.isAlive == true) return true
+        shutdown()
         val apk = context.applicationInfo.sourceDir
         val extracted = File(context.applicationInfo.nativeLibraryDir, "libunison_capture.so")
-        val library = if (extracted.isFile) extracted.absolutePath
-            else "$apk!/lib/${Build.SUPPORTED_ABIS.first()}/libunison_capture.so"
-        val latencyUs = try {
-            Math.multiplyExact(latencyMs, 1000)
-        } catch (error: ArithmeticException) {
-            emit("ERROR latency does not fit SET_LATENCY i32: $latencyMs ms")
-            return false
-        }
-        val command = "CLASSPATH=${quote(apk)} exec app_process " +
-            "${quote("-Dunison.capture.library=$library")} /system/bin " +
-            "io.github.ichaivalx.unison.capture.CaptureMain " +
-            "--exclude-uid ${context.applicationInfo.uid} --latency-us $latencyUs " +
-            "--name ${quote(Build.MODEL)} --mode effect --local-delay-ms $localDelayMs"
-        val child = try {
-            ProcessBuilder("su", "-c", command).redirectErrorStream(true).start()
-        } catch (error: Exception) {
-            emit("ERROR su unavailable: ${error.message}")
-            return false
-        }
+        val library = if (extracted.isFile) extracted.absolutePath else "$apk!/lib/${Build.SUPPORTED_ABIS.first()}/libunison_capture.so"
+        val command = "CLASSPATH=${quote(apk)} exec app_process ${quote("-Dunison.capture.library=$library")} /system/bin " +
+            "io.github.ichaivalx.unison.capture.CaptureMain ${context.applicationInfo.uid}"
+        val child = try { ProcessBuilder("su", "-c", command).redirectErrorStream(true).start() } catch (_: Exception) { return false }
         process = child
-        rootPid = 0
-        ready = false
-        val startup = CountDownLatch(1)
-        val acknowledged = AtomicBoolean(false)
-        thread(name = "source-output", isDaemon = true) {
+        val started = CountDownLatch(1)
+        thread(name = "root-events", isDaemon = true) {
             try {
-                child.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { line ->
-                        if (process === child && line.startsWith("CALIBRATION ")) {
-                            runCatching { calibrationLine(JSONObject(line.substringAfter(' '))) }
+                child.inputStream.bufferedReader().useLines { lines -> lines.forEach { line ->
+                    if (process !== child || !line.startsWith("{")) return@forEach
+                    runCatching {
+                        val event = JSONObject(line)
+                        when (val type = event.getString("type")) {
+                            "ready" -> { rootPid = event.getJSONObject("data").getInt("pid"); ready = true; started.countDown() }
+                            "reply" -> pending.remove(event.getLong("id"))?.let { future ->
+                                if (!event.isNull("error")) future.completeExceptionally(IllegalStateException(event.getString("error")))
+                                else future.complete(event.opt("result").takeUnless { it == JSONObject.NULL })
+                            }
+                            else -> onEvent?.invoke(type, event.opt("data").takeUnless { it == JSONObject.NULL })
                         }
-                        if (process === child && line.startsWith("PROCESS pid=")) {
-                            rootPid = line.substringAfter("PROCESS pid=").toIntOrNull() ?: 0
-                        }
-                        if (process === child && line.startsWith("READY ")) {
-                            acknowledged.set(true)
-                            ready = true
-                            startup.countDown()
-                        }
-                        runCatching { onLine(line) }
                     }
-                }
-            } catch (error: Exception) {
-                if (ready) runCatching { onLine("ERROR source output: ${error.message}") }
+                } }
             } finally {
-                startup.countDown()
-                // 不取 start/stop 的锁，避免等待子进程退出时互相阻塞。
-                if (process === child) { ready = false; isCalibrating = false }
-            }
-        }
-        val started = try {
-            // 包含首次 root 授权弹窗的等待时间；超时也要关闭 stdin 撤销拦截。
-            startup.await(30, TimeUnit.SECONDS) && acknowledged.get() && ready && child.isAlive
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
-        if (!started) {
-            emit("ERROR source startup failed or timed out; check root permission and source output")
-            stop()
-        } else {
-            // 启动命令只是快照；授权/启动等待期间 UI 仍可更新期望值。
-            enqueueLocalDelay(child)
-        }
-        return started
-    }
-
-    @Synchronized
-    fun stop() {
-        val child = process ?: return
-        if (isCalibrating) calibrationText += "\n校准已停止"
-        isCalibrating = false
-        ready = false
-        runCatching { child.outputStream.close() }
-        try {
-            if (!child.waitFor(3, TimeUnit.SECONDS)) {
-                // su 本身可能是转发进程；使用音源报告的 PID 终止真正的 app_process。
-                if (rootPid > 0) signalRoot(rootPid, "TERM") else child.destroy()
-                if (!child.waitFor(2, TimeUnit.SECONDS)) {
-                    if (rootPid > 0) signalRoot(rootPid, "KILL")
-                    child.destroyForcibly()
+                started.countDown()
+                if (process === child) {
+                    ready = false
+                    pending.values.forEach { it.completeExceptionally(IllegalStateException("Root process exited")) }; pending.clear()
+                    onEvent?.invoke("rootExit", null)
                 }
             }
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            child.destroy()
         }
-        process = null
+        if (!started.await(30, TimeUnit.SECONDS) || !ready) { shutdown(); return false }
+        return true
+    }
+    fun request(method: String, args: JSONObject = JSONObject()): CompletableFuture<Any?> {
+        val result = CompletableFuture<Any?>(); val id = ids.incrementAndGet(); pending[id] = result
+        try { synchronized(this) {
+            check(ready && process?.isAlive == true) { "Root is unavailable" }
+            val bytes = (JSONObject().put("id", id).put("method", method).put("args", args).toString() + "\n").toByteArray(Charsets.UTF_8)
+            process!!.outputStream.write(bytes); process!!.outputStream.flush()
+        } } catch (error: Throwable) { pending.remove(id); result.completeExceptionally(error) }
+        return result
+    }
+    @Synchronized fun shutdown() {
+        val child = process; process = null; ready = false
+        runCatching { child?.outputStream?.close() }
+        if (child != null && !child.waitFor(3, TimeUnit.SECONDS)) {
+            if (rootPid > 0) runCatching { ProcessBuilder("su", "-c", "kill -TERM $rootPid").start().waitFor(2, TimeUnit.SECONDS) }
+            if (!child.waitFor(2, TimeUnit.SECONDS)) {
+                if (rootPid > 0) runCatching { ProcessBuilder("su", "-c", "kill -KILL $rootPid").start().waitFor(2, TimeUnit.SECONDS) }
+                child.destroyForcibly()
+            }
+        }
         rootPid = 0
+        pending.values.forEach { it.completeExceptionally(IllegalStateException("Root process stopped")) }; pending.clear()
     }
-
-    /** 运行中调整目标延迟。 */
-    fun setLatency(latencyMs: Int) {
-        if (isCalibrating) return
-        val current = process ?: return
-        commands.execute {
-            if (process !== current || !isRunning) return@execute
-            try {
-                val bytes = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
-                    .putInt(0x4E534E55).put(1.toByte()).put(7.toByte()).putShort(0.toShort())
-                    .putInt(Math.multiplyExact(latencyMs, 1000)).array()
-                DatagramSocket().use { udp ->
-                    udp.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("127.0.0.1"), 47800))
-                }
-            } catch (error: Exception) {
-                runCatching { output?.invoke("ERROR set_latency: ${error.message}") }
-            }
-        }
-    }
-
-    val isRunning: Boolean get() = ready && process?.isAlive == true
-
-    /** 本机效果直通的延迟，不改变网络目标延迟。 */
-    fun setLocalDelay(ms: Int) {
-        require(ms >= 0) { "本机延迟不能为负数" }
-        if (isCalibrating) return
-        localDelayMs = ms
-        val current = process ?: return
-        enqueueLocalDelay(current)
-    }
-
-    private fun enqueueLocalDelay(current: java.lang.Process) {
-        commands.execute {
-            if (process !== current || !isRunning) return@execute
-            runCatching {
-                current.outputStream.write("LOCAL_DELAY $localDelayMs\n".toByteArray(Charsets.UTF_8))
-                current.outputStream.flush()
-            }.onFailure { if (isRunning) output?.invoke("ERROR local_delay: ${it.message}") }
-        }
-    }
-
-    fun calibrate() {
-        val current = process ?: return
-        if (!isRunning || isCalibrating) return
-        isCalibrating = true
-        calibrationText = "正在校准：请暂停其他播放，让 PC 扬声器声音能传到平板麦克风。"
-        commands.execute {
-            if (process !== current || !isRunning) { isCalibrating = false; return@execute }
-            runCatching {
-                current.outputStream.write("CALIBRATE\n".toByteArray(Charsets.UTF_8))
-                current.outputStream.flush()
-            }.onFailure { isCalibrating = false; calibrationText = "校准启动失败：${it.message}" }
-        }
-    }
-
-    private fun calibrationLine(value: JSONObject) {
-        fun ms(key: String) = String.format(Locale.ROOT, "%.2f", value.getDouble(key))
-        when (value.getString("state")) {
-            "begin" -> { isCalibrating = true; calibrationText = "校准中：请保持设备位置不变。" }
-            "phase" -> calibrationText += "\n${value.getString("message")}"
-            "round" -> calibrationText += "\n${value.getString("stage")} 第${value.getInt("round")}轮：${ms("offsetMs")} ms"
-            "result" -> {
-                localDelayMs = value.getInt("localDelayMs")
-                val later = if (value.getDouble("deltaMs") >= 0) "PC 更晚" else "平板更晚"
-                calibrationText += "\nΔ ${ms("deltaMs")} ms（$later）\n已采用：本机 $localDelayMs ms，目标 ${value.getInt("latencyUs") / 1000} ms"
-            }
-            "error" -> calibrationText += "\n校准失败：${value.getString("message")}（未写入补偿）"
-            "restored" -> isCalibrating = false
-        }
-    }
-
-    private fun signalRoot(pid: Int, signal: String) {
-        runCatching {
-            val kill = ProcessBuilder("su", "-c", "kill -$signal $pid").start()
-            if (!kill.waitFor(2, TimeUnit.SECONDS)) kill.destroy()
-        }.onFailure { emit("ERROR terminate source: ${it.message}") }
-    }
-
-    private fun emit(line: String) {
-        val callback = output
-        thread(name = "source-output-error", isDaemon = true) { runCatching { callback?.invoke(line) } }
-    }
-
     private fun quote(value: String) = "'" + value.replace("'", "'\\''") + "'"
 }

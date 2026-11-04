@@ -45,7 +45,7 @@ Descriptor buildDescriptor() {
     d.common.flags.type = Flags::Type::INSERT;
     d.common.flags.insert = Flags::Insert::LAST;
     d.common.name = "Unison Tap";
-    d.common.implementor = "Unison";
+    d.common.implementor = "Unison/5";
     return d;
 }
 ScopedAStatus error(const char* message) {
@@ -53,10 +53,10 @@ ScopedAStatus error(const char* message) {
     return ScopedAStatus::fromExceptionCodeWithMessage(EX_ILLEGAL_ARGUMENT, message);
 }
 struct DelayLine {
-    DelayLine(size_t samples, int32_t delay) : data(samples, 0.0f), milliseconds(delay) {}
+    DelayLine(size_t samples, int64_t delay) : data(samples, 0.0f), microseconds(delay) {}
     std::vector<float> data;
     size_t position = 0;
-    int32_t milliseconds = 0;
+    int64_t microseconds = 0;
     DelayLine* next = nullptr;
 };
 }
@@ -142,10 +142,12 @@ public:
             uint32_t key = 0;
             memcpy(&key, blob->bytes.data() + 12, 4);
             if (key != kDelayParameter && key != kMuteParameter) return error("unknown parameter");
-            blob->bytes.resize(20);
-            const int32_t values[] = {0, 4, 4, static_cast<int32_t>(key),
-                key == kDelayParameter ? delayMs_.load() : (muted_.load() ? 1 : 0)};
-            memcpy(blob->bytes.data(), values, sizeof(values));
+            const bool delay = key == kDelayParameter;
+            blob->bytes.resize(delay ? 24 : 20);
+            const int32_t fields[] = {0, 4, delay ? 8 : 4, static_cast<int32_t>(key)};
+            memcpy(blob->bytes.data(), fields, sizeof(fields));
+            if (delay) { const int64_t value = delayUs_.load(); memcpy(blob->bytes.data() + 16, &value, 8); }
+            else { const int32_t value = muted_.load() ? 1 : 0; memcpy(blob->bytes.data() + 16, &value, 4); }
             VendorExtension extension;
             extension.extension.setParcelable(*blob);
             *result = Parameter::make<Parameter::specific>(Parameter::Specific::make<Parameter::Specific::vendorEffect>(extension));
@@ -187,14 +189,16 @@ private:
         auto* p = retired_.exchange(nullptr);
         while (p) { auto* next = p->next; delete p; p = next; }
     }
-    void scheduleDelay(int32_t ms) {
-        if (ms < 0) throw std::invalid_argument("negative local delay");
-        const uint64_t frames = uint64_t(common_.input.base.sampleRate) * uint64_t(ms) / 1000;
+    void scheduleDelay(int64_t us) {
+        if (us < 0) throw std::invalid_argument("negative local delay");
+        const uint64_t rate = static_cast<uint64_t>(common_.input.base.sampleRate);
+        if (uint64_t(us) / 1000000 > SIZE_MAX / (2 * sizeof(float)) / rate) throw std::invalid_argument("delay size overflow");
+        const uint64_t frames = uint64_t(us) / 1000000 * rate + uint64_t(us) % 1000000 * rate / 1000000;
         if (frames > SIZE_MAX / (2 * sizeof(float))) throw std::invalid_argument("delay size overflow");
         // 分配和回收只在 Binder 控制线程进行，process 只交换指针。
-        auto next = std::make_unique<DelayLine>(static_cast<size_t>(frames) * 2, ms);
+        auto next = std::make_unique<DelayLine>(static_cast<size_t>(frames) * 2, us);
         delete pending_.exchange(next.release());
-        delayMs_ = ms;
+        delayUs_ = us;
         collectRetired();
     }
     ScopedAStatus parameter(const Parameter& param) {
@@ -211,7 +215,7 @@ private:
                 stopWorker();
                 common_ = c;
                 allocateData();
-                scheduleDelay(delayMs_);
+                scheduleDelay(delayUs_);
                 streamId_ = static_cast<uint64_t>(nowNs()); frames_ = 0;
                 status_->wake(kMqChanged);
                 if (resume) { quit_ = false; state_ = State::PROCESSING; worker_ = std::thread([this] { process(); }); }
@@ -224,11 +228,13 @@ private:
         std::optional<DefaultExtension> blob;
         if (specific.get<Parameter::Specific::vendorEffect>().extension.getParcelable(&blob) != STATUS_OK || !blob || blob->bytes.size() < 20)
             return error("invalid vendor parameter");
-        int32_t fields[5]; memcpy(fields, blob->bytes.data(), sizeof(fields));
-        if (fields[1] != 4 || fields[2] != 4) return error("invalid vendor parameter size");
-        if (fields[3] == kDelayParameter) scheduleDelay(fields[4]);
-        else if (fields[3] == kMuteParameter) muted_ = fields[4] != 0;
-        else return error("unknown vendor parameter");
+        int32_t fields[4]; memcpy(fields, blob->bytes.data(), sizeof(fields));
+        if (fields[1] != 4) return error("invalid vendor parameter size");
+        if (fields[3] == kDelayParameter && fields[2] == 8 && blob->bytes.size() >= 24) {
+            int64_t us; memcpy(&us, blob->bytes.data() + 16, 8); scheduleDelay(us);
+        } else if (fields[3] == kMuteParameter && fields[2] == 4) {
+            int32_t value; memcpy(&value, blob->bytes.data() + 16, 4); muted_ = value != 0;
+        } else return error("unknown vendor parameter");
         return ScopedAStatus::ok();
     }
     void stopWorker() {
@@ -245,7 +251,7 @@ private:
         delete pending_.exchange(nullptr);
         collectRetired();
         state_ = State::INIT;
-        frames_ = 0; droppedFrames_ = 0; droppedBatches_ = 0; delayMs_ = 0;
+        frames_ = 0; droppedFrames_ = 0; droppedBatches_ = 0; delayUs_ = 0;
         muted_ = false;
     }
     void process() noexcept {
@@ -268,7 +274,7 @@ private:
             }
             const auto frames = static_cast<uint32_t>(n / 2);
             UnisonTapHeader header{UNISON_TAP_MAGIC, static_cast<uint32_t>(common_.input.base.sampleRate), frames,
-                common_.ioHandle, streamId_, frames_, callNs, droppedFrames_, droppedBatches_, activeDelay_ ? activeDelay_->milliseconds : 0, common_.session};
+                common_.ioHandle, streamId_, frames_, callNs, droppedFrames_, droppedBatches_, activeDelay_ ? static_cast<int32_t>(activeDelay_->microseconds / 1000) : 0, common_.session};
             iovec vectors[] = {{&header, sizeof(header)}, {work_.data(), n * sizeof(float)}};
             msghdr message{};
             message.msg_name = &destination; message.msg_namelen = addressSize;
@@ -303,7 +309,7 @@ private:
     std::vector<float> work_;
     int socket_ = -1;
     uint64_t streamId_ = 0, frames_ = 0, droppedFrames_ = 0, droppedBatches_ = 0;
-    std::atomic<int32_t> delayMs_{0};
+    std::atomic<int64_t> delayUs_{0};
     std::atomic<bool> muted_{false};
     std::atomic<DelayLine*> pending_{nullptr}, retired_{nullptr};
     DelayLine* activeDelay_ = nullptr;

@@ -25,19 +25,25 @@ import kotlin.math.sin
 internal class AcousticCalibration(
     private val source: EffectSource,
     private val latencyUs: Int,
-    private val localDelayMs: Int,
-    private val hasSubscribers: () -> Boolean,
-    private val applySettings: (Int, Int) -> Unit,
+    private val localDelayUs: Long,
+    private val receivers: List<Long>,
+    private val requestedBands: List<String>,
+    private val subscribed: (Long) -> Boolean,
+    private val progress: (JSONObject) -> Unit,
+    private val complete: (JSONObject?, Throwable?) -> Unit,
 ) {
     companion object {
         private const val RATE = 48_000
-        private const val CHIRP_FRAMES = 16_800 // 0.35 秒
         private fun frameNs(frames: Long) = frames / RATE * 1_000_000_000L + frames % RATE * 1_000_000_000L / RATE
-        private fun event(state: String, body: JSONObject.() -> Unit = {}) {
-            println("CALIBRATION " + JSONObject().put("state", state).apply(body))
-        }
     }
-
+    private data class Band(val name: String, val low: Double, val high: Double, val frames: Int,
+        val taper: Int, val lookback: Int, val ratio: Double)
+    private val bands = requestedBands.map { name -> when (name) {
+        "midHigh" -> Band(name, 1000.0, 8000.0, 16800, 384, 720, 0.5)
+        "lowMid" -> Band(name, 250.0, 700.0, 9600, 960, 2400, 0.3)
+        "bass" -> Band(name, 80.0, 250.0, 14400, 960, 2400, 0.3)
+        else -> error("Unknown calibration band $name")
+    } }
     private class Window(capacity: Int) {
         val lock = Any()
         val tap = FloatArray(capacity)
@@ -52,7 +58,9 @@ internal class AcousticCalibration(
 
     @Volatile var isRunning = false
         private set
-    @Volatile var networkMuted = false
+    @Volatile var networkTarget: Long? = null
+        private set
+    @Volatile var sessionId: Int? = null
         private set
     @Volatile private var cancelled = false
     @Volatile private var window: Window? = null
@@ -69,7 +77,7 @@ internal class AcousticCalibration(
     private var worker: Thread? = null
     private var micThread: Thread? = null
     private var playThread: Thread? = null
-    private external fun detect(samples: FloatArray, sine: FloatArray, cosine: FloatArray, directSound: Boolean): DoubleArray?
+    private external fun detect(samples: FloatArray, sine: FloatArray, cosine: FloatArray, directSound: Boolean, lookback: Int, ratio: Double): DoubleArray?
 
     fun start() {
         isRunning = true
@@ -88,11 +96,15 @@ internal class AcousticCalibration(
     }
 
     private fun run() {
-        var succeeded = false
+        var result: JSONObject? = null
+        var failure: Throwable? = null
         try {
-            check(hasSubscribers()) { "没有接收端订阅，请先启动 PC 接收端" }
-            check(!source.hasOtherPlayback()) { "请先暂停其他播放，再开始校准" }
-            event("begin") { put("message", "请暂停其他播放，让 PC 扬声器的声音能传到平板麦克风") }
+            if (bands.isEmpty()) {
+                result = JSONObject().put("local", org.json.JSONArray()).put("receivers", JSONObject().apply {
+                    receivers.forEach { put(it.toString(), org.json.JSONArray()) }
+                })
+                return
+            }
             openMicrophone()
             val format = AudioFormat.Builder().setSampleRate(RATE).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build()
@@ -102,109 +114,88 @@ internal class AcousticCalibration(
                 .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_POWER_SAVING)
                 .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_STEREO,
                     AudioFormat.ENCODING_PCM_16BIT), RATE / 5 * 4)).build()
-            player = track
-            event("output") { put("session", track.audioSessionId); put("bufferFrames", track.bufferSizeInFrames); put("performance", track.performanceMode) }
+            player = track; sessionId = track.audioSessionId
             source.setCalibrationSession(track.audioSessionId)
+            source.setCalibrationLocal(true)
             val deadline = System.nanoTime() + 3_000_000_000L
             while (track.audioSessionId !in source.activeSessions()) {
-                check(System.nanoTime() < deadline) { "测试音效果挂载失败：${source.status()}" }
-                pause(20)
+                check(System.nanoTime() < deadline) { "Calibration effect could not be attached" }; pause(20)
             }
             track.play()
             playThread = thread(name = "calibration-output", isDaemon = true) { writeAudio(track) }
             pause(2500)
-            val microphoneAnchor = checkNotNull(micOriginNs) { "麦克风单调时钟时间戳不可用" }
-            // 两阶段共用同一个 getTimestamp 锚点，按已读帧数推进；共同输入延迟才能相减抵消。
-            val delays = mutableListOf<List<Double>>()
-            val settlingMs = maxOf(localDelayMs, latencyUs / 1000).coerceAtLeast(0) + 500L
-            val periodMs = maxOf(localDelayMs, latencyUs / 1000).coerceAtLeast(0) + 1500L
-            for (pc in listOf(false, true)) {
+            val microphoneAnchor = checkNotNull(micOriginNs) { "Microphone monotonic timestamp unavailable" }
+            val total = (receivers.size + 1) * bands.size * 3
+            var step = 0
+            val local = org.json.JSONArray()
+            val remote = JSONObject()
+            for (receiver in listOf<Long?>(null) + receivers) {
+                val valuesForDevice = org.json.JSONArray()
+                val name = receiver?.toString() ?: "本机"
                 synchronized(control) {
-                    check(!cancelled) { "校准已停止" }
-                    source.setOutputMuted(pc)
-                    networkMuted = !pc
+                    check(!cancelled)
+                    source.setCalibrationLocal(receiver == null)
+                    networkTarget = receiver
                 }
-                val side = if (pc) "PC" else "本机"
-                event("phase") { put("stage", side); put("message", if (pc) "只听 PC" else "只听平板，网络音频已静音") }
-                pause(settlingMs)
-                val values = mutableListOf<Double>()
-                repeat(3) { round ->
-                    check(!source.hasOtherPlayback(track.audioSessionId)) { "检测到其他播放，请暂停后重试" }
-                    check(hasSubscribers()) { "接收端订阅已断开" }
-                    val sine = chirp(round, false)
-                    val cosine = chirp(round, true)
-                    val tone = ShortArray(CHIRP_FRAMES * 2) { (sine[it / 2] * 0.35f * 32767).roundToInt().toShort() }
-                    val current = Window(((periodMs + 250) * RATE / 1000).toInt())
-                    window = current
-                    synchronized(tones) { pendingTone = tone }
-                    pause(periodMs)
-                    window = null
-                    val tap: FloatArray
-                    val mic: FloatArray
-                    synchronized(current.lock) {
-                        current.frozen = true
-                        check(!current.gap) { "tap 时间轴中断，请重试" }
-                        tap = current.tap.copyOf(current.tapCount)
-                        mic = current.mic.copyOf(current.micCount)
+                pause(maxOf(localDelayUs, latencyUs.toLong()).coerceAtLeast(0) / 1000 + 500)
+                for (band in bands) {
+                    val values = mutableListOf<Double>()
+                    repeat(3) { round ->
+                        progress(JSONObject().put("step", step).put("totalSteps", total)
+                            .put("description", "$name ${band.name} ${round + 1}/3"))
+                        if (receiver == null || subscribed(receiver)) {
+                            val sine = chirp(band, round, false)
+                            val cosine = chirp(band, round, true)
+                            val tone = ShortArray(band.frames * 2) { (sine[it / 2] * 0.35f * 32767).roundToInt().toShort() }
+                            val periodMs = maxOf(localDelayUs, latencyUs.toLong()).coerceAtLeast(0) / 1000 + 1500
+                            val current = Window(((periodMs + 250) * RATE / 1000).toInt())
+                            window = current
+                            synchronized(tones) { pendingTone = tone }
+                            pause(periodMs); window = null
+                            val tap: FloatArray; val mic: FloatArray
+                            synchronized(current.lock) {
+                                current.frozen = true
+                                tap = current.tap.copyOf(current.tapCount); mic = current.mic.copyOf(current.micCount)
+                            }
+                            val reference = detect(tap, sine, cosine, false, band.lookback, band.ratio)
+                            val found = detect(mic, sine, cosine, true, band.lookback, band.ratio)
+                            if (!current.gap && reference != null && found != null && reference[1] >= 8 &&
+                                reference[2] >= 0.1 && found[1] >= 8 && found[2] >= 0.1) {
+                                val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
+                                val micTime = microphoneAnchor + (current.micFirstFrame + found[0]) * 1_000_000_000.0 / RATE
+                                values.add((micTime - tapTime) / 1000.0)
+                            }
+                        }
+                        ++step
+                        progress(JSONObject().put("step", step).put("totalSteps", total)
+                            .put("description", "$name ${band.name} ${round + 1}/3"))
                     }
-                    val reference = checkNotNull(detect(tap, sine, cosine, false)) { "tap 中没有完整测试音" }
-                    val received = checkNotNull(detect(mic, sine, cosine, true)) { "麦克风录音过短" }
-                    val micOrigin = checkNotNull(micOriginNs)
-                    val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
-                    val micTime = microphoneAnchor + (current.micFirstFrame + received[0]) * 1_000_000_000.0 / RATE
-                    val offset = (micTime - tapTime) / 1_000_000.0
-                    val tapMatch = reference[1] >= 8 && reference[2] >= 0.1
-                    val micMatch = received[1] >= 8 && received[2] >= 0.1
-                    event("detection") {
-                        put("stage", side); put("round", round + 1)
-                        put("tapSnr", reference[1]); put("tapMatch", reference[2])
-                        put("snr", received[1]); put("match", received[2])
-                        put("offsetMs", offset); put("micOriginNs", micOrigin)
-                        put("micAheadFrames", micTimestampFrame - micReadFrames)
-                        put("tapNs", tapTime); put("micNs", micTime)
-                    }
-                    check(tapMatch) { "tap 扫频未可靠检出" }
-                    check(micMatch) { "$side 扫频未可靠检出，请确认声音能到达麦克风并降低环境噪声" }
-                    values.add(offset)
-                    event("round") {
-                        put("stage", side); put("round", round + 1); put("offsetMs", offset)
-                        put("snr", received[1]); put("match", received[2])
-                    }
+                    val sorted = values.sorted()
+                    val spread = if (sorted.isEmpty()) null else (sorted.last() - sorted.first()).toLong()
+                    val median = if (sorted.size < 2 || spread!! > 5000) null else
+                        ((sorted[(sorted.size - 1) / 2] + sorted[sorted.size / 2]) / 2).toLong()
+                    valuesForDevice.put(JSONObject().put("band", band.name).put("arrivalUs", median ?: JSONObject.NULL)
+                        .put("spreadUs", spread ?: JSONObject.NULL).put("rounds", values.size))
                 }
-                check(values.max() - values.min() <= 5.0) { "$side 三轮相差超过 5ms，请保持设备位置不变并重试" }
-                delays.add(values)
+                if (receiver == null) { for (i in 0 until valuesForDevice.length()) local.put(valuesForDevice.get(i)) }
+                else remote.put(receiver.toString(), valuesForDevice)
             }
-            val local = delays[0].sorted()[1]
-            val pc = delays[1].sorted()[1]
-            val delta = pc - local
-            val newLocal = if (delta > 0) Math.addExact(localDelayMs, delta.roundToInt()) else localDelayMs
-            val newLatency = if (delta < 0) Math.addExact(latencyUs, Math.multiplyExact((-delta).roundToInt(), 1000)) else latencyUs
-            synchronized(control) {
-                check(!cancelled) { "校准已停止" }
-                applySettings(newLatency, newLocal)
-            }
-            event("result") {
-                put("deltaMs", delta); put("localMs", local); put("pcMs", pc)
-                put("localDelayMs", newLocal); put("latencyUs", newLatency)
-            }
-            succeeded = true
-        } catch (error: Throwable) {
-            event("error") { put("message", error.message ?: error.toString()) }
-        } finally {
-            close()
-            event("restored") { put("success", succeeded) }
-            isRunning = false
+            result = JSONObject().put("local", local).put("receivers", remote)
+        } catch (error: Throwable) { failure = if (cancelled) InterruptedException("Calibration cancelled") else error }
+        finally {
+            close(); isRunning = false
+            complete(result, failure)
         }
     }
 
-    private fun chirp(round: Int, quadrature: Boolean): FloatArray {
-        val f0 = if (round % 2 == 0) 1000.0 else 8000.0
-        val f1 = if (round % 2 == 0) 8000.0 else 1000.0
-        val k = ln(f1 / f0) / (CHIRP_FRAMES.toDouble() / RATE)
-        return FloatArray(CHIRP_FRAMES) { index ->
+    private fun chirp(band: Band, round: Int, quadrature: Boolean): FloatArray {
+        val f0 = if (round % 2 == 0) band.low else band.high
+        val f1 = if (round % 2 == 0) band.high else band.low
+        val k = ln(f1 / f0) / (band.frames.toDouble() / RATE)
+        return FloatArray(band.frames) { index ->
             val phase = 2 * PI * f0 * (exp(k * index / RATE) - 1) / k
-            val edge = minOf(index, CHIRP_FRAMES - 1 - index)
-            val taper = if (edge >= 384) 1.0 else 0.5 * (1 - cos(PI * edge / 384))
+            val edge = minOf(index, band.frames - 1 - index)
+            val taper = if (edge >= band.taper) 1.0 else 0.5 * (1 - cos(PI * edge / band.taper))
             ((if (quadrature) cos(phase) else sin(phase)) * taper).toFloat()
         }
     }
@@ -233,7 +224,7 @@ internal class AcousticCalibration(
                 // 先关闭预处理再开录音，避免创建效果期间产生无人读取的积压。
                 input.startRecording()
                 check(input.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "麦克风录音未启动" }
-                event("microphone") { put("source", if (preset == MediaRecorder.AudioSource.UNPROCESSED) "UNPROCESSED" else "VOICE_RECOGNITION") }
+
                 val activeInput = checkNotNull(input)
                 micThread = thread(name = "calibration-microphone", isDaemon = true) { readMicrophone(activeInput) }
                 return
@@ -317,8 +308,9 @@ internal class AcousticCalibration(
         synchronized(control) {
             cancelled = true
             window = null
-            networkMuted = false
-            runCatching { source.setOutputMuted(false) }
+            networkTarget = null
+            source.setCalibrationSession(null)
+            runCatching { source.setCalibrationLocal(true) }
         }
         runCatching { player?.pause() }
         runCatching { recorder?.stop() }

@@ -1,30 +1,51 @@
 package io.github.ichaivalx.unison.nativebridge
 
-import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.EventChannel
+import io.github.ichaivalx.unison.ReceiverEngine
+import org.json.JSONObject
+import java.util.concurrent.CompletableFuture
 
 class UnisonNativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
     private lateinit var methods: MethodChannel
     private lateinit var events: EventChannel
-    private lateinit var context: Context
+    private val main = Handler(Looper.getMainLooper())
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        context = binding.applicationContext
+        NativeRuntime.initialize(binding.applicationContext)
         methods = MethodChannel(binding.binaryMessenger, "unison_native/methods")
         events = EventChannel(binding.binaryMessenger, "unison_native/events")
         methods.setMethodCallHandler(this); events.setStreamHandler(this)
     }
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        methods.setMethodCallHandler(null); events.setStreamHandler(null)
+        methods.setMethodCallHandler(null); events.setStreamHandler(null); NativeRuntime.detach()
     }
-    override fun onListen(arguments: Any?, sink: EventChannel.EventSink) {}
-    override fun onCancel(arguments: Any?) {}
+    override fun onListen(arguments: Any?, sink: EventChannel.EventSink) { NativeRuntime.listen(sink) }
+    override fun onCancel(arguments: Any?) { NativeRuntime.detach() }
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-        if (call.method == "sourceAvailable") result.success(false)
-        else result.error("unsupported", "Native capability is being initialized", null)
+        try {
+            val args = (call.arguments as? Map<*, *>)?.let { JSONObject(it) } ?: JSONObject()
+            val future: CompletableFuture<Any?> = when (call.method) {
+                "receiverId" -> NativeRuntime.background { ReceiverEngine.receiverId() }
+                "startReceiver" -> NativeRuntime.startReceiver(args.getString("sourceHost"))
+                "stopReceiver" -> NativeRuntime.stopReceiver()
+                "setReceiverOffsetUs" -> NativeRuntime.background { ReceiverEngine.setOffsetUs((call.arguments as Number).toLong()); null }
+                "volume" -> CompletableFuture.completedFuture(NativeRuntime.volume())
+                "setVolume" -> NativeRuntime.background { NativeRuntime.setVolume((call.arguments as Number).toDouble()); null }
+                "sourceAvailable" -> NativeRuntime.root("available").exceptionally { false }
+                "startSource" -> NativeRuntime.startSource(args)
+                "stopSource" -> NativeRuntime.stopSource()
+                "setSourceLatencyUs", "setLocalDelayUs", "mediaSeek", "mediaCommand" -> NativeRuntime.root(call.method, JSONObject().put("value", call.arguments))
+                "calibrate" -> NativeRuntime.root("calibrate", args)
+                "cancelCalibration" -> NativeRuntime.root("cancelCalibration")
+                else -> { result.error("unsupported", "Unsupported Android capability: ${call.method}", null); return }
+            }
+            future.whenComplete { value, error -> main.post {
+                if (error != null) result.error("native", error.cause?.message ?: error.message, null) else result.success(value)
+            } }
+        } catch (error: Throwable) { result.error("native", error.message, null) }
     }
 }

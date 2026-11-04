@@ -15,6 +15,7 @@
 #endif
 
 #include <algorithm>
+#include <random>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -131,7 +132,10 @@ struct Receiver::State {
     std::deque<ClockSample> clockSamples;
     std::map<uint32_t, int64_t> pings;
     PacketMap packets;
-    uint64_t receiverId = 0;
+    uint64_t receiverId = [] {
+        static const uint64_t id = [] { std::random_device random; return ((uint64_t(random()) << 32) | random()) & 0x7fffffffffffffffULL; }();
+        return id;
+    }();
     uint32_t pingId = 0;
     int64_t selectedAt = 0;
     int64_t lastSeen = 0;
@@ -450,7 +454,6 @@ bool Receiver::start(const std::string& sourceIp) {
     }
     s.resetStream();
     s.fixedSource = !sourceIp.empty();
-    s.receiverId = static_cast<uint64_t>(monotonicUs());
     s.xruns.store(0);
     {
         std::lock_guard<std::mutex> lock(s.mutex);
@@ -487,6 +490,13 @@ void Receiver::stop() {
     s.resetStream();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.selected = false;
+}
+
+uint64_t Receiver::receiverId() const { return state_->receiverId; }
+
+void Receiver::setOffsetUs(int64_t us) {
+    std::lock_guard<std::mutex> lock(state_->mutex);
+    state_->userOffsetUs = static_cast<double>(us);
 }
 
 void Receiver::setOffsetMs(float ms) {
@@ -544,37 +554,21 @@ std::string Receiver::statsJson() {
     out.imbue(std::locale::classic());
     out << std::fixed << std::setprecision(3)
         << "{\"running\":" << (s.running ? "true" : "false")
-        << ",\"source\":\"" << ip << "\",\"clockReady\":" << (s.clockReady ? "true" : "false")
-        << ",\"clockOffsetMs\":" << s.clockOffset / 1000
-        << ",\"minRttMs\":" << s.minRtt / 1000
-        << ",\"bufferMs\":" << s.bufferMs
+        << ",\"sourceHost\":\"" << ip << "\",\"clockReady\":" << (s.clockReady ? "true" : "false")
+        << ",\"clockOffsetUs\":" << s.clockOffset
+        << ",\"rttUs\":" << s.minRtt
+        << ",\"bufferUs\":" << s.bufferMs * 1000
         << ",\"lostPackets\":" << s.lost << ",\"latePackets\":" << s.late
         << ",\"latePacketsPerSecond\":" << s.latePacketsPerSecond
         << ",\"lateAvgMs\":" << s.lateAvgMs << ",\"lateMaxMs\":" << s.lateMaxMs
-        << ",\"syncErrorMs\":" << s.errorUs / 1000
+        << ",\"syncErrorUs\":" << s.errorUs
         << ",\"speedPpm\":" << s.correction * 1e6
         << ",\"relocations\":" << s.relocations
         << ",\"xruns\":" << s.xruns
         << ",\"offsetMs\":" << s.userOffsetUs / 1000
-        << ",\"timestamp\":\"" << (s.realTimestamp ? "real" : "fallback") << "\"}";
+        << ",\"realTimestamp\":" << (s.realTimestamp ? "true" : "false") << "}";
     return out.str();
 }
 
-std::string Receiver::statsLine() {
-    auto s = state_->snapshot();
-    std::ostringstream out;
-    out.imbue(std::locale::classic());
-    out << std::fixed << std::setprecision(2)
-        << (s.clockReady ? "sync " : "waiting ")
-        << "err=" << s.errorUs / 1000 << "ms buf=" << s.bufferMs
-        << " late/s=" << s.latePacketsPerSecond << " avg/max=" << s.lateAvgMs << "/" << s.lateMaxMs << "ms"
-        << " rtt=" << s.minRtt / 1000
-        << " xrun=" << s.xruns
-        << " lost=" << s.lost << " late=" << s.late
-        << " ppm=" << std::setprecision(0) << s.correction * 1e6
-        << " seek=" << s.relocations << " ts=" << (s.realTimestamp ? "real" : "fallback")
-        << " offset=" << s.userOffsetUs / 1000 << "ms clk=" << std::setprecision(2) << s.clockOffset / 1000;
-    return out.str();
-}
 
 }  // namespace unison

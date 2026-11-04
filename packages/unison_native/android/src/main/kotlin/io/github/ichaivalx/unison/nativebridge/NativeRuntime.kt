@@ -1,0 +1,129 @@
+package io.github.ichaivalx.unison.nativebridge
+
+import android.content.Context
+import android.content.Intent
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
+import io.github.ichaivalx.unison.ReceiverEngine
+import io.github.ichaivalx.unison.capture.SourceController
+import io.flutter.plugin.common.EventChannel
+import org.json.JSONObject
+import org.json.JSONArray
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
+
+internal object NativeRuntime {
+    lateinit var context: Context
+    private val main = Handler(Looper.getMainLooper())
+    val worker = Executors.newSingleThreadExecutor()
+    @Volatile var sink: EventChannel.EventSink? = null
+    @Volatile var receiverRequested = false
+    @Volatile var sourceRequested = false
+    @Volatile var source = stoppedSource()
+    private var lastVolume = -1.0
+    private var polling = false
+    private fun stoppedSource() = JSONObject().put("running", false).put("latencyUs", 50000).put("localDelayUs", 0)
+        .put("sessions", JSONArray()).put("receiverIds", JSONArray()).put("error", JSONObject.NULL)
+    fun initialize(value: Context) {
+        context = value.applicationContext
+        SourceController.onEvent = { type, data ->
+            if (type == "source") {
+                source = data as JSONObject
+                sourceRequested = source.optBoolean("running")
+                emit(type, source); serviceState()
+            } else if (type == "rootExit") {
+                val active = sourceRequested; sourceRequested = false
+                source = source.put("running", false).put("sessions", JSONArray()).put("receiverIds", JSONArray())
+                if (active && source.isNull("error")) source.put("error", "Root process exited")
+                emit("source", source); serviceState()
+            } else if (type == "media" || type == "calibration") emit(type, data)
+        }
+        if (!polling) { polling = true; main.post(poll) }
+    }
+    private val poll = object : Runnable {
+        override fun run() {
+            if (sink != null || receiverRequested || sourceRequested) {
+                runCatching {
+                    val stats = JSONObject(ReceiverEngine.statsJson())
+                    val id = stats.optInt("outputDeviceId")
+                    val manager = context.getSystemService(AudioManager::class.java)
+                    val name = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id == id }?.productName?.toString().orEmpty()
+                    stats.put("outputDevice", name)
+                    emit("receiver", stats)
+                    val volume = volume()
+                    if (volume != lastVolume) { lastVolume = volume; emit("volume", volume) }
+                }
+            }
+            main.postDelayed(this, 250)
+        }
+    }
+    fun listen(value: EventChannel.EventSink) {
+        sink = value; emit("source", source); emit("volume", volume())
+        worker.execute { if (!SourceController.ensure(context)) emit("media", null) }
+    }
+    fun detach() { sink = null; if (!receiverRequested && !sourceRequested) worker.execute { SourceController.shutdown() } }
+    fun emit(type: String, value: Any?) { main.post { sink?.success(mapOf("type" to type, "data" to convert(value))) } }
+    private fun convert(value: Any?): Any? = when (value) {
+        null, JSONObject.NULL -> null
+        is JSONObject -> value.keys().asSequence().associateWith { convert(value.opt(it)) }
+        is JSONArray -> List(value.length()) { convert(value.opt(it)) }
+        else -> value
+    }
+    fun root(method: String, args: JSONObject = JSONObject()): CompletableFuture<Any?> {
+        val future = CompletableFuture<Any?>()
+        worker.execute {
+            try {
+                check(SourceController.ensure(context)) { "Root is unavailable" }
+                SourceController.request(method, args).whenComplete { result, error ->
+                    if (error != null) future.completeExceptionally(error) else future.complete(convert(result))
+                }
+            } catch (error: Throwable) { future.completeExceptionally(error) }
+        }
+        return future
+    }
+    fun startSource(args: JSONObject): CompletableFuture<Any?> {
+        sourceRequested = true; keepService()
+        return root("startSource", args).whenComplete { _, error -> if (error != null) { sourceRequested = false; serviceState() } }
+    }
+    fun startReceiver(host: String): CompletableFuture<Any?> {
+        receiverRequested = true; keepService()
+        return background {
+            try { check(ReceiverEngine.start(host)) { "Cannot start receiver" }; forceWifi(true) }
+            catch (error: Throwable) { receiverRequested = false; serviceState(); throw error }
+            null
+        }
+    }
+    fun stopReceiver() = background { receiverRequested = false; ReceiverEngine.stop(); forceWifi(false); serviceState(); null }
+    fun stopSource() = root("stopSource").whenComplete { _, _ -> sourceRequested = false; serviceState() }
+    fun stopAll() { stopReceiver(); stopSource() }
+    private fun keepService() { context.startForegroundService(Intent(context, AudioService::class.java).setAction("keep")) }
+    private fun serviceState() { main.post { AudioService.instance?.refresh() } }
+    fun background(block: () -> Any?): CompletableFuture<Any?> {
+        val future = CompletableFuture<Any?>()
+        worker.execute { try { future.complete(block()) } catch (error: Throwable) { future.completeExceptionally(error) } }
+        return future
+    }
+    private var wifiAttempted = false
+    private fun forceWifi(enabled: Boolean) {
+        if (!enabled && !wifiAttempted) return
+        wifiAttempted = enabled
+        runCatching {
+            val process = ProcessBuilder("su", "-c", "cmd wifi force-low-latency-mode ${if (enabled) "enabled" else "disabled"}")
+                .redirectErrorStream(true).start()
+            process.outputStream.close()
+            if (!process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) process.destroy()
+            else process.inputStream.close()
+        }
+    }
+    fun volume(): Double {
+        val audio = context.getSystemService(AudioManager::class.java)
+        return audio.getStreamVolume(AudioManager.STREAM_MUSIC).toDouble() / audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+    }
+    fun setVolume(value: Double) {
+        require(value in 0.0..1.0)
+        val audio = context.getSystemService(AudioManager::class.java)
+        audio.setStreamVolume(AudioManager.STREAM_MUSIC, (value * audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)).toInt(), 0)
+        lastVolume = volume(); emit("volume", lastVolume)
+    }
+}

@@ -27,9 +27,10 @@ internal class EffectSource {
     @Volatile private var needsSessionLookup = false
     @Volatile private var unresolvedClients = emptySet<Pair<Int, Int>>()
     @Volatile private var playingSessions = emptySet<Int>()
-    @Volatile private var delayMs = 0
+    @Volatile private var delayUs = 0L
     @Volatile private var outputMuted = false
     @Volatile private var calibrationSession: Int? = null
+    @Volatile private var calibrationLocal = true
     @Volatile private var deathReason: String? = null
     @Volatile private var closed = false
     private var healthThread: Thread? = null
@@ -42,9 +43,11 @@ internal class EffectSource {
     private val constructor = AudioEffect::class.java.getDeclaredConstructor(UUID::class.java, UUID::class.java,
         Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).apply { isAccessible = true }
     private val setParameter = AudioEffect::class.java.getDeclaredMethod("setParameter", Int::class.javaPrimitiveType,
+        ByteArray::class.java).apply { isAccessible = true }
+    private val setInteger = AudioEffect::class.java.getDeclaredMethod("setParameter", Int::class.javaPrimitiveType,
         Int::class.javaPrimitiveType).apply { isAccessible = true }
     private val getParameter = AudioEffect::class.java.getDeclaredMethod("getParameter", Int::class.javaPrimitiveType,
-        IntArray::class.java).apply { isAccessible = true }
+        ByteArray::class.java).apply { isAccessible = true }
     private val getUid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientUid")
     private val getPid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientPid")
     private val getSession = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getSessionId")
@@ -53,10 +56,10 @@ internal class EffectSource {
     private external fun readTap(fd: Int): ByteArray?
     private external fun closeTap(fd: Int)
 
-    fun start(appUid: Int, localDelayMs: Int) {
-        val context = PlaybackCapture.systemContext()
+    fun start(appUid: Int, localDelayUs: Long) {
+        val context = RootContext.create()
         excludeUid = appUid
-        delayMs = localDelayMs
+        delayUs = localDelayUs
         manager = AudioManager::class.java.getDeclaredConstructor(Context::class.java).newInstance(context)
         socket = openTap()
         val binder = Class.forName("android.os.ServiceManager").getDeclaredMethod("checkService", String::class.java)
@@ -75,8 +78,8 @@ internal class EffectSource {
                 for (session in snapshot) {
                     try {
                         check(session.effect.hasControl() && session.effect.enabled) { "lost control or disabled" }
-                        val value = IntArray(1)
-                        check(getParameter.invoke(session.effect, 1, value) == 1) { "health getParameter failed" }
+                        val value = ByteArray(8)
+                        check(getParameter.invoke(session.effect, 1, value) == 8) { "health getParameter failed" }
                     } catch (error: Exception) {
                         if (!closed && synchronized(lock) { sessions[session.id] === session }) {
                             deathReason = "AudioEffect invalid session=${session.id}: ${error.cause ?: error}"
@@ -88,7 +91,7 @@ internal class EffectSource {
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { return@thread }
             }
         }
-        println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_ms=$localDelayMs")
+        println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_ms=$localDelayUs")
     }
 
     private fun refresh(configs: List<AudioPlaybackConfiguration>? = null) {
@@ -154,11 +157,11 @@ internal class EffectSource {
                 try {
                     instance = constructor.newInstance(UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8201"),
                         UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, id)
-                    check(setParameter.invoke(instance, 1, delayMs) == AudioEffect.SUCCESS) { "Cannot set local delay" }
-                    if (outputMuted) check(setParameter.invoke(instance, 2, 1) == AudioEffect.SUCCESS) { "Cannot mute local effect" }
+                    check(setParameter.invoke(instance, 1, java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(delayUs).array()) == AudioEffect.SUCCESS) { "Cannot set local delay" }
+                    if (shouldMute(id)) check(setInteger.invoke(instance, 2, 1) == AudioEffect.SUCCESS) { "Cannot mute local effect" }
                     check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
                     sessions[id] = Session(uid, id, instance)
-                    println("INFO effect_attached uid=$uid session=$id local_delay_ms=$delayMs")
+                    println("INFO effect_attached uid=$uid session=$id local_delay_us=$delayUs")
                 } catch (error: Exception) {
                     runCatching { instance?.release() }
                     failed.add(id)
@@ -169,13 +172,12 @@ internal class EffectSource {
         }
     }
 
-    fun setLocalDelay(ms: Int) {
-        require(ms >= 0) { "本机延迟不能为负数" }
+    fun setLocalDelay(us: Long) {
+        require(us >= 0)
         synchronized(lock) {
-            delayMs = ms
-            for (session in sessions.values) check(setParameter.invoke(session.effect, 1, ms) == AudioEffect.SUCCESS) {
-                "Effect setParameter(delay=$ms) failed session=${session.id}"
-            }
+            delayUs = us
+            val bytes = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(us).array()
+            for (session in sessions.values) check(setParameter.invoke(session.effect, 1, bytes) == AudioEffect.SUCCESS) { "Cannot set local delay" }
         }
     }
 
@@ -190,7 +192,7 @@ internal class EffectSource {
         outputMuted = muted
         if (closed || deathReason != null || factory?.isBinderAlive != true) return@synchronized
         try {
-            for (session in sessions.values) check(setParameter.invoke(session.effect, 2, if (muted) 1 else 0) == AudioEffect.SUCCESS) {
+            for (session in sessions.values) check(setInteger.invoke(session.effect, 2, if (shouldMute(session.id)) 1 else 0) == AudioEffect.SUCCESS) {
                 "Cannot change local mute session=${session.id}"
             }
         } catch (error: Exception) {
@@ -198,6 +200,13 @@ internal class EffectSource {
             if (!muted) deathReason = "Cannot restore local output: ${error.cause ?: error}"
             throw error
         }
+    }
+
+    private fun shouldMute(id: Int) = if (calibrationSession != null) id != calibrationSession || !calibrationLocal else outputMuted
+    fun setCalibrationLocal(audible: Boolean) { calibrationLocal = audible; setOutputMuted(false) }
+    fun sessionStatus(): org.json.JSONArray = synchronized(lock) {
+        org.json.JSONArray(sessions.values.map { session -> org.json.JSONObject().put("uid", session.uid).put("sessionId", session.id)
+            .put("packageName", runCatching { RootContext.create().packageManager.getPackagesForUid(session.uid)?.firstOrNull() }.getOrNull() ?: org.json.JSONObject.NULL) })
     }
 
     fun acceptStream(session: Int, io: Int): Boolean = synchronized(lock) {
@@ -231,7 +240,7 @@ internal class EffectSource {
 
     private fun release(session: Session) {
         if (deathReason == null && factory?.isBinderAlive == true) {
-            if (outputMuted) runCatching { setParameter.invoke(session.effect, 2, 0) }
+            if (shouldMute(session.id)) runCatching { setInteger.invoke(session.effect, 2, 0) }
             try { session.effect.setEnabled(false) } finally { session.effect.release() }
         }
     }

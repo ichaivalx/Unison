@@ -2,10 +2,10 @@ package io.github.ichaivalx.unison
 
 object ReceiverEngine {
     init { System.loadLibrary("unison") }
-    external fun start(): Boolean
+    external fun start(sourceHost: String): Boolean
     external fun stop()
-    external fun setOffsetMs(ms: Float)
+    external fun setOffsetUs(us: Long)
     external fun statsJson(): String
     external fun routeChanged()
-    external fun setLocalSourceRunning(running: Boolean)
+    external fun receiverId(): Long
 }

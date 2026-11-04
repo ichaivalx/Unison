@@ -14,6 +14,8 @@ public:
     ~Receiver();
     bool start(const std::string& sourceIp = "");
     void stop();
+    uint64_t receiverId() const;
+    void setOffsetUs(int64_t us);
     void setOffsetMs(float ms);
     void resetOutputTiming();
     void addXruns(uint32_t count);
@@ -21,7 +23,6 @@ public:
     void render(float* stereo, int frames, int deviceRate, int64_t firstFrameUs,
                 bool realTimestamp);
     std::string statsJson();
-    std::string statsLine();
 
 private:
     struct State;
