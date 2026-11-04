@@ -300,7 +300,7 @@ struct Receiver::State {
                     packets.insert(std::move(node));
                     if (!haveAudio) {
                         firstAudioTime = playTime;
-                        lossBaseTime = playTime;
+                        lossBaseTime = static_cast<double>(playTime);
                         lossBaseSeq = seq;
                         haveAudio = true;
                     }
@@ -418,7 +418,7 @@ struct Receiver::State {
                     static_cast<int32_t>(it->second.seq - accountedSeq) > 0) {
                     accounted = true;
                     accountedSeq = lossBaseSeq = it->second.seq;
-                    lossBaseTime = it->first.first;
+                    lossBaseTime = static_cast<double>(it->first.first);
                 }
                 return;
             }

@@ -56,14 +56,21 @@ int main() {
 #else
     socklen_t peerSize = sizeof(peer);
 #endif
-    while (true) {
+    const auto receiverAddress = peer;
+    const auto clockDeadline = unison::monotonicUs() + 3'000'000;
+    while (receiver.statsJson().find("\"clockReady\":true") == std::string::npos) {
+        if (unison::monotonicUs() > clockDeadline) return 7;
+        fd_set readable; FD_ZERO(&readable); FD_SET(socketFd, &readable); timeval wait{0, 100000};
+        if (select(static_cast<int>(socketFd + 1), &readable, nullptr, nullptr, &wait) <= 0) continue;
         int n = static_cast<int>(recvfrom(socketFd, reinterpret_cast<char*>(ping.data()), static_cast<int>(ping.size()), 0,
             reinterpret_cast<sockaddr*>(&peer), &peerSize));
-        if (n >= 20 && ping[5] == 3) break;
-    }
-    std::array<unsigned char, 36> pong{}; put(pong.data(), unison::kMagic, 4); pong[4] = 1; pong[5] = 4;
+        if (n < 20 || ping[5] != 3 || peer.sin_port != receiverAddress.sin_port) continue;
+        std::array<unsigned char, 36> pong{}; put(pong.data(), unison::kMagic, 4); pong[4] = 1; pong[5] = 4;
     std::copy(ping.begin() + 8, ping.begin() + 20, pong.begin() + 8);
     put(pong.data() + 20, unison::monotonicUs(), 8); put(pong.data() + 28, unison::monotonicUs(), 8); send(pong);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    peer = receiverAddress;
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const int64_t play = unison::monotonicUs() + 1'000'000;
     std::array<unsigned char, 988> audio{}; put(audio.data(), unison::kMagic, 4); audio[4] = 1; audio[5] = 5;
