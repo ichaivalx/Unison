@@ -29,6 +29,9 @@ class MainActivity : Activity() {
     private lateinit var state: TextView
     private lateinit var sourceState: TextView
     private lateinit var message: TextView
+    private lateinit var calibration: TextView
+    private lateinit var calibrateButton: Button
+    private val delayButtons = mutableListOf<Button>()
     private var lastFramesWritten = -1L
     private val refresh = object : Runnable {
         override fun run() {
@@ -39,6 +42,11 @@ class MainActivity : Activity() {
             localDelay.text = "本机延迟：${PlaybackService.localDelayMs} ms（音效直通，无需本机接收）"
             logs.text = PlaybackService.sourceLog().ifEmpty { "音源进程输出（最近 20 行）" }
             message.text = if (PlaybackService.busy) "正在处理…" else PlaybackService.message
+            calibration.text = SourceController.calibrationText.ifEmpty {
+                "校准前请暂停其他播放，将平板放在能听到 PC 扬声器的位置。两阶段各 3 轮扫频，约 15 秒。"
+            }
+            calibrateButton.isEnabled = SourceController.isRunning && !SourceController.isCalibrating && !PlaybackService.busy
+            delayButtons.forEach { it.isEnabled = !SourceController.isCalibrating }
             val value = JSONObject(ReceiverEngine.statsJson())
             fun number(name: String) = String.format(Locale.US, "%.3f", value.optDouble(name, 0.0))
             val outputOpen = value.optBoolean("outputOpen")
@@ -90,15 +98,17 @@ class MainActivity : Activity() {
             setPadding(0, dp(8), 0, dp(8))
             root.addView(this)
         }
-        fun row(vararg items: Pair<String, () -> Unit>) {
+        fun row(vararg items: Pair<String, () -> Unit>): List<Button> {
             val layout = LinearLayout(this)
-            for ((text, action) in items) layout.addView(Button(this).apply {
+            val buttons = items.map { (text, action) -> Button(this).apply {
                 this.text = text
                 setTextColor(0xfff3f5f8.toInt())
                 backgroundTintList = ColorStateList.valueOf(0xff343c49.toInt())
                 setOnClickListener { action() }
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            } }
+            for (button in buttons) layout.addView(button, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             root.addView(layout)
+            return buttons
         }
         label("Unison", 28f)
         message = label("")
@@ -118,7 +128,7 @@ class MainActivity : Activity() {
             PlaybackService.latencyMs += ms
             if (SourceController.isRunning) command(PlaybackService.LATENCY)
         }
-        row("−50 ms" to { adjustLatency(-50) }, "−5 ms" to { adjustLatency(-5) },
+        delayButtons += row("−50 ms" to { adjustLatency(-50) }, "−5 ms" to { adjustLatency(-5) },
             "+5 ms" to { adjustLatency(5) }, "+50 ms" to { adjustLatency(50) })
         localDelay = label("")
         fun adjustLocalDelay(ms: Int) {
@@ -126,7 +136,9 @@ class MainActivity : Activity() {
             // 不经过正在等待 SOURCE_START 的服务队列，启动中也保存最新期望值。
             SourceController.setLocalDelay(PlaybackService.localDelayMs)
         }
-        row("−5 ms" to { adjustLocalDelay(-5) }, "+5 ms" to { adjustLocalDelay(5) })
+        delayButtons += row("−5 ms" to { adjustLocalDelay(-5) }, "+5 ms" to { adjustLocalDelay(5) })
+        calibrateButton = row("自动校准" to { command(PlaybackService.CALIBRATE) }).single()
+        calibration = label("", 14f).apply { setTextIsSelectable(true) }
         logs = label("", 12f).apply { typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
         setContentView(scroll)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)

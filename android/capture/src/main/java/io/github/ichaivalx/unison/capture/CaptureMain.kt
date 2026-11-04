@@ -69,6 +69,7 @@ object CaptureMain {
     private var channel: DatagramChannel? = null
     private var capture: PlaybackCapture? = null
     private var effect: EffectSource? = null
+    @Volatile private var calibration: AcousticCalibration? = null
 
     @JvmStatic private external fun installTerminationHandler(): Int
     @JvmStatic private external fun waitForTermination(): Int
@@ -119,11 +120,13 @@ object CaptureMain {
             thread(name = "source-stdin", isDaemon = true) {
                 runCatching {
                     System.`in`.bufferedReader().forEachLine { line ->
+                        if (line == "CALIBRATE") startCalibration()
                         if (line.startsWith("LOCAL_DELAY ")) {
                             runCatching {
                                 val ms = line.substringAfter(' ').toInt()
                                 require(ms >= 0)
                                 synchronized(lifecycle) {
+                                    check(calibration?.isRunning != true) { "校准期间不能调整延迟" }
                                     if (!closed) { effect?.setLocalDelay(ms); localDelayMs = ms }
                                 }
                                 println("INFO local_delay_ms=$ms")
@@ -417,8 +420,12 @@ object CaptureMain {
                         mixed[(destination + frame) * 2 + channel] += chunk.samples[(sourceFrame + frame) * 2 + channel]
                     }
                 }
+                val currentCalibration = calibration
+                currentCalibration?.onTap(startNs, mixed)
+                val silence = currentCalibration?.networkMuted == true
                 for (sample in mixed.indices) {
-                    val pcm = (mixed[sample] * 32768f).toInt().coerceIn(-32768, 32767)
+                    val pcm = if (silence) 0
+                        else (mixed[sample] * 32768f).toInt().coerceIn(-32768, 32767)
                     data.putShort(AUDIO_HEADER + sample * 2, pcm.toShort())
                 }
                 data.putInt(8, sequence++)
@@ -483,7 +490,7 @@ object CaptureMain {
                     send(udp, pong, sender, "pong_send")
                 }
                 6 -> subscribers.remove(sender)
-                7 -> if (sender.address.hostAddress == "127.0.0.1" && data.remaining() >= 4) latencyUs = data.int
+                7 -> if (sender.address.hostAddress == "127.0.0.1" && data.remaining() >= 4 && calibration?.isRunning != true) latencyUs = data.int
             }
         }
     }
@@ -523,6 +530,7 @@ object CaptureMain {
         if (closed) return@synchronized
         closed = true
         running = false
+        calibration?.cancel()
         // 先恢复本机路由，再关闭网络；不依赖阻塞中的录音线程主动返回。
         val restored = capture?.close() ?: true
         runCatching { effect?.close() }.onFailure { println("ERROR release_effect=${describe(it)}") }
@@ -534,6 +542,24 @@ object CaptureMain {
             udp.close()
         }
         println("STOPPED reason=$reason policy=${if (restored) "unregistered" else "unregister_failed"}")
+    }
+
+    private fun startCalibration() = synchronized(lifecycle) {
+        if (closed || calibration?.isRunning == true) return@synchronized
+        val source = effect
+        if (source == null) {
+            println("CALIBRATION " + org.json.JSONObject().put("state", "error").put("message", "请先启动 effect 音源"))
+            return@synchronized
+        }
+        calibration = AcousticCalibration(source, latencyUs, localDelayMs,
+            hasSubscribers = { subscribers.values.any { System.nanoTime() - it < SUBSCRIBE_TIMEOUT_NS } },
+            applySettings = { target, local ->
+                // 不获取 lifecycle；关闭线程会持 lifecycle 等待校准的 control 锁。
+                check(running) { "音源已停止" }
+                source.setLocalDelay(local)
+                localDelayMs = local
+                latencyUs = target
+            }).also { it.start() }
     }
 
     private fun fatal(failedStage: String, error: Throwable) {

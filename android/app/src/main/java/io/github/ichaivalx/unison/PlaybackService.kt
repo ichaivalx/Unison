@@ -26,6 +26,7 @@ class PlaybackService : Service() {
         const val SOURCE_START = "source.start"
         const val SOURCE_STOP = "source.stop"
         const val LATENCY = "source.latency"
+        const val CALIBRATE = "source.calibrate"
         const val STOP_ALL = "stop.all"
         @Volatile var receiverRunning = false
         @Volatile var busy = false
@@ -40,6 +41,13 @@ class PlaybackService : Service() {
         private val lines = ArrayDeque<String>()
         private fun log(line: String) = synchronized(lines) {
             android.util.Log.i("UnisonSource", line)
+            if (line.startsWith("CALIBRATION ")) runCatching {
+                val value = org.json.JSONObject(line.substringAfter(' '))
+                if (value.optString("state") == "result") {
+                    latencyMs = value.getInt("latencyUs") / 1000
+                    localDelayMs = value.getInt("localDelayMs")
+                }
+            }
             lines.addLast(line)
             while (lines.size > 20) lines.removeFirst()
         }
@@ -126,6 +134,7 @@ class PlaybackService : Service() {
                         }
                         SOURCE_STOP -> SourceController.stop()
                         LATENCY -> SourceController.setLatency(latencyMs)
+                        CALIBRATE -> SourceController.calibrate()
                         STOP_ALL -> {
                             try { SourceController.stop() } finally { stopReceiver() }
                         }

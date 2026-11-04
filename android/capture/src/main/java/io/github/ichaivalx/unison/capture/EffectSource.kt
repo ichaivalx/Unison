@@ -26,7 +26,10 @@ internal class EffectSource {
     private var excludeUid = -1
     @Volatile private var needsSessionLookup = false
     @Volatile private var unresolvedClients = emptySet<Pair<Int, Int>>()
+    @Volatile private var playingSessions = emptySet<Int>()
     @Volatile private var delayMs = 0
+    @Volatile private var outputMuted = false
+    @Volatile private var calibrationSession: Int? = null
     @Volatile private var deathReason: String? = null
     @Volatile private var closed = false
     private var healthThread: Thread? = null
@@ -135,6 +138,8 @@ internal class EffectSource {
             dump.waitFor()
         }
         unresolvedClients = unresolved
+        calibrationSession?.let { wanted[it] = android.os.Process.myUid() }
+        playingSessions = wanted.keys.toSet()
         synchronized(lock) {
             if (closed || deathReason != null) return@synchronized
             for (id in sessions.keys.toList()) if (id !in wanted) {
@@ -150,6 +155,7 @@ internal class EffectSource {
                     instance = constructor.newInstance(UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8201"),
                         UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, id)
                     check(setParameter.invoke(instance, 1, delayMs) == AudioEffect.SUCCESS) { "Cannot set local delay" }
+                    if (outputMuted) check(setParameter.invoke(instance, 2, 1) == AudioEffect.SUCCESS) { "Cannot mute local effect" }
                     check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
                     sessions[id] = Session(uid, id, instance)
                     println("INFO effect_attached uid=$uid session=$id local_delay_ms=$delayMs")
@@ -173,6 +179,27 @@ internal class EffectSource {
         }
     }
 
+    fun supportsUnprocessedMic(): Boolean = manager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
+
+    fun setCalibrationSession(id: Int?) {
+        calibrationSession = id
+        if (!closed && ::handler.isInitialized) handler.post { refresh() }
+    }
+
+    fun setOutputMuted(muted: Boolean) = synchronized(lock) {
+        outputMuted = muted
+        if (closed || deathReason != null || factory?.isBinderAlive != true) return@synchronized
+        try {
+            for (session in sessions.values) check(setParameter.invoke(session.effect, 2, if (muted) 1 else 0) == AudioEffect.SUCCESS) {
+                "Cannot change local mute session=${session.id}"
+            }
+        } catch (error: Exception) {
+            // 恢复失败则结束音源，通过释放效果恢复原路播放，不能留下持续静音。
+            if (!muted) deathReason = "Cannot restore local output: ${error.cause ?: error}"
+            throw error
+        }
+    }
+
     fun acceptStream(session: Int, io: Int): Boolean = synchronized(lock) {
         val entry = sessions[session] ?: return@synchronized false
         entry.io = io
@@ -181,9 +208,12 @@ internal class EffectSource {
 
     fun activeSessions(): Set<Int> = synchronized(lock) { sessions.keys.toSet() }
 
+    fun hasOtherPlayback(except: Int? = null): Boolean = playingSessions.any { it != except } || unresolvedClients.isNotEmpty()
+
     fun status(): String = synchronized(lock) {
         "sessions=[${sessions.values.joinToString(",") { "${it.uid}/${it.id}/io:${it.io ?: "pending"}" }}] " +
             "attach_failed=[${failed.joinToString(",")}] " +
+            "local_muted=$outputMuted " +
             "session_lookup_pending=[${unresolvedClients.joinToString(",") { "${it.first}/${it.second}" }}]"
     }
 
@@ -201,6 +231,7 @@ internal class EffectSource {
 
     private fun release(session: Session) {
         if (deathReason == null && factory?.isBinderAlive == true) {
+            if (outputMuted) runCatching { setParameter.invoke(session.effect, 2, 0) }
             try { session.effect.setEnabled(false) } finally { session.effect.release() }
         }
     }

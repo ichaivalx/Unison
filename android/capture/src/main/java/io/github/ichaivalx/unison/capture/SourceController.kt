@@ -13,6 +13,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
+import org.json.JSONObject
+import java.util.Locale
 
 object SourceController {
     @Volatile private var process: java.lang.Process? = null
@@ -20,6 +22,10 @@ object SourceController {
     @Volatile private var rootPid = 0
     @Volatile private var output: ((String) -> Unit)? = null
     @Volatile private var localDelayMs = 0
+    @Volatile var isCalibrating = false
+        private set
+    @Volatile var calibrationText = ""
+        private set
     private val commands = Executors.newSingleThreadExecutor { task ->
         Thread(task, "source-commands").apply { isDaemon = true }
     }
@@ -29,6 +35,7 @@ object SourceController {
     fun start(context: Context, latencyMs: Int, onLine: (String) -> Unit): Boolean {
         if (isRunning) return true
         stop()
+        calibrationText = ""
         output = onLine
         val apk = context.applicationInfo.sourceDir
         val extracted = File(context.applicationInfo.nativeLibraryDir, "libunison_capture.so")
@@ -60,6 +67,9 @@ object SourceController {
             try {
                 child.inputStream.bufferedReader().useLines { lines ->
                     lines.forEach { line ->
+                        if (process === child && line.startsWith("CALIBRATION ")) {
+                            runCatching { calibrationLine(JSONObject(line.substringAfter(' '))) }
+                        }
                         if (process === child && line.startsWith("PROCESS pid=")) {
                             rootPid = line.substringAfter("PROCESS pid=").toIntOrNull() ?: 0
                         }
@@ -76,7 +86,7 @@ object SourceController {
             } finally {
                 startup.countDown()
                 // 不取 start/stop 的锁，避免等待子进程退出时互相阻塞。
-                if (process === child) ready = false
+                if (process === child) { ready = false; isCalibrating = false }
             }
         }
         val started = try {
@@ -99,6 +109,8 @@ object SourceController {
     @Synchronized
     fun stop() {
         val child = process ?: return
+        if (isCalibrating) calibrationText += "\n校准已停止"
+        isCalibrating = false
         ready = false
         runCatching { child.outputStream.close() }
         try {
@@ -120,6 +132,7 @@ object SourceController {
 
     /** 运行中调整目标延迟。 */
     fun setLatency(latencyMs: Int) {
+        if (isCalibrating) return
         val current = process ?: return
         commands.execute {
             if (process !== current || !isRunning) return@execute
@@ -141,6 +154,7 @@ object SourceController {
     /** 本机效果直通的延迟，不改变网络目标延迟。 */
     fun setLocalDelay(ms: Int) {
         require(ms >= 0) { "本机延迟不能为负数" }
+        if (isCalibrating) return
         localDelayMs = ms
         val current = process ?: return
         enqueueLocalDelay(current)
@@ -153,6 +167,36 @@ object SourceController {
                 current.outputStream.write("LOCAL_DELAY $localDelayMs\n".toByteArray(Charsets.UTF_8))
                 current.outputStream.flush()
             }.onFailure { if (isRunning) output?.invoke("ERROR local_delay: ${it.message}") }
+        }
+    }
+
+    fun calibrate() {
+        val current = process ?: return
+        if (!isRunning || isCalibrating) return
+        isCalibrating = true
+        calibrationText = "正在校准：请暂停其他播放，让 PC 扬声器声音能传到平板麦克风。"
+        commands.execute {
+            if (process !== current || !isRunning) { isCalibrating = false; return@execute }
+            runCatching {
+                current.outputStream.write("CALIBRATE\n".toByteArray(Charsets.UTF_8))
+                current.outputStream.flush()
+            }.onFailure { isCalibrating = false; calibrationText = "校准启动失败：${it.message}" }
+        }
+    }
+
+    private fun calibrationLine(value: JSONObject) {
+        fun ms(key: String) = String.format(Locale.ROOT, "%.2f", value.getDouble(key))
+        when (value.getString("state")) {
+            "begin" -> { isCalibrating = true; calibrationText = "校准中：请保持设备位置不变。" }
+            "phase" -> calibrationText += "\n${value.getString("message")}"
+            "round" -> calibrationText += "\n${value.getString("stage")} 第${value.getInt("round")}轮：${ms("offsetMs")} ms"
+            "result" -> {
+                localDelayMs = value.getInt("localDelayMs")
+                val later = if (value.getDouble("deltaMs") >= 0) "PC 更晚" else "平板更晚"
+                calibrationText += "\nΔ ${ms("deltaMs")} ms（$later）\n已采用：本机 $localDelayMs ms，目标 ${value.getInt("latencyUs") / 1000} ms"
+            }
+            "error" -> calibrationText += "\n校准失败：${value.getString("message")}（未写入补偿）"
+            "restored" -> isCalibrating = false
         }
     }
 

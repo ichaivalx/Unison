@@ -34,6 +34,7 @@ constexpr uint32_t kMqChanged = 1u << 10;
 constexpr uint32_t kStatusNotFull = 0x01;
 constexpr uint32_t kStatusNotEmpty = 0x02;
 constexpr int kDelayParameter = 1;
+constexpr int kMuteParameter = 2;
 int64_t nowNs() { timespec t{}; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000LL + t.tv_nsec; }
 AudioUuid typeUuid() { return {static_cast<int32_t>(0x8e2581c2), 0x3d9a, 0x4e15, 0xa77a, {0x61,0x7f,0x6f,0x9e,0x82,0x01}}; }
 AudioUuid implUuid() { auto u = typeUuid(); u.node.back() = 2; return u; }
@@ -140,9 +141,10 @@ public:
                 return error("invalid parameter id");
             uint32_t key = 0;
             memcpy(&key, blob->bytes.data() + 12, 4);
-            if (key != kDelayParameter) return error("unknown parameter");
+            if (key != kDelayParameter && key != kMuteParameter) return error("unknown parameter");
             blob->bytes.resize(20);
-            const int32_t values[] = {0, 4, 4, kDelayParameter, delayMs_.load()};
+            const int32_t values[] = {0, 4, 4, static_cast<int32_t>(key),
+                key == kDelayParameter ? delayMs_.load() : (muted_.load() ? 1 : 0)};
             memcpy(blob->bytes.data(), values, sizeof(values));
             VendorExtension extension;
             extension.extension.setParcelable(*blob);
@@ -223,8 +225,10 @@ private:
         if (specific.get<Parameter::Specific::vendorEffect>().extension.getParcelable(&blob) != STATUS_OK || !blob || blob->bytes.size() < 20)
             return error("invalid vendor parameter");
         int32_t fields[5]; memcpy(fields, blob->bytes.data(), sizeof(fields));
-        if (fields[1] != 4 || fields[2] != 4 || fields[3] != kDelayParameter) return error("unknown vendor parameter");
-        scheduleDelay(fields[4]);
+        if (fields[1] != 4 || fields[2] != 4) return error("invalid vendor parameter size");
+        if (fields[3] == kDelayParameter) scheduleDelay(fields[4]);
+        else if (fields[3] == kMuteParameter) muted_ = fields[4] != 0;
+        else return error("unknown vendor parameter");
         return ScopedAStatus::ok();
     }
     void stopWorker() {
@@ -242,6 +246,7 @@ private:
         collectRetired();
         state_ = State::INIT;
         frames_ = 0; droppedFrames_ = 0; droppedBatches_ = 0; delayMs_ = 0;
+        muted_ = false;
     }
     void process() noexcept {
         if (setpriority(PRIO_PROCESS, 0, -16) != 0)
@@ -279,6 +284,8 @@ private:
                     if (++line.position == line.data.size()) line.position = 0;
                 }
             }
+            // 静音在 tap 与延迟线之后，仍连续处理和上报同样的帧。
+            if (muted_.load()) std::fill_n(work_.data(), n, 0.0f);
             output_->write(work_.data(), n);
             const IEffect::Status result{0, static_cast<int32_t>(n), static_cast<int32_t>(n)};
             // audioserver 先写 input/wake data-ready，再 readBlocking(status)，最后读 output。
@@ -297,6 +304,7 @@ private:
     int socket_ = -1;
     uint64_t streamId_ = 0, frames_ = 0, droppedFrames_ = 0, droppedBatches_ = 0;
     std::atomic<int32_t> delayMs_{0};
+    std::atomic<bool> muted_{false};
     std::atomic<DelayLine*> pending_{nullptr}, retired_{nullptr};
     DelayLine* activeDelay_ = nullptr;
 };
