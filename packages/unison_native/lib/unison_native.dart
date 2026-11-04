@@ -5,6 +5,9 @@
 library;
 
 import 'dart:async';
+import 'dart:ffi' as ffi;
+import 'dart:io';
+import 'package:flutter/services.dart';
 
 /// 接收端统计（约每秒 4 次）。
 class ReceiverStats {
@@ -146,72 +149,63 @@ class MediaState {
 enum MediaCommand { play, pause, next, previous }
 
 abstract final class UnisonNative {
-  /// 本机单调时钟（微秒），与原生侧时间戳同一时钟
-  static int get monotonicUs => throw UnimplementedError();
-
-  // ---- 接收端（Android、Windows）----
-
-  /// 本机接收端 id（进程内固定），音源端用它识别订阅者
-  static Future<int> receiverId() => throw UnimplementedError();
-
-  /// 开始接收 [sourceHost] 的音频；Android 上同时进入前台服务
-  static Future<void> startReceiver({required String sourceHost}) => throw UnimplementedError();
-
-  static Future<void> stopReceiver() => throw UnimplementedError();
-
-  /// 本机偏移：正值更晚发声
-  static Future<void> setReceiverOffsetUs(int offsetUs) => throw UnimplementedError();
-
-  static Stream<ReceiverStats> get receiverStats => throw UnimplementedError();
-
-  /// Windows：可选输出设备名列表；Android 抛出 UnsupportedError
-  static Future<List<String>> outputDevices() => throw UnimplementedError();
-
-  /// Windows：选择输出设备，null 表示跟随系统默认
-  static Future<void> setOutputDevice(String? name) => throw UnimplementedError();
-
-  // ---- 本机音量 ----
-
-  /// Android：系统媒体音量；Windows：Unison 自身输出音量
-  static Future<double> volume() => throw UnimplementedError();
-
-  static Future<void> setVolume(double volume) => throw UnimplementedError();
-
-  /// 音量变化（含用户按音量键）
-  static Stream<double> get volumeChanges => throw UnimplementedError();
-
-  // ---- 音源（仅已 root 的 Android）----
-
-  /// root 可用且音效模块已生效
-  static Future<bool> sourceAvailable() => throw UnimplementedError();
-
-  /// 启动音源；Android 上同时进入前台服务
+  static const _methods = MethodChannel('unison_native/methods');
+  static final _events = const EventChannel('unison_native/events').receiveBroadcastStream().cast<Map>();
+  static final _clock = ffi.DynamicLibrary.open(Platform.isAndroid ? 'libunison.so' : 'unison_native_plugin.dll')
+      .lookupFunction<ffi.Int64 Function(), int Function()>('unison_monotonic_us');
+  static int get monotonicUs => _clock();
+  static Future<T> _call<T>(String method, [Object? args]) async {
+    try { return (await _methods.invokeMethod<T>(method, args)) as T; }
+    on PlatformException catch (e) { if (e.code == 'unsupported') throw UnsupportedError(e.message ?? method); rethrow; }
+  }
+  static Stream<dynamic> _stream(String type) => _events.where((e) => e['type'] == type).map((e) => e['data']);
+  static Future<int> receiverId() => _call<int>('receiverId');
+  static Future<void> startReceiver({required String sourceHost}) => _call<void>('startReceiver', {'sourceHost': sourceHost});
+  static Future<void> stopReceiver() => _call<void>('stopReceiver');
+  static Future<void> setReceiverOffsetUs(int offsetUs) => _call<void>('setReceiverOffsetUs', offsetUs);
+  static Stream<ReceiverStats> get receiverStats => _stream('receiver').map((dynamic e) => ReceiverStats(
+    running: e['running'] == true, sourceHost: e['sourceHost'] as String?, clockReady: e['clockReady'] == true,
+    syncErrorUs: (e['syncErrorUs'] as num?)?.round() ?? 0, bufferUs: (e['bufferUs'] as num?)?.round() ?? 0,
+    rttUs: (e['rttUs'] as num?)?.round() ?? 0, lostPackets: (e['lostPackets'] as num?)?.toInt() ?? 0,
+    latePackets: (e['latePackets'] as num?)?.toInt() ?? 0, xruns: (e['xruns'] as num?)?.toInt() ?? 0,
+    speedPpm: (e['speedPpm'] as num?)?.toDouble() ?? 0, realTimestamp: e['realTimestamp'] == true,
+    outputDevice: e['outputDevice'] as String? ?? ''));
+  static Future<List<String>> outputDevices() async => (await _call<List<Object?>>('outputDevices')).cast<String>();
+  static Future<void> setOutputDevice(String? name) => _call<void>('setOutputDevice', name);
+  static Future<double> volume() async => (await _call<num>('volume')).toDouble();
+  static Future<void> setVolume(double volume) => _call<void>('setVolume', volume);
+  static Stream<double> get volumeChanges => _stream('volume').map((dynamic e) => (e as num).toDouble());
+  static Future<bool> sourceAvailable() => _call<bool>('sourceAvailable');
   static Future<void> startSource({required int latencyUs, required int localDelayUs}) =>
-      throw UnimplementedError();
-
-  static Future<void> stopSource() => throw UnimplementedError();
-
-  static Future<void> setSourceLatencyUs(int latencyUs) => throw UnimplementedError();
-
-  static Future<void> setLocalDelayUs(int localDelayUs) => throw UnimplementedError();
-
-  static Stream<SourceStatus> get sourceStatus => throw UnimplementedError();
-
-  /// 对 [receiverIds] 逐台与本机做声学测量；期间暂停转发正常音频。可用 [cancelCalibration] 中止
-  static Future<CalibrationResult> calibrate({
-    required List<int> receiverIds,
-    required List<CalibrationBand> bands,
-    required void Function(CalibrationProgress progress) onProgress,
-  }) => throw UnimplementedError();
-
-  static Future<void> cancelCalibration() => throw UnimplementedError();
-
-  // ---- 媒体控制（音源设备上）----
-
-  /// 当前媒体会话，无会话时为 null
-  static Stream<MediaState?> get mediaState => throw UnimplementedError();
-
-  static Future<void> mediaCommand(MediaCommand command) => throw UnimplementedError();
-
-  static Future<void> mediaSeek(int positionUs) => throw UnimplementedError();
+      _call<void>('startSource', {'latencyUs': latencyUs, 'localDelayUs': localDelayUs});
+  static Future<void> stopSource() => _call<void>('stopSource');
+  static Future<void> setSourceLatencyUs(int latencyUs) => _call<void>('setSourceLatencyUs', latencyUs);
+  static Future<void> setLocalDelayUs(int localDelayUs) => _call<void>('setLocalDelayUs', localDelayUs);
+  static Stream<SourceStatus> get sourceStatus => _stream('source').map((dynamic e) => SourceStatus(
+    running: e['running'] == true, latencyUs: (e['latencyUs'] as num?)?.toInt() ?? 50000,
+    localDelayUs: (e['localDelayUs'] as num?)?.toInt() ?? 0,
+    sessions: ((e['sessions'] as List?) ?? []).map((dynamic s) => CapturedSession(uid: (s['uid'] as num).toInt(),
+      packageName: s['packageName'] as String?, sessionId: (s['sessionId'] as num).toInt())).toList(),
+    receiverIds: ((e['receiverIds'] as List?) ?? []).cast<int>(), error: e['error'] as String?));
+  static Future<CalibrationResult> calibrate({required List<int> receiverIds, required List<CalibrationBand> bands,
+    required void Function(CalibrationProgress progress) onProgress}) async {
+    final subscription = _stream('calibration').listen((dynamic e) => onProgress(CalibrationProgress(
+      step: (e['step'] as num).toInt(), totalSteps: (e['totalSteps'] as num).toInt(), description: e['description'] as String)));
+    try {
+      final result = await _call<Map<Object?, Object?>>('calibrate', {'receiverIds': receiverIds, 'bands': bands.map((b) => b.name).toList()});
+      List<BandMeasurement> measurements(dynamic rows) => (rows as List).map((dynamic m) => BandMeasurement(
+        band: CalibrationBand.values.byName(m['band'] as String), arrivalUs: (m['arrivalUs'] as num?)?.toInt(),
+        spreadUs: (m['spreadUs'] as num?)?.toInt(), rounds: (m['rounds'] as num).toInt())).toList();
+      return CalibrationResult(local: measurements(result['local']), receivers: {
+        for (final entry in (result['receivers'] as Map).entries) int.parse(entry.key.toString()): measurements(entry.value)});
+    } finally { await subscription.cancel(); }
+  }
+  static Future<void> cancelCalibration() => _call<void>('cancelCalibration');
+  static Stream<MediaState?> get mediaState => _stream('media').map((dynamic e) => e == null ? null : MediaState(
+    packageName: e['packageName'] as String, title: e['title'] as String?, artist: e['artist'] as String?,
+    durationUs: (e['durationUs'] as num?)?.toInt(), positionUs: (e['positionUs'] as num).toInt(),
+    positionUpdatedAtUs: (e['positionUpdatedAtUs'] as num).toInt(), speed: (e['speed'] as num).toDouble(),
+    playing: e['playing'] == true, canSeek: e['canSeek'] == true));
+  static Future<void> mediaCommand(MediaCommand command) => _call<void>('mediaCommand', command.name);
+  static Future<void> mediaSeek(int positionUs) => _call<void>('mediaSeek', positionUs);
 }

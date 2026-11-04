@@ -1,0 +1,31 @@
+name: Native
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  effect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - run: sdkmanager 'build-tools;36.0.0' 'ndk;30.0.16248370' 'cmake;4.1.2'
+      - run: python3 native/android/effect/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unison-tap-ksu
+          path: native/android/effect/build/unison-tap-ksu.zip
+  core:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S native/core -B out/core
+      - run: cmake --build out/core --config Release

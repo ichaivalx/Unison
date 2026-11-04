@@ -1,0 +1,7 @@
+package io.github.ichaivalx.unison.nativebridge
+import android.app.Service
+import android.content.Intent
+import android.os.IBinder
+class AudioService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+}

@@ -225,3 +225,5 @@ extern "C" JNIEXPORT void JNICALL
 Java_io_github_ichaivalx_unison_ReceiverEngine_setLocalSourceRunning(JNIEnv*, jobject, jboolean running) {
     engine.setLocalSourceRunning(running == JNI_TRUE);
 }
+
+extern "C" __attribute__((visibility("default"))) int64_t unison_monotonic_us() { return unison::monotonicUs(); }

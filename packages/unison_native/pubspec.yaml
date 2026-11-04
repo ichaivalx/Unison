@@ -1,0 +1,18 @@
+name: unison_native
+description: Unison Android and Windows native audio capabilities.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ^3.13.0
+  flutter: '>=3.47.8'
+dependencies:
+  flutter:
+    sdk: flutter
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: io.github.ichaivalx.unison.nativebridge
+        pluginClass: UnisonNativePlugin
+      windows:
+        pluginClass: UnisonNativePluginCApi

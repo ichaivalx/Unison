@@ -1,0 +1,2 @@
+-keep class io.github.ichaivalx.unison.capture.** { *; }
+-keep class io.github.ichaivalx.unison.ReceiverEngine { *; }
