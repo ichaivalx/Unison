@@ -124,6 +124,7 @@ class CalibrationProgress {
 class MediaState {
   const MediaState({
     required this.packageName,
+    required this.appName,
     required this.title,
     required this.artist,
     required this.durationUs,
@@ -135,6 +136,9 @@ class MediaState {
   });
 
   final String packageName;
+
+  /// 来源 App 的显示名称；无法读取时为包名。
+  final String appName;
   final String? title;
   final String? artist;
   final int? durationUs;
@@ -224,7 +228,7 @@ abstract final class UnisonNative {
   }
   static Future<void> cancelCalibration() => _call<void>('cancelCalibration');
   static Stream<MediaState?> get mediaState => _stream('media').map((dynamic e) => e == null ? null : MediaState(
-    packageName: e['packageName'] as String, title: e['title'] as String?, artist: e['artist'] as String?,
+    packageName: e['packageName'] as String, appName: e['appName'] as String, title: e['title'] as String?, artist: e['artist'] as String?,
     durationUs: (e['durationUs'] as num?)?.toInt(), positionUs: (e['positionUs'] as num).toInt(),
     positionUpdatedAtUs: (e['positionUpdatedAtUs'] as num).toInt(), speed: (e['speed'] as num).toDouble(),
     playing: e['playing'] == true, canSeek: e['canSeek'] == true));

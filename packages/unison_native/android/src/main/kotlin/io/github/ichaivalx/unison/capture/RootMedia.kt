@@ -12,6 +12,7 @@ import org.json.JSONObject
 
 internal class RootMedia(context: Context) {
     private val manager = context.getSystemService(MediaSessionManager::class.java)
+    private val packages = context.packageManager
     private val thread = HandlerThread("root-media").apply { start() }
     private val handler = Handler(thread.looper)
     @Volatile private var controller: MediaController? = null
@@ -39,6 +40,9 @@ internal class RootMedia(context: Context) {
         val metadata = active?.metadata
         val value = if (active == null || state == null) null else JSONObject()
             .put("packageName", active.packageName)
+            .put("appName", runCatching {
+                packages.getApplicationInfo(active.packageName, 0).loadLabel(packages).toString().ifBlank { active.packageName }
+            }.getOrDefault(active.packageName))
             .put("title", metadata?.getString(MediaMetadata.METADATA_KEY_TITLE) ?: JSONObject.NULL)
             .put("artist", metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: JSONObject.NULL)
             .put("durationUs", metadata?.takeIf { it.containsKey(MediaMetadata.METADATA_KEY_DURATION) }
