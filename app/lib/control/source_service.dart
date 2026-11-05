@@ -53,6 +53,15 @@ class _Peer {
   /// 设置已生效且同步误差持续在阈值内的起始时刻
   int? stableSince;
 
+  /// 已收到确认当前设置生效的回报；其后回报的统计才是生效之后的
+  bool confirmed = false;
+
+  /// 设置变化或断线后清空稳定记录，从新设置生效之后重新计时
+  void resetStability() {
+    stableSince = null;
+    confirmed = false;
+  }
+
   Map<String, Object?> toJson() => {
     'name': name,
     'platform': platform.name,
@@ -161,7 +170,8 @@ class SourceService implements Console {
     for (final peer in _peers.values) {
       peer
         ..connection = null
-        ..stats = null;
+        ..stats = null
+        ..resetStability();
     }
     _publish();
     await _transport.dispose();
@@ -249,6 +259,7 @@ class SourceService implements Console {
     await _transport.start();
     _publish();
     UnisonNative.volume().then((volume) {
+      _volumes.isUser(volume);
       _volume = volume;
       _publish();
     }, onError: (_) {});
@@ -336,14 +347,22 @@ class SourceService implements Console {
             ..reportedReceiving = message['receiving'] == true
             ..reportedOffsetUs = (message['offsetUs'] as num?)?.toInt()
             ..reportedVolume = (message['appliedVolume'] as num?)?.toDouble();
-          final stats = peer.stats;
-          final stable =
-              _synced(peer) &&
-              stats != null &&
-              stats.running &&
-              stats.clockReady &&
-              stats.syncErrorUs.abs() <= _stableErrorUs;
-          peer.stableSince = stable ? (peer.stableSince ?? nowUs) : null;
+          if (!_synced(peer)) {
+            peer.resetStability();
+          } else if (!peer.confirmed) {
+            // 确认生效的这次回报所带统计可能仍是生效之前的，从下一次回报开始计
+            peer
+              ..confirmed = true
+              ..stableSince = null;
+          } else {
+            final stats = peer.stats;
+            final stable =
+                stats != null &&
+                stats.running &&
+                stats.clockReady &&
+                stats.syncErrorUs.abs() <= _stableErrorUs;
+            peer.stableSince = stable ? (peer.stableSince ?? nowUs) : null;
+          }
           _publish();
         }
       case MessageType.localVolume:
@@ -388,7 +407,7 @@ class SourceService implements Console {
       ..reportedReceiving = null
       ..reportedOffsetUs = null
       ..reportedVolume = null
-      ..stableSince = null;
+      ..resetStability();
     _links[connection] = peer;
     _savePeers();
     _publish(immediate: true);
@@ -400,7 +419,8 @@ class SourceService implements Console {
     _boosted.remove(peer.id);
     peer
       ..connection = null
-      ..stats = null;
+      ..stats = null
+      ..resetStability();
     _publish();
   }
 
@@ -798,6 +818,7 @@ class SourceService implements Console {
       });
       // 以设备回报的实际状态为准：未生效的定期重发
       if (apply == peer.applied && (_synced(peer) || now - peer.appliedAt < _retryUs)) continue;
+      if (apply != peer.applied) peer.resetStability();
       peer
         ..applied = apply
         ..appliedAt = now;

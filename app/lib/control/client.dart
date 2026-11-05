@@ -47,6 +47,7 @@ class ConsoleClient implements Console {
     onMessage: _onMessage,
     onDisconnected: () {
       _connected.value = false;
+      _session++;
       _restoreBoost();
     },
     onSource: (source) => LocalSettings.lastSource = source,
@@ -77,6 +78,9 @@ class ConsoleClient implements Console {
   Future<void> _applying = Future.value();
   bool _busy = false;
 
+  /// 控制连接的代次：断开或退出时递增，旧连接上待执行和执行中的设置随之作废
+  int _session = 0;
+
   /// 用户从通知退出后，尚待音源确认关闭本机接收开关
   bool _receiveOffPending = false;
 
@@ -101,7 +105,9 @@ class ConsoleClient implements Console {
       } catch (_) {}
     }
     try {
-      _volume = await UnisonNative.volume();
+      final volume = await UnisonNative.volume();
+      _volumes.isUser(volume);
+      _volume = volume;
     } catch (_) {}
   }
 
@@ -125,6 +131,7 @@ class ConsoleClient implements Console {
   Future<void> _exit() async {
     if (_exited) return;
     _exited = true;
+    _session++;
     _clearReceiver();
     // 未送达时重连后补发，确认前不按旧设置重新接收
     _receiveOffPending = true;
@@ -172,57 +179,71 @@ class ConsoleClient implements Console {
         }
       case MessageType.apply:
         final host = _transport.connection?.address;
-        if (host != null) _applying = _applying.then((_) => _apply(message, host));
+        final session = _session;
+        if (host != null) _applying = _applying.then((_) => _apply(message, host, session));
     }
   }
 
-  /// 按下发的设置调用原生；只在调用成功后更新实际状态，失败的由音源按回报重发
-  Future<void> _apply(Message message, String host) async {
+  /// 按下发的设置调用原生；只在调用成功后更新实际状态，失败的由音源按回报重发。
+  /// 所属连接已断开（[session] 过期）时不再执行后续步骤，也不更新状态：断开时的恢复
+  /// 之后不会再有旧设置调高音量
+  Future<void> _apply(Message message, String host, int session) async {
+    bool stale() => session != _session;
+    if (stale()) return;
     _busy = true;
-    final receive = message['receive'] == true;
-    // 退出后，等音源确认关闭前不再按旧设置启动
-    if (!receive) _receiveOffPending = false;
-    if (receive && !_receiveOffPending) {
-      if (!_receiverOn || _receiverHost != host) {
-        // 换音源地址时原生先停旧流：新流启动成功前按未接收回报，失败由音源重发
-        _clearReceiver();
+    try {
+      final receive = message['receive'] == true;
+      // 退出后，等音源确认关闭前不再按旧设置启动
+      if (!receive) _receiveOffPending = false;
+      if (receive && !_receiveOffPending) {
+        if (!_receiverOn || _receiverHost != host) {
+          // 换音源地址时原生先停旧流：新流启动成功前按未接收回报，失败由音源重发
+          _clearReceiver();
+          try {
+            await UnisonNative.startReceiver(sourceHost: host);
+            if (stale()) return;
+            _receiverOn = true;
+            _receiverHost = host;
+            _offsetUs = null;
+            _startedAt = nowUs;
+          } catch (_) {}
+        }
+        if (_receiverOn && !stale()) {
+          if (message['offsetUs'] case final int offset when offset != _offsetUs) {
+            try {
+              await UnisonNative.setReceiverOffsetUs(offset);
+              if (stale()) return;
+              _offsetUs = offset;
+            } catch (_) {}
+          }
+        }
+      } else if (_receiverOn) {
         try {
-          await UnisonNative.startReceiver(sourceHost: host);
-          _receiverOn = true;
-          _receiverHost = host;
-          _offsetUs = null;
-          _startedAt = nowUs;
+          await UnisonNative.stopReceiver();
+          _clearReceiver();
         } catch (_) {}
       }
-      if (_receiverOn) {
-        if (message['offsetUs'] case final int offset when offset != _offsetUs) {
+      if (stale()) return;
+      if (message['volume'] case final num value) {
+        final volume = value.toDouble();
+        // 快照在调高之前同步建立，断开时的恢复总排在这次设定之后
+        if (message['boost'] != true) {
+          _boostFrom = null;
+        } else {
+          _boostFrom ??= _volume;
+        }
+        if (volume != _targetVolume) {
           try {
-            await UnisonNative.setReceiverOffsetUs(offset);
-            _offsetUs = offset;
+            final actual = await _volumes.set(volume);
+            if (stale()) return;
+            _volume = actual;
+            _targetVolume = volume;
           } catch (_) {}
         }
       }
-    } else if (_receiverOn) {
-      try {
-        await UnisonNative.stopReceiver();
-        _clearReceiver();
-      } catch (_) {}
+    } finally {
+      _busy = false;
     }
-    if (message['volume'] case final num value) {
-      final volume = value.toDouble();
-      if (message['boost'] != true) {
-        _boostFrom = null;
-      } else {
-        _boostFrom ??= _volume;
-      }
-      if (volume != _targetVolume) {
-        try {
-          _volume = await _volumes.set(volume);
-          _targetVolume = volume;
-        } catch (_) {}
-      }
-    }
-    _busy = false;
     _report();
   }
 
