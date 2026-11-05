@@ -62,8 +62,9 @@ class ConsoleClient implements Console {
   /// 无时钟样本时，按收到状态的时刻估计的音源时钟差
   int _fallbackOffsetUs = 0;
 
-  /// 以下为原生调用成功后的实际状态
-  bool _receiverOn = false;
+  /// 以下为原生调用后的实际状态：调用成功即记录（所属连接已断开也记录），结果拿不准时
+  /// 为 null（未知），按未生效回报，下次下发时重新调用核对
+  bool? _receiverOn = false;
   String? _receiverHost;
   int? _offsetUs;
   double? _targetVolume;
@@ -184,9 +185,9 @@ class ConsoleClient implements Console {
     }
   }
 
-  /// 按下发的设置调用原生；只在调用成功后更新实际状态，失败的由音源按回报重发。
-  /// 所属连接已断开（[session] 过期）时不再执行后续步骤，也不更新状态：断开时的恢复
-  /// 之后不会再有旧设置调高音量
+  /// 按下发的设置调用原生，失败的由音源按回报重发。所属连接已断开（[session] 过期）
+  /// 时不再执行后续步骤，但已完成的原生调用照常记录实际状态，重连后据此核对；断开时
+  /// 的恢复之后不会再有旧设置调高音量
   Future<void> _apply(Message message, String host, int session) async {
     bool stale() => session != _session;
     if (stale()) return;
@@ -196,34 +197,41 @@ class ConsoleClient implements Console {
       // 退出后，等音源确认关闭前不再按旧设置启动
       if (!receive) _receiveOffPending = false;
       if (receive && !_receiveOffPending) {
-        if (!_receiverOn || _receiverHost != host) {
-          // 换音源地址时原生先停旧流：新流启动成功前按未接收回报，失败由音源重发
+        if (_receiverOn != true || _receiverHost != host) {
+          // 换音源地址时原生先停旧流：新流启动成功前按未接收回报
           _clearReceiver();
           try {
             await UnisonNative.startReceiver(sourceHost: host);
-            if (stale()) return;
             _receiverOn = true;
             _receiverHost = host;
-            _offsetUs = null;
             _startedAt = nowUs;
-          } catch (_) {}
+          } catch (_) {
+            // 旧流是否已停拿不准
+            _receiverOn = null;
+          }
+          // 启动期间用户已退出：按退出停下这次启动的接收
+          if (_exited && _receiverOn != false) {
+            await _stopReceiver();
+            return;
+          }
+          if (stale()) return;
         }
-        if (_receiverOn && !stale()) {
+        if (_receiverOn == true) {
           if (message['offsetUs'] case final int offset when offset != _offsetUs) {
             try {
               await UnisonNative.setReceiverOffsetUs(offset);
-              if (stale()) return;
-              _offsetUs = offset;
-            } catch (_) {}
+              // 期间已因退出停止接收的不再记录
+              if (_receiverOn == true) _offsetUs = offset;
+            } catch (_) {
+              _offsetUs = null;
+            }
+            if (stale()) return;
           }
         }
-      } else if (_receiverOn) {
-        try {
-          await UnisonNative.stopReceiver();
-          _clearReceiver();
-        } catch (_) {}
+      } else if (_receiverOn != false) {
+        await _stopReceiver();
+        if (stale()) return;
       }
-      if (stale()) return;
       if (message['volume'] case final num value) {
         final volume = value.toDouble();
         // 快照在调高之前同步建立，断开时的恢复总排在这次设定之后
@@ -235,16 +243,31 @@ class ConsoleClient implements Console {
         if (volume != _targetVolume) {
           try {
             final actual = await _volumes.set(volume);
-            if (stale()) return;
+            if (stale()) {
+              // 断开时的恢复可能与这次设定交错，最终音量拿不准
+              _targetVolume = null;
+              return;
+            }
             _volume = actual;
             _targetVolume = volume;
-          } catch (_) {}
+          } catch (_) {
+            _targetVolume = null;
+          }
         }
       }
     } finally {
       _busy = false;
     }
     _report();
+  }
+
+  Future<void> _stopReceiver() async {
+    try {
+      await UnisonNative.stopReceiver();
+      _clearReceiver();
+    } catch (_) {
+      _receiverOn = null;
+    }
   }
 
   void _clearReceiver() {
@@ -255,7 +278,7 @@ class ConsoleClient implements Console {
 
   void _onStats(ReceiverStats stats) {
     _stats = stats;
-    if (!_receiverOn || stats.running || _busy || nowUs - _startedAt < _startGraceUs) return;
+    if (_receiverOn != true || stats.running || _busy || nowUs - _startedAt < _startGraceUs) return;
     // 接收意外停止：按未接收回报，由音源按接收开关重发恢复
     _clearReceiver();
     _report();
@@ -293,7 +316,7 @@ class ConsoleClient implements Console {
     final stats = _stats;
     _transport.send({
       't': MessageType.report,
-      'stats': stats == null || !_receiverOn ? null : statsToJson(stats),
+      'stats': stats == null || _receiverOn != true ? null : statsToJson(stats),
       'volume': _volume,
       'receiving': _receiverOn,
       'offsetUs': _offsetUs,

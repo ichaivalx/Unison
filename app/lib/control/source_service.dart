@@ -344,7 +344,8 @@ class SourceService implements Console {
           peer
             ..stats = statsFromJson(message['stats'])
             ..actualVolume = (message['volume'] as num?)?.toDouble()
-            ..reportedReceiving = message['receiving'] == true
+            // 未知（null）与任何设置都不一致，持续重发直到设备确认
+            ..reportedReceiving = message['receiving'] as bool?
             ..reportedOffsetUs = (message['offsetUs'] as num?)?.toInt()
             ..reportedVolume = (message['appliedVolume'] as num?)?.toDouble();
           if (!_synced(peer)) {
