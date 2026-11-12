@@ -12,6 +12,7 @@
 namespace {
 
 constexpr UINT kTrayMessage = WM_APP + 1;
+constexpr wchar_t kTrayClassName[] = L"UnisonTray";
 constexpr UINT kTrayId = 1;
 constexpr int kMenuShow = 1;
 constexpr int kMenuQuit = 2;
@@ -108,14 +109,65 @@ bool FlutterWindow::OnCreate() {
 
   taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
   show_message_ = RegisterWindowMessageW(kShowMessageName);
+  CreateTrayWindow();
   AddTrayIcon();
   return true;
 }
 
+void FlutterWindow::CreateTrayWindow() {
+  WNDCLASSW tray_class{};
+  tray_class.lpfnWndProc = TrayProc;
+  tray_class.hInstance = GetModuleHandle(nullptr);
+  tray_class.lpszClassName = kTrayClassName;
+  RegisterClassW(&tray_class);
+  // 不可见的顶层窗口：能收到 TaskbarCreated 广播，也能作为菜单所有者取得前台
+  tray_window_ = CreateWindowExW(WS_EX_TOOLWINDOW, kTrayClassName, L"", WS_POPUP, 0, 0, 0, 0,
+                                 nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+  SetWindowLongPtrW(tray_window_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+}
+
+LRESULT CALLBACK FlutterWindow::TrayProc(HWND window, UINT message, WPARAM wparam,
+                                         LPARAM lparam) {
+  auto* that = reinterpret_cast<FlutterWindow*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+  if (that != nullptr) {
+    if (message == kTrayMessage) {
+      that->HandleTrayEvent(LOWORD(lparam));
+      return 0;
+    }
+    if (that->taskbar_created_ != 0 && message == that->taskbar_created_) {
+      that->AddTrayIcon();
+      return 0;
+    }
+  }
+  return DefWindowProcW(window, message, wparam, lparam);
+}
+
+void FlutterWindow::HandleTrayEvent(UINT event) {
+  switch (event) {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+      front_at_tray_press_ = InFront();
+      break;
+    case WM_LBUTTONUP:
+      // 不在前台（含可见但在其他虚拟桌面）时按显示处理：落到当前桌面并置前
+      if (front_at_tray_press_) {
+        Dismiss();
+      } else {
+        Present();
+      }
+      break;
+    case WM_RBUTTONUP:
+      ShowTrayMenu();
+      break;
+  }
+}
+
 void FlutterWindow::AddTrayIcon() {
-  tray_window_ = GetHandle();
+  if (tray_window_ == nullptr) {
+    return;
+  }
   if (tray_icon_ == nullptr) {
-    const UINT dpi = GetDpiForWindow(tray_window_);
+    const UINT dpi = GetDpiForWindow(GetHandle());
     tray_icon_ = static_cast<HICON>(LoadImageW(
         GetModuleHandle(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
         GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi),
@@ -141,6 +193,7 @@ void FlutterWindow::RemoveTrayIcon() {
   icon.hWnd = tray_window_;
   icon.uID = kTrayId;
   Shell_NotifyIconW(NIM_DELETE, &icon);
+  DestroyWindow(tray_window_);
   tray_window_ = nullptr;
   if (tray_icon_ != nullptr) {
     DestroyIcon(tray_icon_);
@@ -149,7 +202,6 @@ void FlutterWindow::RemoveTrayIcon() {
 }
 
 void FlutterWindow::ShowTrayMenu() {
-  HWND window = GetHandle();
   HMENU menu = CreatePopupMenu();
   AppendMenuW(menu, MF_STRING, kMenuShow, L"显示 Unison");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -157,22 +209,22 @@ void FlutterWindow::ShowTrayMenu() {
   SetMenuDefaultItem(menu, kMenuShow, FALSE);
   POINT cursor{};
   GetCursorPos(&cursor);
-  // 菜单所有者须在前台，点击别处时菜单才会关闭
-  SetForegroundWindow(window);
+  // 菜单所有者须在前台，点击别处时菜单才会关闭；置前的是辅助窗口，不激活主窗口
+  SetForegroundWindow(tray_window_);
   const BOOL command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                                      cursor.x, cursor.y, 0, window, nullptr);
-  PostMessage(window, WM_NULL, 0, 0);
+                                      cursor.x, cursor.y, 0, tray_window_, nullptr);
+  PostMessage(tray_window_, WM_NULL, 0, 0);
   DestroyMenu(menu);
   if (command == kMenuShow) {
     Present();
   } else if (command == kMenuQuit) {
-    DestroyWindow(window);
+    DestroyWindow(GetHandle());
   }
 }
 
 bool FlutterWindow::InFront() {
   HWND window = GetHandle();
-  return IsWindowVisible(window) && !IsIconic(window) &&
+  return IsWindowVisible(window) && !IsIconic(window) && OnCurrentDesktop() &&
          (GetForegroundWindow() == window || GetTickCount64() - deactivated_at_ < 500);
 }
 
@@ -271,31 +323,8 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     Dismiss();
     return 0;
   }
-  if (message == kTrayMessage) {
-    switch (LOWORD(lparam)) {
-      case WM_LBUTTONDOWN:
-      case WM_LBUTTONDBLCLK:
-        front_at_tray_press_ = InFront();
-        break;
-      case WM_LBUTTONUP:
-        if (front_at_tray_press_) {
-          Dismiss();
-        } else {
-          Present();
-        }
-        break;
-      case WM_RBUTTONUP:
-        ShowTrayMenu();
-        break;
-    }
-    return 0;
-  }
   if (show_message_ != 0 && message == show_message_) {
     Present();
-    return 0;
-  }
-  if (taskbar_created_ != 0 && message == taskbar_created_) {
-    AddTrayIcon();
     return 0;
   }
   // Give Flutter, including plugins, an opportunity to handle window messages.

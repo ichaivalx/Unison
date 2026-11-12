@@ -49,18 +49,23 @@ class FlutterWindow : public Win32Window {
 
   bool show_on_start_;
 
-  // 托盘图标；资源管理器重启后按 TaskbarCreated 重新添加
+  // 托盘图标的回调与菜单由不可见的辅助窗口承担（不进任务栏和 Alt+Tab）：弹菜单前置前的是它，
+  // 主窗口在用户选择显示之前不被激活，不会把用户带到主窗口所在的其他虚拟桌面。
+  // 资源管理器重启后按 TaskbarCreated 重新添加
   HWND tray_window_ = nullptr;
   HICON tray_icon_ = nullptr;
   UINT taskbar_created_ = 0;
   UINT show_message_ = 0;
 
-  // 托盘左键按下时窗口是否在前台：点击托盘会先使任务栏取得前台，刚刚失去前台的也算
+  // 托盘左键按下时窗口是否在当前虚拟桌面的前台：点击托盘会先使任务栏取得前台，刚刚失去前台的也算
   bool front_at_tray_press_ = false;
   ULONGLONG deactivated_at_ = 0;
 
+  static LRESULT CALLBACK TrayProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
+  void CreateTrayWindow();
   void AddTrayIcon();
   void RemoveTrayIcon();
+  void HandleTrayEvent(UINT event);
   void ShowTrayMenu();
   bool InFront();
 

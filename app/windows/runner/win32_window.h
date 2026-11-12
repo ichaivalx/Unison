@@ -74,9 +74,13 @@ class Win32Window {
   // 黑屏退出后保持隐藏（黑屏期间要求隐藏到托盘）
   void KeepHiddenAfterFullScreen() { hidden_before_fullscreen_ = true; }
 
-  // 显示在用户当前所在的虚拟桌面并置前（最小化的还原）；隐藏（不在任务栏）
+  // 显示在用户当前所在的虚拟桌面并置前（最小化的还原）；黑屏期间只记下退出后应可见并置前。
+  // 隐藏：不在任务栏
   void Reveal();
   void Hide();
+
+  // 窗口在用户当前所在的虚拟桌面上（系统不支持虚拟桌面时视为在）
+  bool OnCurrentDesktop();
 
   static constexpr int kEscapeHotKey = 1;
 
@@ -131,7 +135,8 @@ class Win32Window {
 
   bool fullscreen_ = false;
 
-  // 黑屏退出后保持隐藏；进入时最大化（含最小化前为最大化），退出后保持隐藏的，下次显示时再最大化
+  // 黑屏退出后保持隐藏；进入时最大化（含最小化前为最大化）而退出后保持隐藏的，待恢复普通界面
+  // （从托盘显示，或黑屏期间要求显示后退出黑屏）时再最大化
   bool hidden_before_fullscreen_ = false;
   bool maximized_before_fullscreen_ = false;
   bool reveal_maximized_ = false;

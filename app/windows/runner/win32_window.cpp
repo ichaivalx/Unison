@@ -370,14 +370,28 @@ void Win32Window::SetFullScreen(bool on) {
   }
   WINDOWPLACEMENT placement = placement_;
   if (hidden_before_fullscreen_) {
-    // 可见性与最大化分开恢复：位置按原样、保持隐藏，最大化留到下次显示
+    // 可见性与最大化分开恢复：位置按原样、保持隐藏，最大化留到恢复普通界面时
     reveal_maximized_ = reveal_maximized_ || maximized_before_fullscreen_;
     placement.showCmd = SW_HIDE;
-  } else if (IsIconic(window)) {
-    if (placement.showCmd == SW_SHOWMAXIMIZED) {
-      placement.flags |= WPF_RESTORETOMAXIMIZED;
+  } else {
+    // 进入时隐藏、黑屏期间要求显示的按普通显示；待恢复的最大化在此用上并清掉
+    if (placement.showCmd == SW_HIDE) {
+      placement.showCmd = SW_SHOWNORMAL;
     }
-    placement.showCmd = SW_SHOWMINIMIZED;
+    if (reveal_maximized_) {
+      if (placement.showCmd == SW_SHOWMINIMIZED) {
+        placement.flags |= WPF_RESTORETOMAXIMIZED;
+      } else {
+        placement.showCmd = SW_SHOWMAXIMIZED;
+      }
+      reveal_maximized_ = false;
+    }
+    if (IsIconic(window)) {
+      if (placement.showCmd == SW_SHOWMAXIMIZED) {
+        placement.flags |= WPF_RESTORETOMAXIMIZED;
+      }
+      placement.showCmd = SW_SHOWMINIMIZED;
+    }
   }
   hidden_before_fullscreen_ = false;
   UnregisterHotKey(window, kEscapeHotKey);
@@ -392,6 +406,11 @@ void Win32Window::SetFullScreen(bool on) {
 void Win32Window::Reveal() {
   HWND window = window_handle_;
   hidden_before_fullscreen_ = false;
+  // 黑屏期间不改变窗口的显示方式，待恢复的最大化留到退出黑屏时
+  if (fullscreen_) {
+    SetForegroundWindow(window);
+    return;
+  }
   HideIfOnOtherDesktop();
   int command = IsIconic(window) ? SW_RESTORE : SW_SHOW;
   if (reveal_maximized_) {
@@ -406,20 +425,24 @@ void Win32Window::Hide() {
   ShowWindow(window_handle_, SW_HIDE);
 }
 
-void Win32Window::HideIfOnOtherDesktop() {
-  if (!IsWindowVisible(window_handle_)) {
-    return;
-  }
+bool Win32Window::OnCurrentDesktop() {
   IVirtualDesktopManager* manager = nullptr;
   if (FAILED(CoCreateInstance(__uuidof(VirtualDesktopManager), nullptr, CLSCTX_ALL,
                               IID_PPV_ARGS(&manager)))) {
-    return;
+    return true;
   }
   BOOL current = TRUE;
-  if (SUCCEEDED(manager->IsWindowOnCurrentVirtualDesktop(window_handle_, &current)) && !current) {
-    ShowWindow(window_handle_, SW_HIDE);
+  if (FAILED(manager->IsWindowOnCurrentVirtualDesktop(window_handle_, &current))) {
+    current = TRUE;
   }
   manager->Release();
+  return current != FALSE;
+}
+
+void Win32Window::HideIfOnOtherDesktop() {
+  if (IsWindowVisible(window_handle_) && !OnCurrentDesktop()) {
+    ShowWindow(window_handle_, SW_HIDE);
+  }
 }
 
 bool Win32Window::OnCreate() {
