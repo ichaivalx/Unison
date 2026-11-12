@@ -14,8 +14,9 @@ import kotlin.concurrent.thread
 internal class EffectSource {
     var onSessionsChanged: (() -> Unit)? = null
     /**
-     * [packageName]、[appName] 为播放应用的包名与显示名称，[outputIo]、[channel] 为会话所在的输出线程与通道，
-     * [delayUs] 为效果上生效的本机延迟
+     * [packageName]、[appName] 为播放应用的包名与显示名称，[outputIo]、[channel] 为按 dumpsys 核实的输出线程与
+     * 通道，[delayUs] 为效果上生效的本机延迟；[io] 为采集包里的 io，只用于诊断与触发核实（会话迁移而效果
+     * 复用时可能不更新）
      */
     private class Session(val uid: Int, val id: Int, val effect: AudioEffect, val packageName: String?, val appName: String?,
         var outputIo: Int?, var channel: String?, var delayUs: Long) {
@@ -204,15 +205,19 @@ internal class EffectSource {
         session.delayUs = delay
     }
 
-    /** 采集包显示会话换到了另一输出线程：按新线程的通道更新补偿 */
-    private fun rechannel(id: Int, io: Int) {
+    /**
+     * 采集包的 io 有变化：按当前 dumpsys 重新核实会话所在的输出线程并更新补偿；dumpsys 里查不到该会话的
+     * 轨道时才按最新采集包的 io。与 reconcile 同在 handler 线程，核实总读当前 dumpsys，不会写回旧结果
+     */
+    private fun verifyOutput(id: Int) {
         if (closed || deathReason != null) return
         try {
-            val channel = outputChannels[io] ?: readOutputs().channels[io]
+            val outputs = readOutputs()
             val changed = synchronized(lock) {
                 val session = sessions[id]
-                if (closed || session == null || session.outputIo != io) return
-                moveTo(session, io, channel)
+                if (closed || session == null) return
+                val io = outputs.ioOf(id) ?: session.io ?: return
+                moveTo(session, io, outputChannels[io])
             }
             if (changed) onSessionsChanged?.invoke()
         } catch (error: Exception) {
@@ -282,11 +287,10 @@ internal class EffectSource {
 
     fun acceptStream(session: Int, io: Int): Boolean = synchronized(lock) {
         val entry = sessions[session] ?: return@synchronized false
+        val previous = entry.io
         entry.io = io
-        if (io != entry.outputIo) {
-            entry.outputIo = io
-            handler.post { rechannel(session, io) }
-        }
+        // 与上一包不同，或第一包与已核实的线程不同（含尚未确定）时核实一次
+        if (io != previous && (previous != null || io != entry.outputIo)) handler.post { verifyOutput(session) }
         true
     }
 
