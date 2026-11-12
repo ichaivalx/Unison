@@ -212,6 +212,13 @@ String formatOffset(int us) {
   return '${us > 0 ? '慢' : '快'} ${(tenths / 10).toStringAsFixed(1)} ms';
 }
 
+/// 对齐频段位置的文本
+String bandPosition(double weight) => switch (weight) {
+  0.0 => '中高频',
+  1.0 => '低频',
+  _ => '低频 ${(weight * 100).round()}%',
+};
+
 String formatMs(int us) => '${(us / 1000).toStringAsFixed(1)} ms';
 
 /// 低频相对本机的差值说明

@@ -25,6 +25,11 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  window_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+      flutter_controller_->engine()->messenger(), "unison/window",
+      &flutter::StandardMethodCodec::GetInstance());
+  window_channel_->SetMethodCallHandler(
+      [this](const auto& call, auto result) { HandleWindowCall(call, std::move(result)); });
 
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
@@ -40,7 +45,54 @@ bool FlutterWindow::OnCreate() {
   return true;
 }
 
+void FlutterWindow::HandleWindowCall(
+    const flutter::MethodCall<flutter::EncodableValue>& call,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  const std::string& method = call.method_name();
+  if (method == "state") {
+    result->Success(flutter::EncodableValue(flutter::EncodableMap{
+        {flutter::EncodableValue("maximized"), flutter::EncodableValue(Maximized())},
+        {flutter::EncodableValue("minimized"), flutter::EncodableValue(Minimized())},
+    }));
+    return;
+  }
+  // 拖动在系统的移动循环中进行，先回复
+  result->Success();
+  if (method == "startDrag") {
+    StartDrag();
+  } else if (method == "minimize") {
+    Minimize();
+  } else if (method == "toggleMaximize") {
+    ToggleMaximize();
+  } else if (method == "close") {
+    Close();
+  } else if (method == "blackout") {
+    const auto* on = std::get_if<bool>(call.arguments());
+    const bool active = on != nullptr && *on;
+    // 黑屏期间显示器保持开启、系统不睡眠，显示器的扬声器不断电
+    SetThreadExecutionState(active ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+                                   : ES_CONTINUOUS);
+    SetFullScreen(active);
+  }
+}
+
+void FlutterWindow::NotifyWindowState() {
+  const bool maximized = Maximized();
+  const bool minimized = Minimized();
+  if (!window_channel_ || (maximized == maximized_ && minimized == minimized_)) {
+    return;
+  }
+  maximized_ = maximized;
+  minimized_ = minimized;
+  window_channel_->InvokeMethod(
+      "state", std::make_unique<flutter::EncodableValue>(flutter::EncodableMap{
+                   {flutter::EncodableValue("maximized"), flutter::EncodableValue(maximized)},
+                   {flutter::EncodableValue("minimized"), flutter::EncodableValue(minimized)},
+               }));
+}
+
 void FlutterWindow::OnDestroy() {
+  window_channel_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -68,5 +120,9 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
       break;
   }
 
-  return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+  const LRESULT handled = Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+  if (message == WM_SIZE) {
+    NotifyWindowState();
+  }
+  return handled;
 }

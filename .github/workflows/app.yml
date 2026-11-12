@@ -23,7 +23,15 @@ jobs:
           cache: true
       - run: flutter pub get
       - run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Download CJK font for screenshots
+        run: curl -sSfL --create-dirs -o build/test_fonts/NotoSansSC.ttf "https://github.com/google/fonts/raw/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf"
       - run: flutter test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: screenshots
+          path: app/build/screenshots/
+          if-no-files-found: error
       - run: flutter build apk --release --target-platform android-arm64
       - run: mv build/app/outputs/flutter-apk/app-release.apk unison-arm64.apk
       - uses: actions/upload-artifact@v7

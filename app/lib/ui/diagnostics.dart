@@ -48,7 +48,7 @@ class _DiagnosticsState extends State<Diagnostics> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           InkWell(
-            borderRadius: BorderRadius.circular(24),
+            borderRadius: BorderRadius.circular(Grid.panelRadius),
             onTap: () => setState(() => _open = !_open),
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),

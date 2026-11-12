@@ -81,16 +81,16 @@ class _MediaCardState extends State<MediaCard> {
     final colors = context.colors;
     final texts = context.texts;
     return Container(
-      padding: const EdgeInsets.fromLTRB(24, 22, 24, 18),
+      padding: const EdgeInsets.fromLTRB(Grid.panelPadding, 18, Grid.panelPadding, 12),
       decoration: BoxDecoration(
         color: colors.surfaceContainer,
-        borderRadius: BorderRadius.circular(28),
+        borderRadius: BorderRadius.circular(Grid.panelRadius),
       ),
       child: media == null
           ? SizedBox(
-              height: 140,
+              height: 72,
               child: Center(
-                child: Text('没有正在播放的媒体', style: texts.bodyMedium?.copyWith(color: colors.onSurfaceVariant)),
+                child: Text('音源设备上没有正在播放的媒体', style: texts.bodyMedium?.copyWith(color: colors.onSurfaceVariant)),
               ),
             )
           : _content(media, colors, texts),
@@ -123,7 +123,7 @@ class _MediaCardState extends State<MediaCard> {
           media.title?.isNotEmpty == true ? media.title! : '未知标题',
           maxLines: 2,
           overflow: TextOverflow.ellipsis,
-          style: texts.headlineSmall?.copyWith(fontWeight: FontWeight.w600, height: 1.25),
+          style: texts.titleLarge?.copyWith(fontWeight: FontWeight.w600, height: 1.3),
         ),
         if (media.artist?.isNotEmpty == true) ...[
           const SizedBox(height: 4),

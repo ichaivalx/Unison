@@ -11,20 +11,37 @@ const _muted = Color(0xFF8E8E97);
 const _good = Color(0xFF86D1A8);
 const _bad = Color(0xFFF08A80);
 
+/// 接收端通道条顶部的标识色；音源用主色
+const receiverMark = Color(0xFF7D93AD);
+
+/// 推子钮的正面
+const faderCap = (Color(0xFF4B4E56), Color(0xFF2B2D33));
+
+/// 栅格：页面边距、区块间距与圆角
+abstract final class Grid {
+  static const unit = 8.0;
+  static const gap = 16.0;
+  static const narrowMargin = 16.0;
+  static const wideMargin = 24.0;
+  static const panelRadius = 20.0;
+  static const panelPadding = 20.0;
+  static const stripRadius = 14.0;
+}
+
 /// 两种深色：深灰与纯黑（OLED 可关闭像素）
 ThemeData buildTheme(DarkVariant variant) {
   final (background, card, raised, line) = switch (variant) {
     DarkVariant.gray => (
-      const Color(0xFF131316),
-      const Color(0xFF1C1C20),
-      const Color(0xFF26262B),
-      const Color(0xFF33333A),
+      const Color(0xFF121315),
+      const Color(0xFF1B1C20),
+      const Color(0xFF25272C),
+      const Color(0xFF33353C),
     ),
     DarkVariant.black => (
       const Color(0xFF000000),
       const Color(0xFF0D0D0F),
-      const Color(0xFF18181B),
-      const Color(0xFF242428),
+      const Color(0xFF18191C),
+      const Color(0xFF26272C),
     ),
   };
   final scheme = ColorScheme(

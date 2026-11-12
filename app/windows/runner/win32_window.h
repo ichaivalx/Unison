@@ -55,6 +55,17 @@ class Win32Window {
   // Return a RECT representing the bounds of the current client area.
   RECT GetClientArea();
 
+  // 界面自绘的标题栏：从当前按下的位置拖动窗口、最小化、最大化与还原、关闭
+  void StartDrag();
+  void Minimize();
+  void ToggleMaximize();
+  void Close();
+  bool Maximized();
+  bool Minimized();
+
+  // 全屏覆盖窗口所在的显示器并置顶；退出时恢复进入前的位置与状态（期间被最小化的保持最小化）
+  void SetFullScreen(bool on);
+
  protected:
   // Processes and route salient window messages for mouse handling,
   // size change and DPI. Delegates handling of these to member overloads that
@@ -89,6 +100,19 @@ class Win32Window {
 
   // Update the window frame's theme to match the system theme.
   static void UpdateTheme(HWND const window);
+
+  // 内容窗口在顶部缩放边框内透明，使其由主窗口按缩放处理
+  static LRESULT CALLBACK ContentProc(HWND window, UINT message, WPARAM wparam,
+                                      LPARAM lparam, UINT_PTR id, DWORD_PTR data);
+
+  // 缩放边框的高度：去掉标题栏后顶部仍按此高度缩放，最大化时窗口超出屏幕此高度
+  int FrameHeight();
+
+  // 屏幕坐标 [lparam] 处于顶部的缩放边框内
+  bool InTopBorder(LPARAM lparam);
+
+  bool fullscreen_ = false;
+  WINDOWPLACEMENT placement_{sizeof(WINDOWPLACEMENT)};
 
   bool quit_on_close_ = false;
 

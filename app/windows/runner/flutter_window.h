@@ -3,6 +3,8 @@
 
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
+#include <flutter/method_channel.h>
+#include <flutter/standard_method_codec.h>
 
 #include <memory>
 
@@ -28,6 +30,16 @@ class FlutterWindow : public Win32Window {
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
+
+  // 界面的窗口操作与黑屏；窗口最大化、最小化变化时通知界面
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> window_channel_;
+  bool maximized_ = false;
+  bool minimized_ = false;
+
+  void HandleWindowCall(
+      const flutter::MethodCall<flutter::EncodableValue>& call,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void NotifyWindowState();
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

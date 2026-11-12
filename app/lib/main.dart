@@ -8,6 +8,7 @@ import 'package:unison_native/unison_native.dart';
 import 'control/client.dart';
 import 'control/console.dart';
 import 'control/source_service.dart';
+import 'desktop.dart';
 import 'settings.dart';
 import 'ui/home.dart';
 import 'ui/theme.dart';
@@ -16,6 +17,7 @@ import 'ui/theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await LocalSettings.init();
+  await AppWindow.init();
   final console = ValueNotifier<Console?>(null);
   runApp(UnisonApp(console: console));
   console.value = await _open();
@@ -108,7 +110,7 @@ class _UnisonAppState extends State<UnisonApp> {
             locale: const Locale('zh', 'CN'),
             supportedLocales: const [Locale('zh', 'CN')],
             localizationsDelegates: GlobalMaterialLocalizations.delegates,
-            home: HomePage(console: widget.console),
+            home: HomePage(console: widget.console, desktop: AppWindow.supported),
           ),
         );
       },

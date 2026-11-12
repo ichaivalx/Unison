@@ -1,7 +1,9 @@
 #include "win32_window.h"
 
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <flutter_windows.h>
+#include <windowsx.h>
 
 #include "resource.h"
 
@@ -211,6 +213,27 @@ Win32Window::MessageHandler(HWND hwnd,
       }
       return 0;
 
+    // 去掉标题栏：按标准边框计算后收回顶部，保留左、右、下的缩放边框
+    case WM_NCCALCSIZE:
+      if (wparam && !fullscreen_) {
+        auto params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lparam);
+        const LONG top = params->rgrc[0].top;
+        const LRESULT result = DefWindowProc(hwnd, message, wparam, lparam);
+        if (result != 0) {
+          return result;
+        }
+        params->rgrc[0].top = top + (IsZoomed(hwnd) ? FrameHeight() : 0);
+        return 0;
+      }
+      break;
+
+    case WM_NCHITTEST: {
+      const LRESULT hit = DefWindowProc(hwnd, message, wparam, lparam);
+      if (hit == HTCLIENT && InTopBorder(lparam)) {
+        return HTTOP;
+      }
+      return hit;
+    }
   }
 
   return DefWindowProc(window_handle_, message, wparam, lparam);
@@ -236,6 +259,7 @@ Win32Window* Win32Window::GetThisFromHandle(HWND const window) noexcept {
 void Win32Window::SetChildContent(HWND content) {
   child_content_ = content;
   SetParent(content, window_handle_);
+  SetWindowSubclass(content, ContentProc, 1, reinterpret_cast<DWORD_PTR>(this));
   RECT frame = GetClientArea();
 
   MoveWindow(content, frame.left, frame.top, frame.right - frame.left,
@@ -256,6 +280,92 @@ HWND Win32Window::GetHandle() {
 
 void Win32Window::SetQuitOnClose(bool quit_on_close) {
   quit_on_close_ = quit_on_close;
+}
+
+LRESULT CALLBACK Win32Window::ContentProc(HWND window, UINT message,
+                                          WPARAM wparam, LPARAM lparam,
+                                          UINT_PTR id, DWORD_PTR data) {
+  if (message == WM_NCHITTEST &&
+      reinterpret_cast<Win32Window*>(data)->InTopBorder(lparam)) {
+    return HTTRANSPARENT;
+  }
+  return DefSubclassProc(window, message, wparam, lparam);
+}
+
+int Win32Window::FrameHeight() {
+  const UINT dpi = GetDpiForWindow(window_handle_);
+  return GetSystemMetricsForDpi(SM_CYFRAME, dpi) +
+         GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+}
+
+bool Win32Window::InTopBorder(LPARAM lparam) {
+  if (fullscreen_ || IsZoomed(window_handle_)) {
+    return false;
+  }
+  POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+  ScreenToClient(window_handle_, &point);
+  return point.y >= 0 && point.y < FrameHeight();
+}
+
+void Win32Window::StartDrag() {
+  ReleaseCapture();
+  SendMessage(window_handle_, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
+}
+
+void Win32Window::Minimize() {
+  ShowWindow(window_handle_, SW_MINIMIZE);
+}
+
+void Win32Window::ToggleMaximize() {
+  ShowWindow(window_handle_, IsZoomed(window_handle_) ? SW_RESTORE : SW_MAXIMIZE);
+}
+
+void Win32Window::Close() {
+  PostMessage(window_handle_, WM_CLOSE, 0, 0);
+}
+
+bool Win32Window::Maximized() {
+  return IsZoomed(window_handle_) != FALSE;
+}
+
+bool Win32Window::Minimized() {
+  return IsIconic(window_handle_) != FALSE;
+}
+
+void Win32Window::SetFullScreen(bool on) {
+  HWND window = window_handle_;
+  if (on == fullscreen_ || window == nullptr) {
+    return;
+  }
+  const LONG_PTR style = GetWindowLongPtr(window, GWL_STYLE);
+  if (on) {
+    GetWindowPlacement(window, &placement_);
+    if (IsIconic(window) || IsZoomed(window)) {
+      ShowWindow(window, SW_RESTORE);
+    }
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    GetMonitorInfo(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT& area = monitor.rcMonitor;
+    fullscreen_ = true;
+    SetWindowLongPtr(window, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+    SetWindowPos(window, HWND_TOPMOST, area.left, area.top,
+                 area.right - area.left, area.bottom - area.top,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    SetForegroundWindow(window);
+    return;
+  }
+  WINDOWPLACEMENT placement = placement_;
+  if (IsIconic(window)) {
+    if (placement.showCmd == SW_SHOWMAXIMIZED) {
+      placement.flags |= WPF_RESTORETOMAXIMIZED;
+    }
+    placement.showCmd = SW_SHOWMINIMIZED;
+  }
+  fullscreen_ = false;
+  SetWindowLongPtr(window, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+  SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  SetWindowPlacement(window, &placement);
 }
 
 bool Win32Window::OnCreate() {

@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 
+import '../control/calibration.dart';
 import '../control/console.dart';
 import '../control/models.dart';
 import '../control/protocol.dart';
-import 'panels.dart';
 import 'theme.dart';
 
 /// 校准面板：说明、进度、结果与撤销，按频段对齐的滑块。校准在音源上进行，关闭面板
@@ -68,7 +68,7 @@ class _CalibrationSheetState extends State<_CalibrationSheet> {
           ),
           const SizedBox(height: 12),
           if (stage == CalibrationStage.idle) ...[
-            Text('音源设备用麦克风录下各设备依次发出的测试音，自动设置本机延迟与各接收端的偏移。期间暂停转发音频，请保持安静。', style: hint),
+            Text('音源设备用麦克风录下各设备依次发出的测试音，自动设置本机延迟、本机各输出通道的补偿与各接收端的偏移。期间暂停转发音频，请保持安静。', style: hint),
             if (calibration.message case final message?) ...[
               const SizedBox(height: 8),
               Text(message, style: texts.bodyMedium),
