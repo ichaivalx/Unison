@@ -24,7 +24,7 @@ internal fun joinThread(thread: Thread?) {
 }
 
 internal class SourceSession(private val excludeUid: Int, @Volatile var latencyUs: Long,
-    @Volatile var localDelayUs: Long, @Volatile var channelDelays: Map<String, Long>,
+    @Volatile var localDelayUs: Long, @Volatile private var channelDelays: Map<String, Long>,
     private val onFatal: (SourceSession, Throwable) -> Unit) {
     private val MAGIC = 0x4E534E55
     private val SOURCE_PORT = 47800
