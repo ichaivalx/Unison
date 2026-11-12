@@ -34,7 +34,7 @@ internal object NativeRuntime {
     private var lastVolume = -1.0
     private var polling = false
     private fun stoppedSource() = JSONObject().put("running", false).put("latencyUs", 50000).put("localDelayUs", 0)
-        .put("sessions", JSONArray()).put("receiverIds", JSONArray()).put("error", JSONObject.NULL)
+        .put("sessions", JSONArray()).put("uncaptured", JSONArray()).put("receiverIds", JSONArray()).put("error", JSONObject.NULL)
     fun initialize(value: Context) {
         context = value.applicationContext
         SourceController.onEvent = events@{ type, data ->
@@ -48,7 +48,7 @@ internal object NativeRuntime {
             } else if (type == "rootExit") {
                 currentMedia = null; haveMedia = true; emit("media", null)
                 val active = sourceRequested; sourceRequested = false
-                source = source.put("running", false).put("sessions", JSONArray()).put("receiverIds", JSONArray())
+                source = source.put("running", false).put("sessions", JSONArray()).put("uncaptured", JSONArray()).put("receiverIds", JSONArray())
                 if (active && source.isNull("error")) source.put("error", "Root process exited")
                 emit("source", source); serviceState()
             } else if (type == "calibration") emit(type, data)
@@ -176,7 +176,7 @@ internal object NativeRuntime {
             try {
                 ReceiverEngine.stop(); forceWifi(false); SourceController.shutdown()
             } finally {
-                source = source.put("running", false).put("sessions", JSONArray()).put("receiverIds", JSONArray())
+                source = source.put("running", false).put("sessions", JSONArray()).put("uncaptured", JSONArray()).put("receiverIds", JSONArray())
                 currentMedia = null; haveMedia = true
                 emit("source", source); emit("media", null)
                 exiting = false; exitComplete.complete(null); serviceState()

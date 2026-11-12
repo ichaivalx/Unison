@@ -102,6 +102,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
 
     fun status(): org.json.JSONObject = org.json.JSONObject().put("running", running && !closed)
         .put("latencyUs", latencyUs).put("localDelayUs", localDelayUs).put("sessions", effect?.sessionStatus() ?: org.json.JSONArray())
+        .put("uncaptured", effect?.uncapturedStatus() ?: org.json.JSONArray())
         .put("receiverIds", org.json.JSONArray(receiverIds())).put("error", fatalError ?: org.json.JSONObject.NULL)
 
     private fun publishStatus() { CaptureMain.publish(this, "source", status()) }

@@ -813,6 +813,10 @@ class SourceService implements Console {
               calibrated: _channels.containsKey(s.channel),
             ),
         ],
+        uncaptured: [
+          for (final s in status?.uncaptured ?? const <UncapturedSession>[])
+            UncapturedView(app: s.appName ?? s.packageName ?? 'uid ${s.uid}', packageName: s.packageName, sessionId: s.sessionId),
+        ],
         channels: channels,
       ),
       media: _media == null ? null : MediaView.of(_media!),

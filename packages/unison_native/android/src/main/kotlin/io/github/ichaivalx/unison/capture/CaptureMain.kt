@@ -91,7 +91,7 @@ object CaptureMain {
     private fun delays(json: JSONObject): Map<String, Long> = json.keys().asSequence().associateWith { json.getLong(it) }
         .also { check(it.values.all { delay -> delay >= 0 }) }
     private fun stopped() = JSONObject().put("running", false).put("latencyUs", latencyUs).put("localDelayUs", delayUs)
-        .put("sessions", org.json.JSONArray()).put("receiverIds", org.json.JSONArray()).put("error", JSONObject.NULL)
+        .put("sessions", org.json.JSONArray()).put("uncaptured", org.json.JSONArray()).put("receiverIds", org.json.JSONArray()).put("error", JSONObject.NULL)
     internal fun publish(session: SourceSession, type: String, value: JSONObject) = synchronized(sourceEvents) {
         // 快照在调用处构造，不能在持有发布锁时再获取音效锁。
         if (source === session) RootEvents.emit(type, value)

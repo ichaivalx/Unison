@@ -77,6 +77,18 @@ class CapturedSession {
   final int delayUs;
 }
 
+/// 音源端正在播放、但挂载音效被拒而没有采集的会话（典型是快速或直通通道）。
+class UncapturedSession {
+  const UncapturedSession({required this.uid, required this.packageName, required this.appName, required this.sessionId});
+
+  final int uid;
+  final String? packageName;
+
+  /// 应用的显示名称；无法读取时为 null
+  final String? appName;
+  final int sessionId;
+}
+
 /// 音源端状态（变化时推送，运行中至少每秒一次）。
 class SourceStatus {
   const SourceStatus({
@@ -84,6 +96,7 @@ class SourceStatus {
     required this.latencyUs,
     required this.localDelayUs,
     required this.sessions,
+    required this.uncaptured,
     required this.receiverIds,
     this.error,
   });
@@ -96,6 +109,9 @@ class SourceStatus {
   /// 本机延迟：音源本机输出额外推迟的时间
   final int localDelayUs;
   final List<CapturedSession> sessions;
+
+  /// 正在播放但没有采集的会话；会话结束后不再列出
+  final List<UncapturedSession> uncaptured;
 
   /// 当前订阅音频的接收端 id（与 [UnisonNative.receiverId] 对应）
   final List<int> receiverIds;
@@ -258,6 +274,8 @@ abstract final class UnisonNative {
     sessions: ((e['sessions'] as List?) ?? []).map((dynamic s) => CapturedSession(uid: (s['uid'] as num).toInt(),
       packageName: s['packageName'] as String?, appName: s['appName'] as String?, sessionId: (s['sessionId'] as num).toInt(),
       channel: s['channel'] as String?, delayUs: (s['delayUs'] as num).toInt())).toList(),
+    uncaptured: ((e['uncaptured'] as List?) ?? []).map((dynamic s) => UncapturedSession(uid: (s['uid'] as num).toInt(),
+      packageName: s['packageName'] as String?, appName: s['appName'] as String?, sessionId: (s['sessionId'] as num).toInt())).toList(),
     receiverIds: ((e['receiverIds'] as List?) ?? []).cast<int>(), error: e['error'] as String?));
   static Future<CalibrationResult> calibrate({required List<int> receiverIds, required List<CalibrationBand> bands,
     required void Function(CalibrationProgress progress) onProgress}) async {

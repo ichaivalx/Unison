@@ -138,6 +138,7 @@ ConsoleState _state() => ConsoleState(
       SessionView(app: 'YouTube', channel: 'DEEP_BUFFER', delayUs: 12000, calibrated: true),
       SessionView(app: '网易云音乐', channel: 'COMPRESS_OFFLOAD', delayUs: 12000, calibrated: false),
     ],
+    uncaptured: [UncapturedView(app: '酷狗音乐', packageName: 'com.kugou.android', sessionId: 4217)],
     channels: [
       ChannelView(channel: 'DEEP_BUFFER', latencyUs: 148000, compensationUs: 0, base: true),
       ChannelView(channel: 'PRIMARY|FAST', latencyUs: 58000, compensationUs: 90000, base: false),

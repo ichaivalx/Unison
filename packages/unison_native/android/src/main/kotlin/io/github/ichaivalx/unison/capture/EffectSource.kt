@@ -22,9 +22,11 @@ internal class EffectSource {
         var outputIo: Int?, var channel: String?, var delayUs: Long) {
         @Volatile var io: Int? = null
     }
+    /** 正在播放但挂载效果被拒的会话（典型是快速或直通通道）：声音没被采集，只上报给界面 */
+    private class Uncaptured(val uid: Int, val id: Int, val packageName: String?, val appName: String?)
     private val lock = Any()
     private val sessions = linkedMapOf<Int, Session>()
-    private val failed = mutableSetOf<Int>()
+    private val failed = linkedMapOf<Int, Uncaptured>()
     private var socket = -1
     private var factory: IBinder? = null
     private lateinit var manager: AudioManager
@@ -134,7 +136,7 @@ internal class EffectSource {
         calibrationSession?.let { wanted[it] = android.os.Process.myUid() }
         needsSessionLookup = unknown.isNotEmpty()
         val unresolved = unknown.toMutableSet()
-        val (known, attached) = synchronized(lock) { (sessions.keys + failed) to sessions.isNotEmpty() }
+        val (known, attached) = synchronized(lock) { (sessions.keys + failed.keys) to sessions.isNotEmpty() }
         // 新会话须在启用效果前确定所在通道，与缺失编号的客户端共用一次查询；不在会话锁内等待
         // dumpsys，采集不受影响。
         val outputs = if (unknown.isNotEmpty() || wanted.keys.any { it !in known } || (recheck && attached)) readOutputs() else null
@@ -149,12 +151,13 @@ internal class EffectSource {
         synchronized(lock) {
             if (closed || deathReason != null) return@synchronized
             val before = sessions.keys.toSet()
+            val failedBefore = failed.keys.toSet()
             for (id in sessions.keys.toList()) if (id !in wanted) {
                 val session = sessions.remove(id)!!
                 release(session)
                 println("INFO effect_detached uid=${session.uid} session=$id io=${session.io ?: "pending"}")
             }
-            failed.retainAll(wanted.keys)
+            failed.keys.retainAll(wanted.keys)
             for ((id, uid) in wanted) {
                 if (id in sessions || id in failed) continue
                 var instance: AudioEffect? = null
@@ -167,15 +170,13 @@ internal class EffectSource {
                     check(setParameter.invoke(instance, 1, delayBytes(delay)) == AudioEffect.SUCCESS) { "Cannot set local delay" }
                     if (shouldMute(id)) check(setInteger.invoke(instance, 2, 1) == AudioEffect.SUCCESS) { "Cannot mute local effect" }
                     check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
-                    val packageName = runCatching { packages.getPackagesForUid(uid)?.firstOrNull() }.getOrNull()
-                    val appName = packageName?.let { name ->
-                        runCatching { packages.getApplicationInfo(name, 0).loadLabel(packages).toString().ifBlank { null } }.getOrNull()
-                    }
+                    val (packageName, appName) = appOf(uid)
                     sessions[id] = Session(uid, id, instance, packageName, appName, io, channel, delay)
                     println("INFO effect_attached uid=$uid session=$id io=${io ?: "unknown"} channel=${channel ?: "unknown"} local_delay_us=$delay")
                 } catch (error: Exception) {
                     runCatching { instance?.release() }
-                    failed.add(id)
+                    val (packageName, appName) = appOf(uid)
+                    failed[id] = Uncaptured(uid, id, packageName, appName)
                     // FAST/DIRECT 等拒绝挂载时保持播放器原路播放；不循环创建或改动其音量。
                     println("ERROR effect_attach uid=$uid session=$id error=${error.cause ?: error}")
                 }
@@ -185,8 +186,17 @@ internal class EffectSource {
                 val io = outputs.ioOf(session.id) ?: continue
                 if (moveTo(session, io, outputChannels[io])) moved = true
             }
-            if (before != sessions.keys || moved) onSessionsChanged?.invoke()
+            if (before != sessions.keys || failedBefore != failed.keys || moved) onSessionsChanged?.invoke()
         }
+    }
+
+    /** 应用的包名与显示名称；读不到时为 null */
+    private fun appOf(uid: Int): Pair<String?, String?> {
+        val packageName = runCatching { packages.getPackagesForUid(uid)?.firstOrNull() }.getOrNull()
+        val appName = packageName?.let { name ->
+            runCatching { packages.getApplicationInfo(name, 0).loadLabel(packages).toString().ifBlank { null } }.getOrNull()
+        }
+        return packageName to appName
     }
 
     private fun readOutputs(): AudioOutputs = AudioOutputs.read().also { outputChannels = outputChannels + it.channels }
@@ -285,6 +295,13 @@ internal class EffectSource {
             .put("channel", session.channel ?: org.json.JSONObject.NULL).put("delayUs", session.delayUs) })
     }
 
+    /** 正在播放但挂载失败、没被采集的会话；会话结束后不再列出 */
+    fun uncapturedStatus(): org.json.JSONArray = synchronized(lock) {
+        org.json.JSONArray(failed.values.filter { it.id != calibrationSession }.map { session -> org.json.JSONObject().put("uid", session.uid)
+            .put("sessionId", session.id).put("packageName", session.packageName ?: org.json.JSONObject.NULL)
+            .put("appName", session.appName ?: org.json.JSONObject.NULL) })
+    }
+
     fun acceptStream(session: Int, io: Int): Boolean = synchronized(lock) {
         val entry = sessions[session] ?: return@synchronized false
         val previous = entry.io
@@ -300,7 +317,7 @@ internal class EffectSource {
 
     fun status(): String = synchronized(lock) {
         "sessions=[${sessions.values.joinToString(",") { "${it.uid}/${it.id}/io:${it.io ?: "pending"}/${it.channel ?: "unknown"}/${it.delayUs}us" }}] " +
-            "attach_failed=[${failed.joinToString(",")}] " +
+            "attach_failed=[${failed.keys.joinToString(",")}] " +
             "local_muted=$outputMuted " +
             "session_lookup_pending=[${unresolvedClients.joinToString(",") { "${it.first}/${it.second}" }}]"
     }

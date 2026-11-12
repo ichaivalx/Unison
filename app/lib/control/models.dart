@@ -215,6 +215,24 @@ class SessionView {
   );
 }
 
+/// 音源上正在播放、但没被采集的会话：它的输出方式不经过音效（快速或直通通道）
+class UncapturedView {
+  const UncapturedView({required this.app, required this.packageName, required this.sessionId});
+
+  /// 应用的显示名称，读取不到时为包名
+  final String app;
+  final String? packageName;
+  final int sessionId;
+
+  Map<String, Object?> toJson() => {'app': app, 'packageName': packageName, 'sessionId': sessionId};
+
+  static UncapturedView fromJson(Map json) => UncapturedView(
+    app: json['app'] as String? ?? '',
+    packageName: json['packageName'] as String?,
+    sessionId: (json['sessionId'] as num?)?.toInt() ?? 0,
+  );
+}
+
 /// 本机一条已校准的输出通道
 class ChannelView {
   const ChannelView({required this.channel, required this.latencyUs, required this.compensationUs, required this.base});
@@ -252,6 +270,7 @@ class SourceView {
     required this.localDelayUs,
     required this.error,
     required this.sessions,
+    required this.uncaptured,
     required this.channels,
   });
 
@@ -265,6 +284,9 @@ class SourceView {
   /// 正在采集的播放会话
   final List<SessionView> sessions;
 
+  /// 正在播放但没被采集的会话
+  final List<UncapturedView> uncaptured;
+
   /// 已校准的本机输出通道，出声慢的在前
   final List<ChannelView> channels;
 
@@ -274,6 +296,7 @@ class SourceView {
     'localDelayUs': localDelayUs,
     'error': error,
     'sessions': [for (final session in sessions) session.toJson()],
+    'uncaptured': [for (final session in uncaptured) session.toJson()],
     'channels': [for (final channel in channels) channel.toJson()],
   };
 
@@ -283,6 +306,7 @@ class SourceView {
     localDelayUs: (json['localDelayUs'] as num?)?.toInt() ?? 0,
     error: json['error'] as String?,
     sessions: [for (final session in (json['sessions'] as List? ?? const [])) SessionView.fromJson(session as Map)],
+    uncaptured: [for (final session in (json['uncaptured'] as List? ?? const [])) UncapturedView.fromJson(session as Map)],
     channels: [for (final channel in (json['channels'] as List? ?? const [])) ChannelView.fromJson(channel as Map)],
   );
 }

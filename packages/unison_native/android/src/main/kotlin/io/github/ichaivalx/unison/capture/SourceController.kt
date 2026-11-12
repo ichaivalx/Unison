@@ -2,6 +2,7 @@ package io.github.ichaivalx.unison.capture
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
@@ -33,7 +34,8 @@ object SourceController {
         thread(name = "root-events", isDaemon = true) {
             try {
                 child.inputStream.bufferedReader().useLines { lines -> lines.forEach { line ->
-                    if (process !== child || !line.startsWith("{")) return@forEach
+                    if (process !== child) return@forEach
+                    if (!line.startsWith("{")) { log(line); return@forEach }
                     runCatching {
                         val event = JSONObject(line)
                         when (val type = event.getString("type")) {
@@ -80,5 +82,10 @@ object SourceController {
         rootPid = 0
         pending.values.forEach { it.completeExceptionally(IllegalStateException("Root process stopped")) }; pending.clear()
     }
+    /** root 进程的日志行：行首 ERROR 记为错误，其余记为信息 */
+    private fun log(line: String) {
+        if (line.startsWith("ERROR")) Log.e(LOG_TAG, line) else Log.i(LOG_TAG, line)
+    }
+    private const val LOG_TAG = "UnisonRoot"
     private fun quote(value: String) = "'" + value.replace("'", "'\\''") + "'"
 }

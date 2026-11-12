@@ -117,6 +117,13 @@ class SourcePanel extends StatelessWidget {
               const SizedBox(height: 8),
               Text('${session.app}：${sessionChannel(session)}', style: texts.bodySmall?.copyWith(color: colors.error)),
             ],
+          for (final session in source.uncaptured) ...[
+            const SizedBox(height: 8),
+            Text(
+              '${session.app}：无法采集，声音不会同步到其他设备。它的输出方式绕过了音效（快速或直通通道），本机播放不受影响',
+              style: texts.bodySmall?.copyWith(color: colors.error),
+            ),
+          ],
           const SizedBox(height: Grid.gap),
           const Divider(),
           const SizedBox(height: Grid.gap),

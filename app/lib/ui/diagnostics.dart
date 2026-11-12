@@ -81,7 +81,7 @@ class _DiagnosticsState extends State<Diagnostics> {
                             '音源 ${source.running ? '运行中' : '已停止'}',
                             '目标延迟 ${formatMs(source.latencyUs)}',
                             '本机延迟 ${formatMs(source.localDelayUs)}',
-                            if (source.sessions.isEmpty) '采集 无',
+                            if (source.sessions.isEmpty && source.uncaptured.isEmpty) '采集 无',
                           ].join('   '),
                           style: mono,
                         ),
@@ -95,6 +95,12 @@ class _DiagnosticsState extends State<Diagnostics> {
                           Text(
                             '采集 ${session.app}   ${sessionChannel(session)}   生效延迟 ${formatMs(session.delayUs)}',
                             style: mono?.copyWith(color: session.calibrated ? null : colors.error),
+                          ),
+                        for (final session in source.uncaptured)
+                          Text(
+                            '未采集 ${session.app}${session.packageName == null || session.packageName == session.app ? '' : ' (${session.packageName})'}'
+                            '   会话 ${session.sessionId}   挂载音效被拒（快速或直通通道）',
+                            style: mono?.copyWith(color: colors.error),
                           ),
                         for (final device in state.devices)
                           if (!device.isSource)
