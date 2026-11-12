@@ -180,6 +180,9 @@ Win32Window::MessageHandler(HWND hwnd,
     break;
 
     case WM_DESTROY:
+      if (fullscreen_) {
+        UnregisterHotKey(hwnd, kEscapeHotKey);
+      }
       window_handle_ = nullptr;
       Destroy();
       if (quit_on_close_) {
@@ -352,6 +355,8 @@ void Win32Window::SetFullScreen(bool on) {
     SetWindowPos(window, HWND_TOPMOST, area.left, area.top,
                  area.right - area.left, area.bottom - area.top,
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    // 远程进入时系统可能不允许取得前台，键盘仍在其他应用；注册失败则只能在取得焦点后按 Esc
+    RegisterHotKey(window, kEscapeHotKey, MOD_NOREPEAT, VK_ESCAPE);
     SetForegroundWindow(window);
     return;
   }
@@ -362,6 +367,7 @@ void Win32Window::SetFullScreen(bool on) {
     }
     placement.showCmd = SW_SHOWMINIMIZED;
   }
+  UnregisterHotKey(window, kEscapeHotKey);
   fullscreen_ = false;
   const LONG_PTR style = GetWindowLongPtr(window, GWL_STYLE);
   SetWindowLongPtr(window, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);

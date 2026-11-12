@@ -15,7 +15,13 @@ abstract final class AppWindow {
   static Future<void> init() async {
     if (!supported) return;
     _channel.setMethodCallHandler((call) async {
-      if (call.method == 'state') _onState(call.arguments as Map);
+      switch (call.method) {
+        case 'state':
+          _onState(call.arguments as Map);
+        // 黑屏期间原生以热键收到的 Esc，与黑屏层内的 Esc 走同一退出路径（重复退出无副作用）
+        case 'escape':
+          Blackout.set(false);
+      }
     });
     _onState(await _channel.invokeMethod<Map>('state') ?? const {});
   }

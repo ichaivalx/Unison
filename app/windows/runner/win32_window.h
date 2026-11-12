@@ -63,8 +63,11 @@ class Win32Window {
   bool Maximized();
   bool Minimized();
 
-  // 全屏覆盖窗口所在的显示器并置顶；退出时恢复进入前的位置与状态（期间被最小化的保持最小化）
+  // 全屏覆盖窗口所在的显示器并置顶；退出时恢复进入前的位置与状态（期间被最小化的保持最小化）。
+  // 全屏期间以热键注册 Esc：窗口未能取得前台时也能收到（WM_HOTKEY，编号 kEscapeHotKey）
   void SetFullScreen(bool on);
+
+  static constexpr int kEscapeHotKey = 1;
 
  protected:
   // Processes and route salient window messages for mouse handling,

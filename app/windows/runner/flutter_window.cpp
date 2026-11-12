@@ -118,6 +118,13 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;
+    // 黑屏期间的 Esc：交给界面按与黑屏层内 Esc 相同的路径退出
+    case WM_HOTKEY:
+      if (wparam == kEscapeHotKey && window_channel_) {
+        window_channel_->InvokeMethod("escape", nullptr);
+        return 0;
+      }
+      break;
   }
 
   const LRESULT handled = Win32Window::MessageHandler(hwnd, message, wparam, lparam);
