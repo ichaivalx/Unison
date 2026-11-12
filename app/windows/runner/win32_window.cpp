@@ -139,6 +139,9 @@ bool Win32Window::Create(const std::wstring& title,
   }
 
   UpdateTheme(window);
+  // 按收回顶部后的非客户区重新计算一次，首帧即没有原生标题栏
+  SetWindowPos(window, nullptr, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
   return OnCreate();
 }
@@ -216,17 +219,16 @@ Win32Window::MessageHandler(HWND hwnd,
       }
       return 0;
 
-    // 去掉标题栏：按标准边框计算后收回顶部，保留左、右、下的缩放边框
+    // 去掉标题栏：按标准边框计算后收回顶部，保留左、右、下的缩放边框。wparam 为 FALSE 时 lparam
+    // 指向单个 RECT，与 NCCALCSIZE_PARAMS 的 rgrc[0] 同位。窗口类带 CS_HREDRAW | CS_VREDRAW，
+    // DefWindowProc 会返回重绘标志，原样返回
     case WM_NCCALCSIZE:
-      if (wparam && !fullscreen_) {
-        auto params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lparam);
-        const LONG top = params->rgrc[0].top;
+      if (!fullscreen_) {
+        auto client = reinterpret_cast<RECT*>(lparam);
+        const LONG top = client->top;
         const LRESULT result = DefWindowProc(hwnd, message, wparam, lparam);
-        if (result != 0) {
-          return result;
-        }
-        params->rgrc[0].top = top + (IsZoomed(hwnd) ? FrameHeight() : 0);
-        return 0;
+        client->top = top + (IsZoomed(hwnd) ? FrameHeight() : 0);
+        return result;
       }
       break;
 
