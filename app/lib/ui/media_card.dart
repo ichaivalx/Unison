@@ -138,7 +138,7 @@ class _MediaCardState extends State<MediaCard> {
         SliderTheme(
           data: SliderTheme.of(context).copyWith(
             overlayShape: const RoundSliderOverlayShape(overlayRadius: 16),
-            thumbShape: RoundSliderThumbShape(enabledThumbRadius: seekable ? 6 : 0),
+            thumbShape: RoundSliderThumbShape(enabledThumbRadius: seekable ? 6 : 0, elevation: 0, pressedElevation: 0),
           ),
           child: Slider(
             padding: EdgeInsets.zero,

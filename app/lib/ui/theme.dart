@@ -11,12 +11,6 @@ const _muted = Color(0xFF8E8E97);
 const _good = Color(0xFF86D1A8);
 const _bad = Color(0xFFF08A80);
 
-/// 接收端通道条顶部的标识色；音源用主色
-const receiverMark = Color(0xFF7D93AD);
-
-/// 推子钮的正面
-const faderCap = (Color(0xFF4B4E56), Color(0xFF2B2D33));
-
 /// 栅格：页面边距、区块间距与圆角
 abstract final class Grid {
   static const unit = 8.0;
@@ -64,6 +58,8 @@ ThemeData buildTheme(DarkVariant variant) {
     surfaceContainerHighest: raised,
     outline: _muted,
     outlineVariant: line,
+    // 层次只靠纯色明度差，抬起的表面不叠加主色
+    surfaceTint: Colors.transparent,
   );
   final base = ThemeData(
     useMaterial3: true,
@@ -80,7 +76,7 @@ ThemeData buildTheme(DarkVariant variant) {
       inactiveTrackColor: line,
       thumbColor: _accent,
       overlayColor: _accent.withValues(alpha: 0.12),
-      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7),
+      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 7, elevation: 0, pressedElevation: 0),
       showValueIndicator: ShowValueIndicator.never,
     ),
     switchTheme: SwitchThemeData(
@@ -97,6 +93,8 @@ ThemeData buildTheme(DarkVariant variant) {
     bottomSheetTheme: BottomSheetThemeData(
       backgroundColor: card,
       showDragHandle: true,
+      elevation: 0,
+      modalElevation: 0,
       dragHandleColor: line,
       constraints: const BoxConstraints(maxWidth: 560),
     ),

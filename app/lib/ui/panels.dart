@@ -57,11 +57,7 @@ class StatusDot extends StatelessWidget {
   Widget build(BuildContext context) => Container(
     width: size,
     height: size,
-    decoration: BoxDecoration(
-      color: color,
-      shape: BoxShape.circle,
-      boxShadow: [BoxShadow(color: color.withValues(alpha: 0.5), blurRadius: 6)],
-    ),
+    decoration: BoxDecoration(color: color, shape: BoxShape.circle),
   );
 }
 

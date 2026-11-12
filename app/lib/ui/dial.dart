@@ -101,14 +101,12 @@ class _DialPainter extends CustomPainter {
       final tick = index + i;
       // 刻度随手指移动，较大值在左侧，向中心滚入
       final x = mid - i * _extent + drag;
-      final distance = (x - mid).abs() / mid;
-      if (distance > 1) continue;
+      if ((x - mid).abs() > mid) continue;
       final major = tick % 10 == 0;
       final length = size.height * (major ? 0.62 : (tick.isEven ? 0.4 : 0.26));
-      final fade = 1 - distance;
       paint
         ..strokeWidth = major ? 2 : 1.2
-        ..color = color.withValues(alpha: fade * fade * (major ? 0.85 : 0.55));
+        ..color = color.withValues(alpha: major ? 0.6 : 0.3);
       final top = (size.height - length) / 2;
       canvas.drawLine(Offset(x, top), Offset(x, top + length), paint);
     }

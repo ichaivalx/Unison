@@ -145,12 +145,10 @@ class ChannelStrip extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            // 标识条：音源用主色，接收端用冷色
-            Container(height: 4, color: device.isSource ? colors.primary : receiverMark),
             SizedBox(
-              height: 74,
+              height: 78,
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 10, 10, 0),
+                padding: const EdgeInsets.fromLTRB(12, 14, 10, 0),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -421,8 +419,9 @@ class _OffsetControl extends StatelessWidget {
   }
 }
 
-/// 竖向推子（0~100）：上下拖动按相对位移调节，不会跳到按下处；滚轮每格 1，获得焦点后方向键
-/// 每次 1、翻页键每次 10。拖动期间以本地值为准、按绝对值提交
+/// 竖向推子（0~100）：细轨道从底部到当前值以主色填充，扁平滑块。上下拖动按相对位移调节，不会
+/// 跳到按下处；纵向滚轮每格 1，获得焦点后方向键每次 1、翻页键每次 10。拖动期间以本地值为准、
+/// 按绝对值提交
 class Fader extends StatefulWidget {
   const Fader({super.key, required this.value, required this.onChanged, required this.label, this.active = true});
 
@@ -430,7 +429,7 @@ class Fader extends StatefulWidget {
   final ValueChanged<int> onChanged;
   final String label;
 
-  /// 有声音经过：填充用主色，否则用灰色
+  /// 有声音经过：填充用主色，否则用低对比度的灰
   final bool active;
 
   @override
@@ -445,6 +444,8 @@ class _FaderState extends State<Fader> {
   Timer? _release;
   double _drag = 0;
   bool _focused = false;
+  bool _hovered = false;
+  bool _dragging = false;
 
   int get _value => _pending ?? widget.value;
 
@@ -466,11 +467,11 @@ class _FaderState extends State<Fader> {
     });
   }
 
+  /// 只接纵向滚动，横向滚动留给外层的横向列表
   void _onPointerSignal(PointerSignalEvent event) {
-    if (event is! PointerScrollEvent) return;
+    if (event is! PointerScrollEvent || event.scrollDelta.dy == 0) return;
     GestureBinding.instance.pointerSignalResolver.register(event, (event) {
-      final delta = (event as PointerScrollEvent).scrollDelta.dy;
-      if (delta != 0) _set(_value + (delta < 0 ? 1 : -1));
+      _set(_value + ((event as PointerScrollEvent).scrollDelta.dy < 0 ? 1 : -1));
     });
   }
 
@@ -488,9 +489,12 @@ class _FaderState extends State<Fader> {
     return KeyEventResult.handled;
   }
 
+  void _endDrag([_]) => setState(() => _dragging = false);
+
   @override
   Widget build(BuildContext context) {
     final colors = context.colors;
+    final emphasized = _hovered || _dragging;
     return Semantics(
       label: widget.label,
       value: '$_value%',
@@ -501,33 +505,41 @@ class _FaderState extends State<Fader> {
         onFocusChange: (focused) => setState(() => _focused = focused),
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final travel = (constraints.maxHeight - _FaderPainter.capHeight - 2 * _FaderPainter.inset).clamp(1.0, double.infinity);
-            return Listener(
-              onPointerSignal: _onPointerSignal,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTapDown: (_) => _focus.requestFocus(),
-                onVerticalDragStart: (_) {
-                  _drag = 0;
-                  _focus.requestFocus();
-                },
-                onVerticalDragUpdate: (details) {
-                  _drag -= details.delta.dy / travel * 100;
-                  final steps = _drag.truncate();
-                  if (steps != 0) {
-                    _drag -= steps;
-                    _set(_value + steps);
-                  }
-                },
-                child: CustomPaint(
-                  size: Size(constraints.maxWidth, constraints.maxHeight),
-                  painter: _FaderPainter(
-                    value: _value,
-                    focused: _focused,
-                    fill: widget.active ? colors.primary : colors.outline,
-                    slot: colors.surface,
-                    tick: colors.onSurfaceVariant,
-                    focus: colors.primary,
+            final travel = (constraints.maxHeight - 2 * _FaderPainter.inset).clamp(1.0, double.infinity);
+            return MouseRegion(
+              onEnter: (_) => setState(() => _hovered = true),
+              onExit: (_) => setState(() => _hovered = false),
+              child: Listener(
+                onPointerSignal: _onPointerSignal,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (_) => _focus.requestFocus(),
+                  onVerticalDragStart: (_) {
+                    _drag = 0;
+                    _focus.requestFocus();
+                    setState(() => _dragging = true);
+                  },
+                  onVerticalDragUpdate: (details) {
+                    _drag -= details.delta.dy / travel * 100;
+                    final steps = _drag.truncate();
+                    if (steps != 0) {
+                      _drag -= steps;
+                      _set(_value + steps);
+                    }
+                  },
+                  onVerticalDragEnd: _endDrag,
+                  onVerticalDragCancel: _endDrag,
+                  child: CustomPaint(
+                    size: Size(constraints.maxWidth, constraints.maxHeight),
+                    painter: _FaderPainter(
+                      value: _value,
+                      emphasized: emphasized,
+                      focused: _focused,
+                      track: colors.outlineVariant,
+                      fill: widget.active ? colors.primary : Color.lerp(colors.outlineVariant, colors.outline, 0.45)!,
+                      thumb: widget.active ? colors.onSurface : colors.outline,
+                      focus: colors.primary,
+                    ),
                   ),
                 ),
               ),
@@ -542,89 +554,54 @@ class _FaderState extends State<Fader> {
 class _FaderPainter extends CustomPainter {
   _FaderPainter({
     required this.value,
+    required this.emphasized,
     required this.focused,
+    required this.track,
     required this.fill,
-    required this.slot,
-    required this.tick,
+    required this.thumb,
     required this.focus,
   });
 
-  static const capHeight = 30.0;
-  static const capWidth = 46.0;
-  static const inset = 6.0;
+  /// 滑块中心离轨道两端的距离，悬停放大后仍在范围内
+  static const inset = 12.0;
 
   final int value;
+
+  /// 悬停或拖动中：滑块略放大
+  final bool emphasized;
   final bool focused;
+  final Color track;
   final Color fill;
-  final Color slot;
-  final Color tick;
+  final Color thumb;
   final Color focus;
 
   @override
   void paint(Canvas canvas, Size size) {
     final x = size.width / 2;
-    final top = inset + capHeight / 2;
-    final bottom = size.height - inset - capHeight / 2;
-    double yOf(num v) => bottom - (bottom - top) * v / 100;
+    final top = inset;
+    final bottom = size.height - inset;
+    final y = bottom - (bottom - top) * value / 100;
 
-    // 刻度：每 10 一格，0、50、100 较长
-    final ticks = Paint()..strokeWidth = 1;
-    for (var v = 0; v <= 100; v += 10) {
-      final major = v % 50 == 0;
-      final y = yOf(v);
-      final length = major ? 9.0 : 5.0;
-      ticks.color = tick.withValues(alpha: major ? 0.6 : 0.35);
-      canvas
-        ..drawLine(Offset(x - 16 - length, y), Offset(x - 16, y), ticks)
-        ..drawLine(Offset(x + 16, y), Offset(x + 16 + length, y), ticks);
-    }
-
-    // 推子槽与已推起的部分
-    final y = yOf(value);
     canvas.drawRRect(
-      RRect.fromRectAndRadius(Rect.fromLTRB(x - 3, top - 4, x + 3, bottom + 4), const Radius.circular(3)),
-      Paint()..color = slot,
+      RRect.fromRectAndRadius(Rect.fromLTRB(x - 3, top, x + 3, bottom), const Radius.circular(3)),
+      Paint()..color = track,
     );
     canvas.drawRRect(
-      RRect.fromRectAndRadius(Rect.fromLTRB(x - 1.5, y, x + 1.5, bottom + 2), const Radius.circular(1.5)),
-      Paint()..color = fill.withValues(alpha: 0.85),
+      RRect.fromRectAndRadius(Rect.fromLTRB(x - 3, y, x + 3, bottom), const Radius.circular(3)),
+      Paint()..color = fill,
     );
 
-    // 推子钮
-    final cap = RRect.fromRectAndRadius(
-      Rect.fromCenter(center: Offset(x, y), width: capWidth, height: capHeight),
-      const Radius.circular(6),
+    final handle = RRect.fromRectAndRadius(
+      Rect.fromCenter(center: Offset(x, y), width: emphasized ? 40 : 36, height: emphasized ? 16 : 14),
+      const Radius.circular(7),
     );
-    canvas.drawShadow(Path()..addRRect(cap), Colors.black, 4, false);
-    canvas.drawRRect(
-      cap,
-      Paint()
-        ..shader = LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: [faderCap.$1, faderCap.$2],
-        ).createShader(cap.outerRect),
-    );
-    // 钮面的横纹与读数线
-    final grip = Paint()
-      ..color = Colors.black.withValues(alpha: 0.35)
-      ..strokeWidth = 1;
-    for (final dy in [-9.0, -5.0, 5.0, 9.0]) {
-      canvas.drawLine(Offset(x - capWidth / 2 + 8, y + dy), Offset(x + capWidth / 2 - 8, y + dy), grip);
-    }
-    canvas.drawLine(
-      Offset(x - capWidth / 2 + 4, y),
-      Offset(x + capWidth / 2 - 4, y),
-      Paint()
-        ..color = const Color(0xFFF2F2F5)
-        ..strokeWidth = 2,
-    );
+    canvas.drawRRect(handle, Paint()..color = thumb);
     if (focused) {
       canvas.drawRRect(
-        cap.inflate(3),
+        handle.inflate(3),
         Paint()
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2
+          ..strokeWidth = 1.5
           ..color = focus,
       );
     }
@@ -632,5 +609,10 @@ class _FaderPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_FaderPainter old) =>
-      value != old.value || focused != old.focused || fill != old.fill || slot != old.slot || tick != old.tick;
+      value != old.value ||
+      emphasized != old.emphasized ||
+      focused != old.focused ||
+      track != old.track ||
+      fill != old.fill ||
+      thumb != old.thumb;
 }
