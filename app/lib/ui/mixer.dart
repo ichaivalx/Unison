@@ -8,6 +8,7 @@ import '../control/calibration.dart';
 import '../control/console.dart';
 import '../control/models.dart';
 import '../control/protocol.dart';
+import '../desktop.dart';
 import 'dial.dart';
 import 'panels.dart';
 import 'theme.dart';
@@ -19,7 +20,7 @@ class Mixer extends StatefulWidget {
   static const stripWidth = 140.0;
 
   /// 通道条的最小高度；可用高度更大时推子随之加长
-  static const minHeight = 470.0;
+  static const minHeight = 500.0;
 
   /// 单栏布局中通道条的高度
   static const narrowHeight = 540.0;
@@ -44,6 +45,8 @@ class _MixerState extends State<Mixer> {
   Widget build(BuildContext context) {
     final state = widget.state;
     final calibrating = state.calibration.stage == CalibrationStage.running;
+    // 有设备可黑屏时各条都留出按键的位置，推子保持对齐
+    final blackout = state.devices.any((d) => d.blackout != null);
     return Scrollbar(
       controller: _scroll,
       child: ListView.separated(
@@ -60,6 +63,7 @@ class _MixerState extends State<Mixer> {
             device: device,
             source: state.source,
             calibrating: calibrating,
+            blackoutRow: blackout,
           );
         },
       ),
@@ -75,6 +79,7 @@ class ChannelStrip extends StatelessWidget {
     required this.device,
     required this.source,
     required this.calibrating,
+    required this.blackoutRow,
   });
 
   final Console console;
@@ -83,6 +88,9 @@ class ChannelStrip extends StatelessWidget {
 
   /// 校准期间偏移不可调
   final bool calibrating;
+
+  /// 留出黑屏按键的位置；设备支持黑屏时显示按键
+  final bool blackoutRow;
 
   /// 偏移每格 0.5ms
   static const _offsetStep = 500;
@@ -105,6 +113,15 @@ class ChannelStrip extends StatelessWidget {
   }
 
   void _command(String command, Map<String, Object?> args) => console.command(command, {'id': device.id, ...args});
+
+  /// 本机直接进入黑屏，其他设备经音源转达
+  void _blackout(bool on) {
+    if (device.id == console.selfId) {
+      Blackout.set(on);
+    } else {
+      _command(Command.blackout, {'on': on});
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -231,6 +248,22 @@ class ChannelStrip extends StatelessWidget {
                       onSteps: (steps) => _command(Command.offset, {'deltaUs': steps * _offsetStep}),
                     ),
             ),
+            if (blackoutRow)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 0, 10, 12),
+                child: SizedBox(
+                  height: 34,
+                  child: switch (device.blackout) {
+                    null => null,
+                    final on => LitButton(
+                      label: on ? '退出黑屏' : '黑屏',
+                      icon: Icons.bedtime_outlined,
+                      on: on,
+                      onPressed: () => _blackout(!on),
+                    ),
+                  },
+                ),
+              ),
           ],
         ),
       ),

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../control/console.dart';
 import '../control/models.dart';
+import '../desktop.dart';
 import 'diagnostics.dart';
 import 'media_card.dart';
 import 'mixer.dart';
@@ -73,6 +74,12 @@ class _Home extends StatelessWidget {
           margin: margin + safe.left,
           desktop: desktop,
           actions: [
+            if (desktop && Blackout.supported)
+              IconButton(
+                tooltip: '黑屏（播放照常，Esc 或点击退出）',
+                onPressed: () => Blackout.set(true),
+                icon: const Icon(Icons.bedtime_outlined),
+              ),
             IconButton(
               tooltip: '设置',
               onPressed: () => showSettingsSheet(context),

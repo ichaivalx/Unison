@@ -132,6 +132,7 @@ class DeviceView {
     required this.volume,
     required this.actualVolume,
     required this.stats,
+    this.blackout,
   });
 
   final String id;
@@ -154,6 +155,9 @@ class DeviceView {
   final double? actualVolume;
   final ReceiverStats? stats;
 
+  /// 在线且支持黑屏的设备当前是否黑屏；其他设备为 null
+  final bool? blackout;
+
   Map<String, Object?> toJson() => {
     'id': id,
     'name': name,
@@ -166,6 +170,7 @@ class DeviceView {
     'volume': volume.toJson(),
     'actualVolume': actualVolume,
     'stats': stats == null ? null : statsToJson(stats!),
+    'blackout': blackout,
   };
 
   static DeviceView fromJson(Map json) => DeviceView(
@@ -180,6 +185,7 @@ class DeviceView {
     volume: VolumeSetting.fromJson(json['volume']),
     actualVolume: (json['actualVolume'] as num?)?.toDouble(),
     stats: statsFromJson(json['stats']),
+    blackout: json['blackout'] as bool?,
   );
 }
 

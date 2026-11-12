@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:unison_native/unison_native.dart';
 
+import '../desktop.dart';
 import '../settings.dart';
 import 'clock.dart';
 import 'console.dart';
@@ -89,6 +90,8 @@ class ConsoleClient implements Console {
     UnisonNative.receiverStats.listen(_onStats, onError: (_) {});
     UnisonNative.volumeChanges.listen(_onVolume, onError: (_) {});
     UnisonNative.exitRequests.listen((_) => _exit(), onError: (_) {});
+    // 本机进入或退出黑屏（含本机手动退出）时立即回报
+    Blackout.active.addListener(_report);
     await _transport.start();
     Timer.periodic(const Duration(seconds: 1), (_) => _report());
     _initNative();
@@ -166,6 +169,7 @@ class ConsoleClient implements Console {
       'name': LocalSettings.deviceName,
       'platform': LocalSettings.platform.name,
       'receiverId': _receiverId,
+      'blackout': Blackout.supported,
     });
   }
 
@@ -178,6 +182,8 @@ class ConsoleClient implements Console {
           _fallbackOffsetUs = nowUs - state.sentAtUs;
           _state.value = state;
         }
+      case MessageType.blackout:
+        Blackout.set(message['on'] == true);
       case MessageType.apply:
         final host = _transport.connection?.address;
         final session = _session;
@@ -321,6 +327,7 @@ class ConsoleClient implements Console {
       'receiving': _receiverOn,
       'offsetUs': _offsetUs,
       'appliedVolume': _targetVolume,
+      'blackout': Blackout.active.value,
     });
   }
 }

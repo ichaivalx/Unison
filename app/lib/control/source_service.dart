@@ -50,6 +50,10 @@ class _Peer {
   int? reportedOffsetUs;
   double? reportedVolume;
 
+  /// 设备声明支持黑屏，及回报的是否黑屏
+  bool blackoutSupported = false;
+  bool blackout = false;
+
   /// 设置已生效且同步误差持续在阈值内的起始时刻
   int? stableSince;
 
@@ -364,7 +368,8 @@ class SourceService implements Console {
             // 未知（null）与任何设置都不一致，持续重发直到设备确认
             ..reportedReceiving = message['receiving'] as bool?
             ..reportedOffsetUs = (message['offsetUs'] as num?)?.toInt()
-            ..reportedVolume = (message['appliedVolume'] as num?)?.toDouble();
+            ..reportedVolume = (message['appliedVolume'] as num?)?.toDouble()
+            ..blackout = message['blackout'] == true;
           if (!_synced(peer)) {
             peer.resetStability();
           } else if (!peer.confirmed) {
@@ -419,6 +424,8 @@ class SourceService implements Console {
       ..name = message['name'] as String? ?? peer.name
       ..platform = DevicePlatform.values.asNameMap()[message['platform']] ?? peer.platform
       ..receiverId = (message['receiverId'] as num?)?.toInt()
+      ..blackoutSupported = message['blackout'] == true
+      ..blackout = false
       ..connection = connection
       ..stats = null
       ..applied = null
@@ -513,6 +520,8 @@ class SourceService implements Console {
           peer.receive = args['on'] == true;
           _savePeers();
         }
+      case Command.blackout:
+        if (args['on'] case final bool on) peer?.connection?.send({'t': MessageType.blackout, 'on': on});
       case Command.calibrate:
         _calibrate();
       case Command.calibrateCancel:
@@ -834,6 +843,7 @@ class SourceService implements Console {
             volume: peer.volume,
             actualVolume: peer.actualVolume,
             stats: peer.stats,
+            blackout: peer.blackoutSupported && peer.connection != null ? peer.blackout : null,
           ),
       ],
       calibration: _calibration,

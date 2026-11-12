@@ -61,6 +61,9 @@ abstract final class MessageType {
 
   /// 设备 → 音源：控制台操作（字段 `c` 见 [Command]）
   static const command = 'cmd';
+
+  /// 音源 → 设备：进入（`on` 为 true）或退出黑屏
+  static const blackout = 'blackout';
 }
 
 /// 控制台操作（字段 `c`）
@@ -79,6 +82,9 @@ abstract final class Command {
   static const calibrateUndo = 'calibrateUndo';
   static const calibrateClose = 'calibrateClose';
   static const bandWeight = 'bandWeight';
+
+  /// 让设备 `id` 进入（`on` 为 true）或退出黑屏
+  static const blackout = 'blackout';
 
   /// 校准时临时提高音量：`on` 开关，`level` 目标音量（0~1）
   static const boost = 'boost';

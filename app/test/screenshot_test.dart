@@ -181,6 +181,7 @@ ConsoleState _state() => ConsoleState(
       volume: const VolumeSetting(mode: VolumeMode.follow, offset: -0.05, level: 0.5),
       actualVolume: 0.55,
       stats: _stats(clockReady: true, errorUs: 120),
+      blackout: false,
     ),
     DeviceView(
       id: 'phone',

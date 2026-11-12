@@ -10,6 +10,7 @@ import 'control/console.dart';
 import 'control/source_service.dart';
 import 'desktop.dart';
 import 'settings.dart';
+import 'ui/blackout_layer.dart';
 import 'ui/home.dart';
 import 'ui/theme.dart';
 
@@ -18,6 +19,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await LocalSettings.init();
   await AppWindow.init();
+  Blackout.init();
   final console = ValueNotifier<Console?>(null);
   runApp(UnisonApp(console: console));
   console.value = await _open();
@@ -111,6 +113,7 @@ class _UnisonAppState extends State<UnisonApp> {
             supportedLocales: const [Locale('zh', 'CN')],
             localizationsDelegates: GlobalMaterialLocalizations.delegates,
             home: HomePage(console: widget.console, desktop: AppWindow.supported),
+            builder: (context, child) => Stack(children: [?child, const BlackoutLayer()]),
           ),
         );
       },
