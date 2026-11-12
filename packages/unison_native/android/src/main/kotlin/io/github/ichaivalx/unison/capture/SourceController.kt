@@ -82,9 +82,9 @@ object SourceController {
         rootPid = 0
         pending.values.forEach { it.completeExceptionally(IllegalStateException("Root process stopped")) }; pending.clear()
     }
-    /** root 进程的日志行：行首 ERROR 记为错误，其余记为信息 */
+    /** root 进程的事件日志：行首 ERROR 记为错误、INFO 记为信息；每秒的 STATUS 等其他行不写入 */
     private fun log(line: String) {
-        if (line.startsWith("ERROR")) Log.e(LOG_TAG, line) else Log.i(LOG_TAG, line)
+        if (line.startsWith("ERROR")) Log.e(LOG_TAG, line) else if (line.startsWith("INFO")) Log.i(LOG_TAG, line)
     }
     private const val LOG_TAG = "UnisonRoot"
     private fun quote(value: String) = "'" + value.replace("'", "'\\''") + "'"

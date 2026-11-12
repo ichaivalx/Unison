@@ -96,46 +96,55 @@ internal class AcousticCalibration(
     }
 
     /**
-     * 测试音的一种播放方式。省电模式由 AudioTrack 加上 FLAG_DEEP_BUFFER，走大缓冲通道；普通模式且缓冲
-     * 不足 100ms 时不会被自动加上该标志（AudioTrack.shouldEnablePowerSaving），与多数播放器一样走主输出。
+     * 测试音的一种播放方式，[rate] 为轨道自己的采样率。
+     * - powerSaving：省电模式，AudioTrack 加上 FLAG_DEEP_BUFFER，走大缓冲通道。
+     * - lowLatencyResampled：请求低延迟（FAST），输出策略因此选快速输出；采样率故意与原生输出不同，
+     *   AudioFlinger 不让它走快速路径，成为快速输出线程上的普通轨道（可挂音效），与请求快速轨道而被
+     *   降级的播放器（如 OpenSL ES 播 44.1kHz）同路。不带标志的普通轨道在不少设备上会被策略改走大缓冲。
      */
-    private class Request(val name: String, val mode: Int, val bufferMs: Int)
+    private class Request(val name: String, val mode: Int, val bufferMs: Int, val rate: Int)
     private val requests = listOf(
-        Request("powerSaving", AudioTrack.PERFORMANCE_MODE_POWER_SAVING, 200),
-        Request("normal", AudioTrack.PERFORMANCE_MODE_NONE, 40),
+        Request("powerSaving", AudioTrack.PERFORMANCE_MODE_POWER_SAVING, 200, RATE),
+        Request("lowLatencyResampled", AudioTrack.PERFORMANCE_MODE_LOW_LATENCY, 40,
+            if (source.outputSampleRate() == 44_100) 48_000 else 44_100),
     )
 
-    /** 播放中的测试音轨道及其写入线程 */
-    private inner class Tone(request: Request) {
+    /** 测试音轨道及其写入线程；挂载效果被拒时 [attached] 为 false，不播放 */
+    private inner class Tone(val request: Request) {
         val track: AudioTrack
+        val attached: Boolean
         @Volatile var stopped = false
-        private val writer: Thread
+        private val writer: Thread?
 
         init {
-            val format = AudioFormat.Builder().setSampleRate(RATE).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+            val rate = request.rate
+            val format = AudioFormat.Builder().setSampleRate(rate).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build()
             track = AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
                 .setAudioFormat(format).setTransferMode(AudioTrack.MODE_STREAM)
                 .setPerformanceMode(request.mode)
-                .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT), RATE * request.bufferMs / 1000 * 4)).build()
+                .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT), rate * request.bufferMs / 1000 * 4)).build()
             writer = try {
                 sessionId = track.audioSessionId
                 source.setCalibrationSession(track.audioSessionId)
                 val deadline = System.nanoTime() + 3_000_000_000L
-                while (track.audioSessionId !in source.activeSessions()) {
+                while (track.audioSessionId !in source.activeSessions() && !source.attachFailed(track.audioSessionId)) {
                     check(System.nanoTime() < deadline) { "Calibration effect could not be attached" }; pause(20)
                 }
-                track.play()
-                thread(name = "calibration-output", isDaemon = true) { writeAudio(this) }
+                if (track.audioSessionId !in source.activeSessions()) null else {
+                    track.play()
+                    thread(name = "calibration-output", isDaemon = true) { writeAudio(this) }
+                }
             } catch (error: Throwable) { track.release(); throw error }
+            attached = writer != null
         }
 
         fun close() {
             stopped = true
             runCatching { track.pause() }
-            joinThread(writer)
+            writer?.let { joinThread(it) }
             track.release()
         }
     }
@@ -157,16 +166,24 @@ internal class AcousticCalibration(
             val local = org.json.JSONArray()
             val measured = mutableSetOf<String>()
             var microphoneAnchor: Long? = null
+            // 接收端在最后一个挂上效果的测试音上测量
+            var playable: Request? = null
             for (request in requests) {
                 tone?.close(); tone = null
                 val current = Tone(request)
                 tone = current
                 check(!cancelled) { "校准已停止" }
+                // 挂不上效果（真的拿到了快速轨道）时该通道本次没有测到
+                if (!current.attached) {
+                    println("INFO calibration_channel request=${request.name} rate=${request.rate} attached=false")
+                    step += perDevice; continue
+                }
+                playable = request
                 // 测试音须确实落在已确定的通道上；与已测通道相同时不重复测量
                 val channel = checkNotNull(source.channelOf(current.track.audioSessionId)) {
                     "无法确定测试音所在的输出通道（${request.name}）"
                 }
-                println("INFO calibration_channel request=${request.name} channel=$channel duplicate=${channel in measured}")
+                println("INFO calibration_channel request=${request.name} rate=${request.rate} channel=$channel duplicate=${channel in measured}")
                 if (!measured.add(channel)) { step += perDevice; continue }
                 pause(if (microphoneAnchor == null) 2500 else 1000)
                 val anchor = microphoneAnchor ?: checkNotNull(micOriginNs) { "Microphone monotonic timestamp unavailable" }
@@ -176,6 +193,10 @@ internal class AcousticCalibration(
                 local.put(JSONObject().put("channel", channel).put("request", request.name).put("measurements", values))
             }
             val anchor = checkNotNull(microphoneAnchor)
+            if (tone?.attached != true) {
+                tone?.close(); tone = null
+                tone = Tone(checkNotNull(playable)).also { check(it.attached) { "Calibration effect could not be attached" } }
+            }
             val remote = JSONObject()
             for (receiver in receivers) {
                 remote.put(receiver.toString(), measure(receiver, receiver.toString(), anchor, step, total))
@@ -211,9 +232,11 @@ internal class AcousticCalibration(
                 progress(JSONObject().put("step", step).put("totalSteps", total)
                     .put("description", "$name ${band.name} ${round + 1}/3"))
                 if (receiver == null || subscribed(receiver)) {
-                    val sine = chirp(band, round, false)
-                    val cosine = chirp(band, round, true)
-                    val wave = ShortArray(band.frames * 2) { (sine[it / 2] * 0.35f * 32767).roundToInt().toShort() }
+                    // 检测按取样侧的线程采样率；写入的测试音是同一信号按测试音轨道的采样率生成
+                    val sine = chirp(band, round, false, RATE)
+                    val cosine = chirp(band, round, true, RATE)
+                    val played = chirp(band, round, false, checkNotNull(tone).request.rate)
+                    val wave = ShortArray(played.size * 2) { (played[it / 2] * 0.35f * 32767).roundToInt().toShort() }
                     val periodMs = maxOf(localDelayUs, latencyUs).coerceAtLeast(0) / 1000 + 1500
                     val current = Window(((periodMs + 250) * RATE / 1000).toInt())
                     window = current
@@ -248,14 +271,19 @@ internal class AcousticCalibration(
         return valuesForDevice
     }
 
-    private fun chirp(band: Band, round: Int, quadrature: Boolean): FloatArray {
+    /** 频段的扫频信号按采样率 [rate] 取样；时长与渐变长度按 [RATE] 下的帧数定义，与采样率无关 */
+    private fun chirp(band: Band, round: Int, quadrature: Boolean, rate: Int): FloatArray {
         val f0 = if (round % 2 == 0) band.low else band.high
         val f1 = if (round % 2 == 0) band.high else band.low
-        val k = ln(f1 / f0) / (band.frames.toDouble() / RATE)
-        return FloatArray(band.frames) { index ->
-            val phase = 2 * PI * f0 * (exp(k * index / RATE) - 1) / k
-            val edge = minOf(index, band.frames - 1 - index)
-            val taper = if (edge >= band.taper) 1.0 else 0.5 * (1 - cos(PI * edge / band.taper))
+        val seconds = band.frames.toDouble() / RATE
+        val taperSeconds = band.taper.toDouble() / RATE
+        val k = ln(f1 / f0) / seconds
+        val frames = (seconds * rate).roundToInt()
+        return FloatArray(frames) { index ->
+            val time = index.toDouble() / rate
+            val phase = 2 * PI * f0 * (exp(k * time) - 1) / k
+            val edge = minOf(index, frames - 1 - index).toDouble() / rate
+            val taper = if (edge >= taperSeconds) 1.0 else 0.5 * (1 - cos(PI * edge / taperSeconds))
             ((if (quadrature) cos(phase) else sin(phase)) * taper).toFloat()
         }
     }

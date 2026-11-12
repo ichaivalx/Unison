@@ -265,6 +265,12 @@ internal class EffectSource {
     /** 会话所在的输出通道；未挂载或未能确定时为 null */
     fun channelOf(id: Int): String? = synchronized(lock) { sessions[id]?.channel }
 
+    /** 设备原生输出采样率；读不到时为 null */
+    fun outputSampleRate(): Int? = manager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull()
+
+    /** 会话挂载效果被拒（例如拿到了快速轨道） */
+    fun attachFailed(id: Int): Boolean = synchronized(lock) { id in failed }
+
     fun supportsUnprocessedMic(): Boolean = manager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
 
     fun setCalibrationSession(id: Int?) {

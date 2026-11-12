@@ -388,7 +388,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
             }
             joinThread(controlThread); joinThread(statusThread); joinThread(captureThread)
             publishStatus()
-            println("STOPPED reason=$reason")
+            println("INFO source_stopped reason=$reason")
         } finally { closeFinished.countDown() }
         return true
     }
