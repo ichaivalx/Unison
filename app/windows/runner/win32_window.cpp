@@ -337,12 +337,13 @@ void Win32Window::SetFullScreen(bool on) {
   if (on == fullscreen_ || window == nullptr) {
     return;
   }
-  const LONG_PTR style = GetWindowLongPtr(window, GWL_STYLE);
   if (on) {
     GetWindowPlacement(window, &placement_);
     if (IsIconic(window) || IsZoomed(window)) {
       ShowWindow(window, SW_RESTORE);
     }
+    // 还原后再读样式，并清掉状态位：最大化、最小化由保存的位置在退出时恢复
+    const LONG_PTR style = GetWindowLongPtr(window, GWL_STYLE) & ~(WS_MINIMIZE | WS_MAXIMIZE);
     MONITORINFO monitor{sizeof(MONITORINFO)};
     GetMonitorInfo(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor);
     const RECT& area = monitor.rcMonitor;
@@ -362,6 +363,7 @@ void Win32Window::SetFullScreen(bool on) {
     placement.showCmd = SW_SHOWMINIMIZED;
   }
   fullscreen_ = false;
+  const LONG_PTR style = GetWindowLongPtr(window, GWL_STYLE);
   SetWindowLongPtr(window, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
   SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);

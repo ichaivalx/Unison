@@ -87,7 +87,7 @@ class _DiagnosticsState extends State<Diagnostics> {
                         ),
                         for (final channel in source.channels)
                           Text(
-                            '通道 ${channelLabel(channel.channel)}（${channel.channel}）   出声 ${formatMs(channel.latencyUs)}   '
+                            '通道 ${channelName(channel.channel)}   出声 ${formatMs(channel.latencyUs)}   '
                             '${channel.base ? '基准' : '补偿 +${formatMs(channel.compensationUs)}'}',
                             style: mono,
                           ),

@@ -12,7 +12,8 @@ internal class AudioOutputs private constructor(val channels: Map<Int, String>, 
 
     companion object {
         private val ioLine = Regex("""^\s*I/O handle: (\d+)""")
-        private val flagsLine = Regex("""^\s*AudioStreamOut: \S+ flags (0x[0-9a-fA-F]+)(?: \((.*)\))?""")
+        // AudioFlinger 以 %#x 打印，零值为 "flags 0 (AUDIO_OUTPUT_FLAG_NONE)"
+        private val flagsLine = Regex("""^\s*AudioStreamOut: \S+ flags (0x[0-9a-fA-F]+|0)(?: \((.*)\))?""")
         private val flagName = Regex("""AUDIO_OUTPUT_FLAG_([A-Z0-9_]+)""")
         // Track::appendDump：类型与编号、Active、pid/uid、Session、Port、状态、cblk flags、格式、声道、
         // 采样率、流类型、用途（十六进制）

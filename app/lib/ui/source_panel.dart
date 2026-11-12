@@ -25,24 +25,7 @@ class SourcePanel extends StatelessWidget {
     return name.isEmpty ? '音源设备' : name;
   }
 
-  Future<void> _toggle(BuildContext context) async {
-    final running = state.source.running;
-    if (running && !console.isSource) {
-      final confirmed = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: Text('停止 $_name 的音源？'),
-          content: const Text('所有设备都会停止出声，之后可在任意设备上重新启动。'),
-          actions: [
-            TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('取消')),
-            FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('停止音源')),
-          ],
-        ),
-      );
-      if (confirmed != true) return;
-    }
-    console.command(Command.source, {'on': !running});
-  }
+  void _toggle() => console.command(Command.source, {'on': !state.source.running});
 
   @override
   Widget build(BuildContext context) {
@@ -117,10 +100,10 @@ class SourcePanel extends StatelessWidget {
           const SizedBox(height: Grid.gap),
           if (local)
             source.running
-                ? FilledButton.tonalIcon(onPressed: () => _toggle(context), icon: icon, label: Text(action))
-                : FilledButton.icon(onPressed: () => _toggle(context), icon: icon, label: Text(action))
+                ? FilledButton.tonalIcon(onPressed: _toggle, icon: icon, label: Text(action))
+                : FilledButton.icon(onPressed: _toggle, icon: icon, label: Text(action))
           else
-            OutlinedButton.icon(onPressed: reachable ? () => _toggle(context) : null, icon: icon, label: Text(action)),
+            OutlinedButton.icon(onPressed: reachable ? _toggle : null, icon: icon, label: Text(action)),
           if (!local && self != null) ...[
             const SizedBox(height: 8),
             Text('本机 $self 是接收端，音源的启停作用于所有设备', style: hint),

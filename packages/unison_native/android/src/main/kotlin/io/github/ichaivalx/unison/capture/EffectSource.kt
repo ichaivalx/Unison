@@ -13,9 +13,12 @@ import kotlin.concurrent.thread
 
 internal class EffectSource {
     var onSessionsChanged: (() -> Unit)? = null
-    /** [outputIo]、[channel] 为会话所在的输出线程与通道，[delayUs] 为效果上生效的本机延迟 */
-    private class Session(val uid: Int, val id: Int, val effect: AudioEffect, var outputIo: Int?, var channel: String?,
-        var delayUs: Long) {
+    /**
+     * [packageName]、[appName] 为播放应用的包名与显示名称，[outputIo]、[channel] 为会话所在的输出线程与通道，
+     * [delayUs] 为效果上生效的本机延迟
+     */
+    private class Session(val uid: Int, val id: Int, val effect: AudioEffect, val packageName: String?, val appName: String?,
+        var outputIo: Int?, var channel: String?, var delayUs: Long) {
         @Volatile var io: Int? = null
     }
     private val lock = Any()
@@ -24,6 +27,7 @@ internal class EffectSource {
     private var socket = -1
     private var factory: IBinder? = null
     private lateinit var manager: AudioManager
+    private lateinit var packages: android.content.pm.PackageManager
     private val callbacks = HandlerThread("effect-sessions")
     private lateinit var handler: Handler
     private var excludeUid = -1
@@ -66,6 +70,7 @@ internal class EffectSource {
 
     fun start(appUid: Int, localDelayUs: Long, channelDelays: Map<String, Long>) {
         val context = RootContext.create()
+        packages = context.packageManager
         excludeUid = appUid
         delayUs = localDelayUs
         this.channelDelays = channelDelays
@@ -105,12 +110,13 @@ internal class EffectSource {
 
     private fun refresh(configs: List<AudioPlaybackConfiguration>? = null) {
         if (closed) return
-        try { reconcile(configs ?: manager.activePlaybackConfigurations) } catch (error: Exception) {
+        try { reconcile(configs ?: manager.activePlaybackConfigurations, recheck = configs != null) } catch (error: Exception) {
             if (!closed) deathReason = "Playback configuration failed: ${error.cause ?: error}"
         }
     }
 
-    private fun reconcile(configs: List<AudioPlaybackConfiguration>) {
+    /** [recheck]：播放配置有变化，已挂载的会话也重新核对所在的输出线程（可能已换线程而采集包的 io 不变） */
+    private fun reconcile(configs: List<AudioPlaybackConfiguration>, recheck: Boolean) {
         if (closed || deathReason != null) return
         val wanted = linkedMapOf<Int, Int>()
         val unknown = mutableSetOf<Pair<Int, Int>>()
@@ -127,10 +133,10 @@ internal class EffectSource {
         calibrationSession?.let { wanted[it] = android.os.Process.myUid() }
         needsSessionLookup = unknown.isNotEmpty()
         val unresolved = unknown.toMutableSet()
-        val known = synchronized(lock) { sessions.keys + failed }
+        val (known, attached) = synchronized(lock) { (sessions.keys + failed) to sessions.isNotEmpty() }
         // 新会话须在启用效果前确定所在通道，与缺失编号的客户端共用一次查询；不在会话锁内等待
         // dumpsys，采集不受影响。
-        val outputs = if (unknown.isNotEmpty() || wanted.keys.any { it !in known }) readOutputs() else null
+        val outputs = if (unknown.isNotEmpty() || wanted.keys.any { it !in known } || (recheck && attached)) readOutputs() else null
         if (outputs != null) for (track in outputs.tracks) {
             if ((track.uid to track.pid) in unknown && track.active && track.session > 0 && track.usage in captureUsages) {
                 wanted[track.session] = track.uid
@@ -160,7 +166,11 @@ internal class EffectSource {
                     check(setParameter.invoke(instance, 1, delayBytes(delay)) == AudioEffect.SUCCESS) { "Cannot set local delay" }
                     if (shouldMute(id)) check(setInteger.invoke(instance, 2, 1) == AudioEffect.SUCCESS) { "Cannot mute local effect" }
                     check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
-                    sessions[id] = Session(uid, id, instance, io, channel, delay)
+                    val packageName = runCatching { packages.getPackagesForUid(uid)?.firstOrNull() }.getOrNull()
+                    val appName = packageName?.let { name ->
+                        runCatching { packages.getApplicationInfo(name, 0).loadLabel(packages).toString().ifBlank { null } }.getOrNull()
+                    }
+                    sessions[id] = Session(uid, id, instance, packageName, appName, io, channel, delay)
                     println("INFO effect_attached uid=$uid session=$id io=${io ?: "unknown"} channel=${channel ?: "unknown"} local_delay_us=$delay")
                 } catch (error: Exception) {
                     runCatching { instance?.release() }
@@ -169,7 +179,12 @@ internal class EffectSource {
                     println("ERROR effect_attach uid=$uid session=$id error=${error.cause ?: error}")
                 }
             }
-            if (before != sessions.keys) onSessionsChanged?.invoke()
+            var moved = false
+            if (outputs != null) for (session in sessions.values) {
+                val io = outputs.ioOf(session.id) ?: continue
+                if (moveTo(session, io, outputChannels[io])) moved = true
+            }
+            if (before != sessions.keys || moved) onSessionsChanged?.invoke()
         }
     }
 
@@ -197,20 +212,23 @@ internal class EffectSource {
             val changed = synchronized(lock) {
                 val session = sessions[id]
                 if (closed || session == null || session.outputIo != io) return
-                if (channel == null) {
-                    println("WARN effect_channel session=$id io=$io channel=unknown")
-                    return
-                }
-                val previous = session.channel
-                session.channel = channel
-                applyDelay(session)
-                println("INFO effect_channel session=$id io=$io channel=$channel previous=${previous ?: "unknown"} local_delay_us=${session.delayUs}")
-                previous != channel
+                moveTo(session, io, channel)
             }
             if (changed) onSessionsChanged?.invoke()
         } catch (error: Exception) {
             if (!closed) deathReason = "Cannot update output channel delay: ${error.cause ?: error}"
         }
+    }
+
+    /** 持有 [lock] 时调用：会话现在位于输出线程 [io]、通道 [channel]（未能识别时为 null，不补偿）；有变化时返回 true */
+    private fun moveTo(session: Session, io: Int, channel: String?): Boolean {
+        if (io == session.outputIo && channel == session.channel) return false
+        val previous = session.channel
+        session.outputIo = io
+        session.channel = channel
+        applyDelay(session)
+        println("INFO effect_channel session=${session.id} io=$io channel=${channel ?: "unknown"} previous=${previous ?: "unknown"} local_delay_us=${session.delayUs}")
+        return true
     }
 
     fun setLocalDelay(us: Long) {
@@ -258,7 +276,7 @@ internal class EffectSource {
     fun sessionStatus(): org.json.JSONArray = synchronized(lock) {
         // 校准测试音不算作采集的播放
         org.json.JSONArray(sessions.values.filter { it.id != calibrationSession }.map { session -> org.json.JSONObject().put("uid", session.uid).put("sessionId", session.id)
-            .put("packageName", runCatching { RootContext.create().packageManager.getPackagesForUid(session.uid)?.firstOrNull() }.getOrNull() ?: org.json.JSONObject.NULL)
+            .put("packageName", session.packageName ?: org.json.JSONObject.NULL).put("appName", session.appName ?: org.json.JSONObject.NULL)
             .put("channel", session.channel ?: org.json.JSONObject.NULL).put("delayUs", session.delayUs) })
     }
 

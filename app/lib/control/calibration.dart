@@ -46,23 +46,26 @@ int bandShift(double weight, BandGaps device, BandGaps local) {
   return (-weight * (device[band]! - local[band]!)).round();
 }
 
-/// 输出通道的显示名；通道以输出 flags 标识（如 `PRIMARY|FAST`）
+/// 输出通道的简称：大缓冲、主输出有明确含义，其余直接用原始标志名。通道以输出 flags 标识
+/// （如 `PRIMARY|FAST`）
 String channelLabel(String channel) {
   final flags = channel.split('|').toSet();
   if (flags.contains('DEEP_BUFFER')) return '大缓冲';
-  if (flags.contains('COMPRESS_OFFLOAD')) return '卸载';
-  if (flags.contains('SPATIALIZER')) return '空间音频';
-  if (flags.contains('DIRECT')) return '直通';
   if (flags.contains('PRIMARY')) return '主输出';
-  if (flags.contains('FAST')) return '低延迟';
   return channel;
+}
+
+/// 输出通道的完整名称：有简称时附上原始标志名
+String channelName(String channel) {
+  final label = channelLabel(channel);
+  return label == channel ? channel : '$label（$channel）';
 }
 
 /// 会话所在通道及其校准状态的说明
 String sessionChannel(SessionView session) => switch (session.channel) {
-  null => '通道未知，未补偿',
-  final channel when !session.calibrated => '${channelLabel(channel)}（$channel）未校准，未补偿',
-  final channel => '${channelLabel(channel)}（$channel）',
+  null => '输出通道未知，未补偿',
+  final channel when !session.calibrated => '输出通道 ${channelName(channel)} 未校准，未补偿',
+  final channel => '输出通道 ${channelName(channel)}',
 };
 
 /// 本机一条输出通道的实测：取样点到发声的延迟 [midUs]（中高频，不含本机延迟）与低频记录

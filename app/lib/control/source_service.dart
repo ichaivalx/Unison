@@ -649,14 +649,14 @@ class SourceService implements Console {
           CalibrationRow(name: LocalSettings.deviceName, result: '本机延迟 ${formatMs(_localDelayUs)}'),
           for (final channel in _channelViews())
             CalibrationRow(
-              name: '本机 · ${channelLabel(channel.channel)}',
+              name: '本机 · ${channelName(channel.channel)}',
               result: channel.base
                   ? '出声 ${formatMs(channel.latencyUs)} · 基准'
                   : '出声 ${formatMs(channel.latencyUs)} · 补偿 +${formatMs(channel.compensationUs)}',
-              detail: [channel.channel, _gapsNote(_channels[channel.channel]!.gaps)].join('，'),
+              detail: _gapsNote(_channels[channel.channel]!.gaps),
             ),
           for (final channel in outcome.unmeasured)
-            CalibrationRow(name: '本机 · ${channelLabel(channel)}', result: '未测到测试音', detail: channel),
+            CalibrationRow(name: '本机 · ${channelName(channel)}', result: '未测到测试音'),
           for (final peer in peers.values)
             outcome.missing.contains(peer.id)
                 ? CalibrationRow(name: peer.name, result: '未测到测试音')
@@ -807,7 +807,7 @@ class SourceService implements Console {
         sessions: [
           for (final s in status?.sessions ?? const <CapturedSession>[])
             SessionView(
-              app: s.packageName ?? 'uid ${s.uid}',
+              app: s.appName ?? s.packageName ?? 'uid ${s.uid}',
               channel: s.channel,
               delayUs: s.delayUs,
               calibrated: _channels.containsKey(s.channel),

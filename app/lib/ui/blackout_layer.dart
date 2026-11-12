@@ -31,6 +31,10 @@ class _BlackoutScreenState extends State<_BlackoutScreen> {
   bool _hint = true;
   Timer? _timer;
 
+  /// 黑屏期间持有焦点并接住所有按键，底层控件收不到键盘操作；退出后焦点交回原处
+  final _focus = FocusNode(debugLabel: 'blackout');
+  FocusNode? _previous;
+
   /// 用于退出的这次点击：抬起时退出，整个手势由黑屏层接住
   int? _exitPointer;
 
@@ -38,24 +42,36 @@ class _BlackoutScreenState extends State<_BlackoutScreen> {
   void initState() {
     super.initState();
     _timer = Timer(const Duration(seconds: 2), () => setState(() => _hint = false));
-    HardwareKeyboard.instance.addHandler(_onKey);
+    _previous = FocusManager.instance.primaryFocus;
+    // 黑屏层位于导航之外，自动获取焦点不会从当前页面取走焦点，挂载后主动请求
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focus.requestFocus();
+    });
   }
 
   @override
   void dispose() {
     _timer?.cancel();
-    HardwareKeyboard.instance.removeHandler(_onKey);
+    _focus.dispose();
+    final previous = _previous;
+    if (previous != null && previous.context != null && previous.canRequestFocus) previous.requestFocus();
     super.dispose();
   }
 
-  /// 黑屏期间按键都由黑屏接住，Esc 退出
-  bool _onKey(KeyEvent event) {
+  /// Esc 退出；其余按键也由黑屏接住
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
     if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.escape) Blackout.set(false);
-    return true;
+    return KeyEventResult.handled;
   }
 
   @override
-  Widget build(BuildContext context) => Listener(
+  Widget build(BuildContext context) => Focus(
+    focusNode: _focus,
+    onKeyEvent: _onKey,
+    child: _pointerLayer(),
+  );
+
+  Widget _pointerLayer() => Listener(
     behavior: HitTestBehavior.opaque,
     onPointerDown: (event) {
       if (event.buttons & (kPrimaryButton | kSecondaryButton) != 0) _exitPointer = event.pointer;

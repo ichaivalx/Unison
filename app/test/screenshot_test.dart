@@ -134,9 +134,9 @@ ConsoleState _state() => ConsoleState(
     localDelayUs: 12000,
     error: null,
     sessions: [
-      SessionView(app: 'com.example.piliplus', channel: 'PRIMARY|FAST', delayUs: 102000, calibrated: true),
-      SessionView(app: 'com.google.android.youtube', channel: 'DEEP_BUFFER', delayUs: 12000, calibrated: true),
-      SessionView(app: 'com.netease.cloudmusic', channel: 'COMPRESS_OFFLOAD', delayUs: 12000, calibrated: false),
+      SessionView(app: 'PiliPlus', channel: 'PRIMARY|FAST', delayUs: 102000, calibrated: true),
+      SessionView(app: 'YouTube', channel: 'DEEP_BUFFER', delayUs: 12000, calibrated: true),
+      SessionView(app: '网易云音乐', channel: 'COMPRESS_OFFLOAD', delayUs: 12000, calibrated: false),
     ],
     channels: [
       ChannelView(channel: 'DEEP_BUFFER', latencyUs: 148000, compensationUs: 0, base: true),

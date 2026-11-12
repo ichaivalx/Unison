@@ -57,6 +57,7 @@ class CapturedSession {
   const CapturedSession({
     required this.uid,
     required this.packageName,
+    required this.appName,
     required this.sessionId,
     required this.channel,
     required this.delayUs,
@@ -64,6 +65,9 @@ class CapturedSession {
 
   final int uid;
   final String? packageName;
+
+  /// 应用的显示名称；无法读取时为 null
+  final String? appName;
   final int sessionId;
 
   /// 所在的输出通道（输出 flags，如 `PRIMARY|FAST`、`DEEP_BUFFER`）；未能确定时为 null
@@ -252,7 +256,7 @@ abstract final class UnisonNative {
     running: e['running'] == true, latencyUs: (e['latencyUs'] as num?)?.toInt() ?? 50000,
     localDelayUs: (e['localDelayUs'] as num?)?.toInt() ?? 0,
     sessions: ((e['sessions'] as List?) ?? []).map((dynamic s) => CapturedSession(uid: (s['uid'] as num).toInt(),
-      packageName: s['packageName'] as String?, sessionId: (s['sessionId'] as num).toInt(),
+      packageName: s['packageName'] as String?, appName: s['appName'] as String?, sessionId: (s['sessionId'] as num).toInt(),
       channel: s['channel'] as String?, delayUs: (s['delayUs'] as num).toInt())).toList(),
     receiverIds: ((e['receiverIds'] as List?) ?? []).cast<int>(), error: e['error'] as String?));
   static Future<CalibrationResult> calibrate({required List<int> receiverIds, required List<CalibrationBand> bands,

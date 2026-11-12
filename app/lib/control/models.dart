@@ -193,7 +193,7 @@ class DeviceView {
 class SessionView {
   const SessionView({required this.app, required this.channel, required this.delayUs, required this.calibrated});
 
-  /// 应用包名
+  /// 应用的显示名称，读取不到时为包名
   final String app;
 
   /// 所在的输出通道；未能确定时为 null
