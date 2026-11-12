@@ -56,6 +56,28 @@ void closeSocket(Socket s) { if (s != kInvalidSocket) close(s); }
 constexpr double kFrameUs = 1e6 / kSampleRate;
 constexpr int64_t kPacketUs = int64_t{kFramesPerPacket} * 1'000'000 / kSampleRate;
 
+// 带限插值核：Kaiser 窗 sinc 原型（β=6，截止为源采样率的 0.46），半宽 24 个源帧，每帧 256 个相位，
+// 相位之间线性插值。核对称、以读取时刻为中心，不引入固定延迟；降采样时按输出/源采样率比例展宽，截止随之降到输出奈奎斯特以下。
+constexpr int kKernelHalfWidth = 24;
+constexpr int kKernelPhases = 256;
+using KernelTable = std::array<float, kKernelHalfWidth * kKernelPhases + 2>;
+const KernelTable kKernel = [] {
+    constexpr double pi = 3.14159265358979323846, cutoff = 0.46, beta = 6.0;
+    auto bessel = [](double x) {
+        double sum = 1, term = 1;
+        for (int k = 1; term > 1e-12 * sum; ++k) { term *= (x / (2 * k)) * (x / (2 * k)); sum += term; }
+        return sum;
+    };
+    KernelTable table{};
+    for (int i = 0; i < kKernelHalfWidth * kKernelPhases; ++i) {
+        double u = static_cast<double>(i) / kKernelPhases;
+        double x = pi * 2 * cutoff * u;
+        double r = u / kKernelHalfWidth;
+        table[i] = static_cast<float>((i == 0 ? 1.0 : std::sin(x) / x) * bessel(beta * std::sqrt(1 - r * r)) / bessel(beta));
+    }
+    return table;
+}();
+
 Socket udpSocket(uint16_t port) {
     Socket s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == kInvalidSocket) return s;
@@ -168,6 +190,7 @@ struct Receiver::State {
     double lateWindowSumUs = 0, lateWindowMaxUs = 0;
     uint64_t relocations = 0;
     bool realTimestamp = false;
+    double kernelScale = 1;
 #ifdef _WIN32
     bool winsock = false;
 #endif
@@ -201,7 +224,9 @@ struct Receiver::State {
             const int64_t now = monotonicUs();
             if (lastRenderAtUs && now - lastRenderAtUs < 100'000) {
                 if (!reading) return;
-                while (packets.size() > 1 && std::next(packets.begin())->first.first < readTime - kFrameUs)
+                // 保留插值核左半部分仍会读到的包。
+                const double keepFrom = readTime - (kKernelHalfWidth / kernelScale + 1) * kFrameUs;
+                while (packets.size() > 1 && std::next(packets.begin())->first.first < keepFrom)
                     retired.insert(packets.extract(packets.begin()));
             } else if (clockReady) {
                 const double due = now + clockOffset - userOffsetUs;
@@ -412,33 +437,57 @@ struct Receiver::State {
         if (selected) sendMessage(dataSocket, source, message(MsgType::Bye));
     }
 
+    // 按相邻 seq 的时标连接，吸收采集时钟校准引起的包边界变化。
+    static bool continuous(PacketMap::const_iterator from, PacketMap::const_iterator to) {
+        return to->second.seq == from->second.seq + 1 && to->first.first > from->first.first;
+    }
+
+    // 以 packet 内帧坐标 position 为中心做带限插值；抽头沿相邻 seq 跨包，缺失、不连续或缓冲边缘的帧按 0 计。
+    void interpolate(PacketMap::const_iterator packet, double position, float& left, float& right) const {
+        const double reach = kKernelHalfWidth / kernelScale;
+        const int first = static_cast<int>(std::floor(position - reach)) + 1;
+        const int last = static_cast<int>(std::ceil(position + reach)) - 1;
+        auto segment = packet;
+        int base = 0;
+        while (first < base && segment != packets.begin() && continuous(std::prev(segment), segment)) {
+            --segment;
+            base -= kFramesPerPacket;
+        }
+        bool present = true;
+        double sumLeft = 0, sumRight = 0, total = 0;
+        for (int frame = first; frame <= last; ++frame) {
+            double phase = std::abs(frame - position) * kernelScale * kKernelPhases;
+            int index = static_cast<int>(phase);
+            double weight = kKernel[index] + (kKernel[index + 1] - kKernel[index]) * (phase - index);
+            total += weight;
+            if (frame < base || !present) continue;
+            if (frame - base == kFramesPerPacket) {
+                auto next = std::next(segment);
+                present = next != packets.end() && continuous(segment, next);
+                if (!present) continue;
+                segment = next;
+                base += kFramesPerPacket;
+            }
+            const float* pcm = segment->second.pcm.data() + (frame - base) * kChannels;
+            sumLeft += weight * pcm[0];
+            sumRight += weight * pcm[1];
+        }
+        left = static_cast<float>(sumLeft / total);
+        right = static_cast<float>(sumRight / total);
+    }
+
     // 以包时间轴取样；缺失部分自然变为静音，不等待重传。
     void sample(double time, float& left, float& right) {
         auto it = packets.upper_bound({static_cast<int64_t>(std::floor(time)), UINT32_MAX});
         if (it != packets.begin()) {
             --it;
             auto next = std::next(it);
-            bool continuous = next != packets.end() && next->second.seq == it->second.seq + 1 &&
-                              next->first.first > it->first.first;
-            // 按相邻 seq 的时标连接，吸收采集时钟校准引起的包边界变化。
-            double packetDuration = continuous ? static_cast<double>(next->first.first - it->first.first) : kPacketUs;
+            double packetDuration = next != packets.end() && continuous(it, next)
+                ? static_cast<double>(next->first.first - it->first.first) : kPacketUs;
             double position = (time - it->first.first) * kFramesPerPacket / packetDuration;
             int frame = static_cast<int>(std::floor(position + 1e-5));
             if (frame >= 0 && frame < kFramesPerPacket) {
-                double fraction = std::clamp(position - frame, 0.0, 1.0);
-                float nextLeft = it->second.pcm[frame * 2];
-                float nextRight = it->second.pcm[frame * 2 + 1];
-                if (frame + 1 < kFramesPerPacket) {
-                    nextLeft = it->second.pcm[(frame + 1) * 2];
-                    nextRight = it->second.pcm[(frame + 1) * 2 + 1];
-                } else {
-                    if (continuous) {
-                        nextLeft = next->second.pcm[0];
-                        nextRight = next->second.pcm[1];
-                    }
-                }
-                left = static_cast<float>(it->second.pcm[frame * 2] * (1 - fraction) + nextLeft * fraction);
-                right = static_cast<float>(it->second.pcm[frame * 2 + 1] * (1 - fraction) + nextRight * fraction);
+                interpolate(it, position, left, right);
                 if (!accounted || it->first.first > lossBaseTime ||
                     static_cast<int32_t>(it->second.seq - accountedSeq) > 0) {
                     accounted = true;
@@ -572,6 +621,7 @@ void Receiver::render(float* stereo, int frames, int deviceRate, int64_t firstFr
             s.correction = std::clamp(0.18 * s.errorUs * 1e-6 + 0.025 * s.integral, -0.003, 0.003);
         }
     }
+    s.kernelScale = std::min(1.0, static_cast<double>(deviceRate) / kSampleRate);
     double step = 1e6 / deviceRate * (1.0 + s.correction);
     for (int i = 0; i < frames; ++i) {
         s.sample(s.readTime, stereo[i * 2], stereo[i * 2 + 1]);
