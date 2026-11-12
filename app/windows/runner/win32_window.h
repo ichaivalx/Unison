@@ -74,7 +74,7 @@ class Win32Window {
   // 黑屏退出后保持隐藏（黑屏期间要求隐藏到托盘）
   void KeepHiddenAfterFullScreen() { hidden_before_fullscreen_ = true; }
 
-  // 显示（最小化的还原）、移到用户当前所在的虚拟桌面并置前；隐藏（不在任务栏）
+  // 显示在用户当前所在的虚拟桌面并置前（最小化的还原）；隐藏（不在任务栏）
   void Reveal();
   void Hide();
 
@@ -125,11 +125,16 @@ class Win32Window {
   // 屏幕坐标 [lparam] 处于顶部的缩放边框内
   bool InTopBorder(LPARAM lparam);
 
-  // 窗口不在当前虚拟桌面时移过来：以当前桌面上任一可见窗口所在的桌面为准
-  void MoveToCurrentDesktop();
+  // 可见的窗口不在用户当前所在的虚拟桌面时先隐藏：窗口变为可见时 shell 把它当作新窗口，
+  // 归入当前虚拟桌面；置前一个属于其他桌面的窗口则会把用户切换过去
+  void HideIfOnOtherDesktop();
 
   bool fullscreen_ = false;
+
+  // 黑屏退出后保持隐藏；进入时最大化（含最小化前为最大化），退出后保持隐藏的，下次显示时再最大化
   bool hidden_before_fullscreen_ = false;
+  bool maximized_before_fullscreen_ = false;
+  bool reveal_maximized_ = false;
   WINDOWPLACEMENT placement_{sizeof(WINDOWPLACEMENT)};
 
   bool quit_on_close_ = false;

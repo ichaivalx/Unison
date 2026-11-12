@@ -60,7 +60,7 @@ class WindowSurface extends StatelessWidget {
 }
 
 /// 页面背景上的空白处与标题栏一样：鼠标左键按住拖动窗口、双击最大化或还原。[WindowSurface]
-/// 与滚动条上不响应，触摸照常交给滚动
+/// 与显示中的滚动条（滑块、轨道）上不响应，触摸照常交给滚动
 class WindowDragArea extends StatefulWidget {
   const WindowDragArea({super.key, required this.child});
 
@@ -83,8 +83,13 @@ class _WindowDragAreaState extends State<WindowDragArea> {
     for (final entry in result.path) {
       final target = entry.target;
       if (target is RenderMetaData && target.metaData == WindowSurface._tag) return false;
-      if (target is RenderCustomPaint && (target.foregroundPainter is ScrollbarPainter || target.painter is ScrollbarPainter)) {
-        return false;
+      // 滚动条的绘制层包裹整个滚动内容，只排除落在滚动条交互区域上的按下；滚动条未显示时不排除
+      if (target is RenderCustomPaint && entry is BoxHitTestEntry) {
+        for (final painter in [target.foregroundPainter, target.painter]) {
+          if (painter is ScrollbarPainter && painter.hitTestInteractive(entry.localPosition, PointerDeviceKind.mouse)) {
+            return false;
+          }
+        }
       }
     }
     return true;
