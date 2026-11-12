@@ -537,7 +537,8 @@ class _FaderState extends State<Fader> {
                       focused: _focused,
                       track: colors.outlineVariant,
                       fill: widget.active ? colors.primary : Color.lerp(colors.outlineVariant, colors.outline, 0.45)!,
-                      thumb: widget.active ? colors.onSurface : colors.outline,
+                      thumb: colors.surface,
+                      index: widget.active ? colors.primary : colors.outlineVariant,
                       focus: colors.primary,
                     ),
                   ),
@@ -559,6 +560,7 @@ class _FaderPainter extends CustomPainter {
     required this.track,
     required this.fill,
     required this.thumb,
+    required this.index,
     required this.focus,
   });
 
@@ -572,7 +574,9 @@ class _FaderPainter extends CustomPainter {
   final bool focused;
   final Color track;
   final Color fill;
+  /// 滑块：比通道条更深的近黑色块，中间一条细读数线标出位置
   final Color thumb;
+  final Color index;
   final Color focus;
 
   @override
@@ -596,6 +600,10 @@ class _FaderPainter extends CustomPainter {
       const Radius.circular(7),
     );
     canvas.drawRRect(handle, Paint()..color = thumb);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(Rect.fromCenter(center: Offset(x, y), width: handle.width - 14, height: 2), const Radius.circular(1)),
+      Paint()..color = index,
+    );
     if (focused) {
       canvas.drawRRect(
         handle.inflate(3),
@@ -614,5 +622,6 @@ class _FaderPainter extends CustomPainter {
       focused != old.focused ||
       track != old.track ||
       fill != old.fill ||
-      thumb != old.thumb;
+      thumb != old.thumb ||
+      index != old.index;
 }

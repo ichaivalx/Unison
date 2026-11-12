@@ -20,33 +20,6 @@ class Panel extends StatelessWidget {
   );
 }
 
-/// 区块标题；并排的区块用它对齐顶部
-class SectionTitle extends StatelessWidget {
-  const SectionTitle(this.text, {super.key, this.trailing});
-
-  static const height = 36.0;
-
-  final String text;
-  final Widget? trailing;
-
-  @override
-  Widget build(BuildContext context) => SizedBox(
-    height: height,
-    child: Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.baseline,
-        textBaseline: TextBaseline.alphabetic,
-        children: [
-          Text(text, style: context.texts.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
-          const Spacer(),
-          ?trailing,
-        ],
-      ),
-    ),
-  );
-}
-
 class StatusDot extends StatelessWidget {
   const StatusDot({super.key, required this.color, this.size = 8});
 

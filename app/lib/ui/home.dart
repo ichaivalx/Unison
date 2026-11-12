@@ -6,7 +6,6 @@ import '../desktop.dart';
 import 'diagnostics.dart';
 import 'media_card.dart';
 import 'mixer.dart';
-import 'panels.dart';
 import 'settings_sheet.dart';
 import 'source_panel.dart';
 import 'theme.dart';
@@ -87,7 +86,7 @@ class _Home extends StatelessWidget {
             ),
           ],
         );
-        final insets = EdgeInsets.fromLTRB(margin + safe.left, 4, margin + safe.right, margin + safe.bottom);
+        final insets = EdgeInsets.fromLTRB(margin + safe.left, Grid.unit, margin + safe.right, margin + safe.bottom);
         final Widget body;
         if (console == null || state == null) {
           body = Center(child: _Waiting(text: _status));
@@ -108,14 +107,6 @@ class _Home extends StatelessWidget {
     );
   }
 
-  static Widget _devicesTitle(BuildContext context, ConsoleState state) => SectionTitle(
-    '设备',
-    trailing: Text(
-      '${state.devices.where((d) => d.online).length} 台在线',
-      style: context.texts.labelMedium?.copyWith(color: context.colors.onSurfaceVariant),
-    ),
-  );
-
   Widget _wideLayout(BuildContext context, Console console, ConsoleState state) {
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -125,42 +116,26 @@ class _Home extends StatelessWidget {
           children: [
             SizedBox(
               width: left,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const SectionTitle('音源'),
-                  Expanded(
-                    child: SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        spacing: Grid.gap,
-                        children: [
-                          SourcePanel(console: console, state: state),
-                          MediaCard(console: console, media: state.media),
-                          Diagnostics(state: state),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  spacing: Grid.gap,
+                  children: [
+                    SourcePanel(console: console, state: state),
+                    MediaCard(console: console, media: state.media),
+                    Diagnostics(state: state),
+                  ],
+                ),
               ),
             ),
             const SizedBox(width: Grid.wideMargin),
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  _devicesTitle(context, state),
-                  Expanded(
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        final mixer = Mixer(console: console, state: state);
-                        if (constraints.maxHeight >= Mixer.minHeight) return mixer;
-                        return SingleChildScrollView(child: SizedBox(height: Mixer.minHeight, child: mixer));
-                      },
-                    ),
-                  ),
-                ],
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final mixer = Mixer(console: console, state: state);
+                  if (constraints.maxHeight >= Mixer.minHeight) return mixer;
+                  return SingleChildScrollView(child: SizedBox(height: Mixer.minHeight, child: mixer));
+                },
               ),
             ),
           ],
@@ -173,12 +148,10 @@ class _Home extends StatelessWidget {
     return ListView(
       padding: insets,
       children: [
-        const SectionTitle('音源'),
         SourcePanel(console: console, state: state),
         const SizedBox(height: Grid.gap),
         MediaCard(console: console, media: state.media),
-        const SizedBox(height: Grid.gap * 1.5),
-        _devicesTitle(context, state),
+        const SizedBox(height: Grid.gap),
         SizedBox(height: Mixer.narrowHeight, child: Mixer(console: console, state: state)),
         const SizedBox(height: Grid.gap),
         Diagnostics(state: state),
