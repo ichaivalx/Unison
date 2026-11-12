@@ -53,7 +53,6 @@ using Socket = int;
 constexpr Socket kInvalidSocket = -1;
 void closeSocket(Socket s) { if (s != kInvalidSocket) close(s); }
 #endif
-constexpr double kFrameUs = 1e6 / kSampleRate;
 constexpr int64_t kPacketUs = int64_t{kFramesPerPacket} * 1'000'000 / kSampleRate;
 
 // 带限插值核：Kaiser 窗 sinc 原型（β=6，截止为源采样率的 0.46），半宽 24 个源帧，每帧 256 个相位，
@@ -224,10 +223,12 @@ struct Receiver::State {
             const int64_t now = monotonicUs();
             if (lastRenderAtUs && now - lastRenderAtUs < 100'000) {
                 if (!reading) return;
-                // 保留插值核左半部分仍会读到的包。
-                const double keepFrom = readTime - (kKernelHalfWidth / kernelScale + 1) * kFrameUs;
-                while (packets.size() > 1 && std::next(packets.begin())->first.first < keepFrom)
-                    retired.insert(packets.extract(packets.begin()));
+                // 以读取时刻所在的包为基准，按帧坐标保留插值核左半部分可能向前触及的包，更早的回收。
+                auto keep = packets.upper_bound({static_cast<int64_t>(std::floor(readTime)), UINT32_MAX});
+                for (int reachPackets = static_cast<int>(kKernelHalfWidth / kernelScale) / kFramesPerPacket + 1;
+                     reachPackets >= 0 && keep != packets.begin(); --reachPackets)
+                    --keep;
+                while (packets.begin() != keep) retired.insert(packets.extract(packets.begin()));
             } else if (clockReady) {
                 const double due = now + clockOffset - userOffsetUs;
                 // 没有输出回调时仍按本机时钟回收，队列只覆盖尚未到期的目标延迟。
