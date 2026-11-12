@@ -48,6 +48,12 @@ void EnableFullDpiSupportIfAvailable(HWND hwnd) {
   FreeLibrary(user32_module);
 }
 
+// 应用的深色背景（默认样式）：来不及出帧时窗口露出的区域不是白色
+HBRUSH BackgroundBrush() {
+  static const HBRUSH brush = CreateSolidBrush(RGB(0x12, 0x13, 0x15));
+  return brush;
+}
+
 }  // namespace
 
 // Manages the Win32Window's window class registration.
@@ -92,7 +98,7 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
     window_class.hInstance = GetModuleHandle(nullptr);
     window_class.hIcon =
         LoadIcon(window_class.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
-    window_class.hbrBackground = 0;
+    window_class.hbrBackground = BackgroundBrush();
     window_class.lpszMenuName = nullptr;
     window_class.lpfnWndProc = Win32Window::WndProc;
     RegisterClass(&window_class);
@@ -295,6 +301,12 @@ LRESULT CALLBACK Win32Window::ContentProc(HWND window, UINT message,
       reinterpret_cast<Win32Window*>(data)->InTopBorder(lparam)) {
     return HTTRANSPARENT;
   }
+  if (message == WM_ERASEBKGND) {
+    RECT area;
+    GetClientRect(window, &area);
+    FillRect(reinterpret_cast<HDC>(wparam), &area, BackgroundBrush());
+    return 1;
+  }
   return DefSubclassProc(window, message, wparam, lparam);
 }
 
@@ -350,7 +362,8 @@ void Win32Window::SetFullScreen(bool on) {
         IsZoomed(window) || (IsIconic(window) && (placement_.flags & WPF_RESTORETOMAXIMIZED));
     // 隐藏在托盘时进入：随下面的显示出现在用户当前所在的虚拟桌面
     HideIfOnOtherDesktop();
-    if (IsIconic(window) || IsZoomed(window)) {
+    const bool hidden = !IsWindowVisible(window);
+    if (!hidden && (IsIconic(window) || IsZoomed(window))) {
       ShowWindow(window, SW_RESTORE);
     }
     // 还原后再读样式，并清掉状态位：最大化、最小化由保存的位置在退出时恢复
@@ -360,12 +373,22 @@ void Win32Window::SetFullScreen(bool on) {
     const RECT& area = monitor.rcMonitor;
     fullscreen_ = true;
     SetWindowLongPtr(window, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+    // 隐藏时先按全屏布局出帧，再显示
     SetWindowPos(window, HWND_TOPMOST, area.left, area.top,
                  area.right - area.left, area.bottom - area.top,
-                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+                 SWP_FRAMECHANGED | (hidden ? SWP_NOACTIVATE : SWP_SHOWWINDOW));
     // 远程进入时系统可能不允许取得前台，键盘仍在其他应用；注册失败则只能在取得焦点后按 Esc
     RegisterHotKey(window, kEscapeHotKey, MOD_NOREPEAT, VK_ESCAPE);
-    SetForegroundWindow(window);
+    if (hidden) {
+      ShowAfterNextFrame([this]() {
+        if (fullscreen_) {
+          ShowWindow(window_handle_, SW_SHOW);
+          SetForegroundWindow(window_handle_);
+        }
+      });
+    } else {
+      SetForegroundWindow(window);
+    }
     return;
   }
   WINDOWPLACEMENT placement = placement_;
@@ -412,6 +435,15 @@ void Win32Window::Reveal() {
     return;
   }
   HideIfOnOtherDesktop();
+  if (IsWindowVisible(window)) {
+    ShowNow();
+  } else {
+    ShowAfterNextFrame([this]() { ShowNow(); });
+  }
+}
+
+void Win32Window::ShowNow() {
+  HWND window = window_handle_;
   int command = IsIconic(window) ? SW_RESTORE : SW_SHOW;
   if (reveal_maximized_) {
     command = SW_SHOWMAXIMIZED;

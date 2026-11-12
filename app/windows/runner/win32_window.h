@@ -100,6 +100,9 @@ class Win32Window {
   // Called when Destroy is called.
   virtual void OnDestroy();
 
+  // 从隐藏变为可见：子类在内容的下一帧就绪后再执行 |show|，避免露出未绘制的窗口
+  virtual void ShowAfterNextFrame(std::function<void()> show) { show(); }
+
  private:
   friend class WindowClassRegistrar;
 
@@ -128,6 +131,9 @@ class Win32Window {
 
   // 屏幕坐标 [lparam] 处于顶部的缩放边框内
   bool InTopBorder(LPARAM lparam);
+
+  // 按待恢复的最大化或还原显示并置前
+  void ShowNow();
 
   // 可见的窗口不在用户当前所在的虚拟桌面时先隐藏：窗口变为可见时 shell 把它当作新窗口，
   // 归入当前虚拟桌面；置前一个属于其他桌面的窗口则会把用户切换过去

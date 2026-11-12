@@ -13,6 +13,10 @@ namespace {
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr wchar_t kTrayClassName[] = L"UnisonTray";
+
+// 显示前等待下一帧的兜底时长
+constexpr UINT_PTR kShowTimer = 1;
+constexpr UINT kShowTimeoutMs = 150;
 constexpr UINT kTrayId = 1;
 constexpr int kMenuShow = 1;
 constexpr int kMenuQuit = 2;
@@ -230,12 +234,42 @@ bool FlutterWindow::InFront() {
 
 void FlutterWindow::Present() {
   Reveal();
-  if (flutter_controller_) {
-    flutter_controller_->ForceRedraw();
+}
+
+void FlutterWindow::ShowAfterNextFrame(std::function<void()> show) {
+  const bool waiting = static_cast<bool>(pending_show_);
+  pending_show_ = std::move(show);
+  if (waiting) {
+    return;
+  }
+  if (!flutter_controller_) {
+    RunPendingShow();
+    return;
+  }
+  flutter_controller_->engine()->SetNextFrameCallback([this]() { RunPendingShow(); });
+  flutter_controller_->ForceRedraw();
+  SetTimer(GetHandle(), kShowTimer, kShowTimeoutMs, nullptr);
+}
+
+void FlutterWindow::RunPendingShow() {
+  if (!pending_show_) {
+    return;
+  }
+  KillTimer(GetHandle(), kShowTimer);
+  std::function<void()> show = std::move(pending_show_);
+  pending_show_ = nullptr;
+  show();
+}
+
+void FlutterWindow::CancelPendingShow() {
+  if (pending_show_) {
+    KillTimer(GetHandle(), kShowTimer);
+    pending_show_ = nullptr;
   }
 }
 
 void FlutterWindow::Dismiss() {
+  CancelPendingShow();
   if (FullScreen()) {
     KeepHiddenAfterFullScreen();
     if (window_channel_) {
@@ -302,6 +336,7 @@ void FlutterWindow::NotifyWindowState() {
 }
 
 void FlutterWindow::OnDestroy() {
+  pending_show_ = nullptr;
   RemoveTrayIcon();
   window_channel_ = nullptr;
   if (flutter_controller_) {
@@ -321,6 +356,10 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   // 关闭按钮、Alt+F4 隐藏到托盘；托盘菜单的“退出”才结束进程
   if (message == WM_CLOSE) {
     Dismiss();
+    return 0;
+  }
+  if (message == WM_TIMER && wparam == kShowTimer) {
+    RunPendingShow();
     return 0;
   }
   if (show_message_ != 0 && message == show_message_) {

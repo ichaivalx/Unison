@@ -27,6 +27,7 @@ class FlutterWindow : public Win32Window {
   // Win32Window:
   bool OnCreate() override;
   void OnDestroy() override;
+  void ShowAfterNextFrame(std::function<void()> show) override;
   LRESULT MessageHandler(HWND window, UINT const message, WPARAM const wparam,
                          LPARAM const lparam) noexcept override;
 
@@ -48,6 +49,11 @@ class FlutterWindow : public Win32Window {
   void NotifyWindowState();
 
   bool show_on_start_;
+
+  // 等待下一帧后执行的显示；只保留最新的一次，隐藏或退出时取消。引擎迟迟不出帧时由定时器兜底
+  std::function<void()> pending_show_;
+  void RunPendingShow();
+  void CancelPendingShow();
 
   // 托盘图标的回调与菜单由不可见的辅助窗口承担（不进任务栏和 Alt+Tab）：弹菜单前置前的是它，
   // 主窗口在用户选择显示之前不被激活，不会把用户带到主窗口所在的其他虚拟桌面。
