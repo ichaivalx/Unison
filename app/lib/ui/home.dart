@@ -47,6 +47,7 @@ class _Home extends StatelessWidget {
   /// 不小于此宽度时左右两栏
   static const _wide = 900.0;
 
+  /// 尚无界面内容时的提示
   String get _status {
     final console = this.console;
     final state = this.state;
@@ -62,14 +63,11 @@ class _Home extends StatelessWidget {
     final console = this.console;
     final state = this.state;
     final safe = MediaQuery.paddingOf(context);
-    final connected = console != null && (console.isSource || (state != null && console.connected.value));
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= _wide;
         final margin = wide ? Grid.wideMargin : Grid.narrowMargin;
         final bar = TitleBar(
-          status: _status,
-          connected: connected,
           margin: margin + safe.left,
           desktop: desktop,
           actions: [
@@ -100,7 +98,7 @@ class _Home extends StatelessWidget {
           children: [
             SizedBox(height: safe.top),
             bar,
-            Expanded(child: body),
+            Expanded(child: desktop ? WindowDragArea(child: body) : body),
           ],
         );
       },

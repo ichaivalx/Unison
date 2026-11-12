@@ -1,25 +1,19 @@
 import 'package:flutter/material.dart';
 
 import '../desktop.dart';
-import 'panels.dart';
 import 'theme.dart';
 
-/// 页面顶栏：名称与连接状态、设置。桌面上兼作窗口标题栏：拖动移动窗口、双击最大化，
+/// 页面顶栏：名称、黑屏与设置。桌面上兼作窗口标题栏：拖动移动窗口、双击最大化，
 /// 右侧为最小化、最大化与关闭
 class TitleBar extends StatelessWidget {
   const TitleBar({
     super.key,
-    required this.status,
-    required this.connected,
     required this.margin,
     required this.desktop,
     required this.actions,
   });
 
   static const height = 52.0;
-
-  final String status;
-  final bool connected;
 
   /// 与页面内容对齐的左右边距
   final double margin;
@@ -28,25 +22,12 @@ class TitleBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colors = context.colors;
-    final title = Row(
-      children: [
-        Text(
-          'Unison',
-          style: context.texts.titleLarge?.copyWith(fontWeight: FontWeight.w700, letterSpacing: -0.3),
-        ),
-        const SizedBox(width: 14),
-        StatusDot(color: connected ? colors.tertiary : colors.outline),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            status,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: context.texts.bodySmall?.copyWith(color: colors.onSurfaceVariant),
-          ),
-        ),
-      ],
+    final title = Align(
+      alignment: Alignment.centerLeft,
+      child: Text(
+        'Unison',
+        style: context.texts.titleLarge?.copyWith(fontWeight: FontWeight.w700, letterSpacing: -0.3),
+      ),
     );
     return SizedBox(
       height: height,

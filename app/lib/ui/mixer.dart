@@ -100,16 +100,14 @@ class ChannelStrip extends StatelessWidget {
     DevicePlatform.android => device.isSource ? Icons.tablet_android_rounded : Icons.smartphone_rounded,
   };
 
-  (String, Color) _status(ColorScheme colors) {
-    if (device.isSource) {
-      return source.running ? ('发送中', colors.tertiary) : ('音源已停止', colors.outlineVariant);
-    }
-    if (!device.online) return ('离线', colors.outlineVariant);
-    if (!device.receive) return ('未接收', colors.onSurfaceVariant);
+  String get _status {
+    if (device.isSource) return source.running ? '发送中' : '音源已停止';
+    if (!device.online) return '离线';
+    if (!device.receive) return '未接收';
     final stats = device.stats;
-    if (!device.receiving || stats == null || !stats.running) return ('等待音频', colors.onSurfaceVariant);
-    if (!stats.clockReady) return ('时钟同步中', colors.onSurfaceVariant);
-    return ('同步 ±${(stats.syncErrorUs.abs() / 1000).toStringAsFixed(2)} ms', colors.tertiary);
+    if (!device.receiving || stats == null || !stats.running) return '等待音频';
+    if (!stats.clockReady) return '时钟同步中';
+    return '同步 ±${(stats.syncErrorUs.abs() / 1000).toStringAsFixed(2)} ms';
   }
 
   void _command(String command, Map<String, Object?> args) => console.command(command, {'id': device.id, ...args});
@@ -127,142 +125,142 @@ class ChannelStrip extends StatelessWidget {
   Widget build(BuildContext context) {
     final colors = context.colors;
     final texts = context.texts;
-    final (status, statusColor) = _status(colors);
     final self = device.id == console.selfId;
     final volume = ((device.actualVolume ?? device.volume.level) * 100).round();
     final follow = !device.isSource && device.volume.mode == VolumeMode.follow;
     final muted = texts.labelSmall?.copyWith(color: colors.onSurfaceVariant);
-    return AnimatedOpacity(
-      duration: const Duration(milliseconds: 200),
-      opacity: device.online ? 1 : 0.5,
-      child: Container(
-        width: Mixer.stripWidth,
-        clipBehavior: Clip.antiAlias,
-        decoration: BoxDecoration(
-          color: colors.surfaceContainerHigh,
-          borderRadius: BorderRadius.circular(Grid.stripRadius),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            SizedBox(
-              height: 78,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 14, 10, 0),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(_icon, size: 16, color: device.isSource ? colors.primary : colors.onSurfaceVariant),
-                        const Spacer(),
-                        if (self) Tag('本机', color: colors.primary),
-                      ],
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      device.name.isEmpty ? '未命名设备' : device.name,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: texts.titleSmall?.copyWith(fontWeight: FontWeight.w600, height: 1.2),
-                    ),
-                  ],
+    return WindowSurface(
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 200),
+        opacity: device.online ? 1 : 0.5,
+        child: Container(
+          width: Mixer.stripWidth,
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: colors.surfaceContainerHigh,
+            borderRadius: BorderRadius.circular(Grid.stripRadius),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              SizedBox(
+                height: 78,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 14, 10, 0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(_icon, size: 16, color: device.isSource ? colors.primary : colors.onSurfaceVariant),
+                          const Spacer(),
+                          if (self) Tag('本机', color: colors.primary),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        device.name.isEmpty ? '未命名设备' : device.name,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: texts.titleSmall?.copyWith(fontWeight: FontWeight.w600, height: 1.2),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  SizedBox(
-                    height: 20,
-                    child: Row(
-                      children: [
-                        StatusDot(color: statusColor, size: 7),
-                        const SizedBox(width: 7),
-                        Expanded(
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 与设备名左对齐
+                    SizedBox(
+                      height: 20,
+                      child: Align(
+                        alignment: Alignment.centerLeft,
+                        child: Padding(
+                          padding: const EdgeInsets.only(left: 2),
                           child: Text(
-                            status,
+                            _status,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: muted?.copyWith(fontFeatures: tabular),
                           ),
                         ),
-                      ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  if (device.isSource)
-                    _Plate(label: '音源')
-                  else
-                    LitButton(
-                      label: '接收',
-                      on: device.receive,
-                      onPressed: device.online ? () => _command(Command.receive, {'on': !device.receive}) : null,
+                    const SizedBox(height: 8),
+                    if (device.isSource)
+                      _Plate(label: '音源')
+                    else
+                      LitButton(
+                        label: '接收',
+                        on: device.receive,
+                        onPressed: device.online ? () => _command(Command.receive, {'on': !device.receive}) : null,
+                      ),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      height: 28,
+                      child: device.isSource
+                          ? null
+                          : _ModeSwitch(mode: device.volume.mode, onChanged: (mode) => _command(Command.volumeMode, {'mode': mode.name})),
                     ),
-                  const SizedBox(height: 8),
-                  SizedBox(
-                    height: 28,
-                    child: device.isSource
-                        ? null
-                        : _ModeSwitch(mode: device.volume.mode, onChanged: (mode) => _command(Command.volumeMode, {'mode': mode.name})),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    height: 22,
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.baseline,
-                      textBaseline: TextBaseline.alphabetic,
-                      spacing: 6,
-                      children: [
-                        Text(
-                          '$volume%',
-                          style: texts.titleSmall?.copyWith(fontFeatures: tabular, fontWeight: FontWeight.w600),
-                        ),
-                        if (follow) Text(_signedPoints(device.volume.offset), style: muted?.copyWith(fontFeatures: tabular)),
-                      ],
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      height: 22,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.baseline,
+                        textBaseline: TextBaseline.alphabetic,
+                        spacing: 6,
+                        children: [
+                          Text(
+                            '$volume%',
+                            style: texts.titleSmall?.copyWith(fontFeatures: tabular, fontWeight: FontWeight.w600),
+                          ),
+                          if (follow) Text(_signedPoints(device.volume.offset), style: muted?.copyWith(fontFeatures: tabular)),
+                        ],
+                      ),
                     ),
-                  ),
-                ],
-              ),
-            ),
-            Expanded(
-              child: Fader(
-                value: volume,
-                active: device.isSource || device.receiving,
-                label: '${device.name} 音量',
-                onChanged: (v) => _command(Command.volume, {'value': v / 100}),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 10, 12),
-              child: device.isSource
-                  ? _Readout(label: '本机延迟', value: formatMs(source.localDelayUs))
-                  : _OffsetControl(
-                      offsetUs: device.offsetUs,
-                      enabled: !calibrating && device.online,
-                      onSteps: (steps) => _command(Command.offset, {'deltaUs': steps * _offsetStep}),
-                    ),
-            ),
-            if (blackoutRow)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(10, 0, 10, 12),
-                child: SizedBox(
-                  height: 34,
-                  child: switch (device.blackout) {
-                    null => null,
-                    final on => LitButton(
-                      label: on ? '退出黑屏' : '黑屏',
-                      icon: Icons.bedtime_outlined,
-                      on: on,
-                      onPressed: () => _blackout(!on),
-                    ),
-                  },
+                  ],
                 ),
               ),
-          ],
+              Expanded(
+                child: Fader(
+                  value: volume,
+                  active: device.isSource || device.receiving,
+                  label: '${device.name} 音量',
+                  onChanged: (v) => _command(Command.volume, {'value': v / 100}),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(10, 8, 10, 12),
+                child: device.isSource
+                    ? _Readout(label: '本机延迟', value: formatMs(source.localDelayUs))
+                    : _OffsetControl(
+                        offsetUs: device.offsetUs,
+                        enabled: !calibrating && device.online,
+                        onSteps: (steps) => _command(Command.offset, {'deltaUs': steps * _offsetStep}),
+                      ),
+              ),
+              if (blackoutRow)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 0, 10, 12),
+                  child: SizedBox(
+                    height: 34,
+                    child: switch (device.blackout) {
+                      null => null,
+                      final on => LitButton(
+                        label: on ? '退出黑屏' : '黑屏',
+                        icon: Icons.bedtime_outlined,
+                        on: on,
+                        onPressed: () => _blackout(!on),
+                      ),
+                    },
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );

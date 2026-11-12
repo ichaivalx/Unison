@@ -32,7 +32,6 @@ class SourcePanel extends StatelessWidget {
     final source = state.source;
     final colors = context.colors;
     final texts = context.texts;
-    final receiving = state.devices.where((d) => d.receiving).length;
     final calibrating = state.calibration.stage == CalibrationStage.running;
     final local = console.isSource;
     final reachable = local || console.connected.value;
@@ -59,39 +58,17 @@ class SourcePanel extends StatelessWidget {
               ),
               const SizedBox(width: 14),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                child: Row(
                   children: [
-                    Row(
-                      children: [
-                        Flexible(
-                          child: Text(
-                            _name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: texts.titleLarge?.copyWith(fontWeight: FontWeight.w600),
-                          ),
-                        ),
-                        if (local) ...[const SizedBox(width: 8), Tag('本机', color: colors.primary)],
-                      ],
+                    Flexible(
+                      child: Text(
+                        _name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: texts.titleLarge?.copyWith(fontWeight: FontWeight.w600),
+                      ),
                     ),
-                    const SizedBox(height: 2),
-                    Row(
-                      children: [
-                        StatusDot(color: source.running ? colors.tertiary : colors.outlineVariant),
-                        const SizedBox(width: 8),
-                        Flexible(
-                          child: Text(
-                            source.running
-                                ? (receiving == 0 ? '运行中，暂无设备接收' : '运行中，$receiving 台设备在接收')
-                                : '已停止',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: hint,
-                          ),
-                        ),
-                      ],
-                    ),
+                    if (local) ...[const SizedBox(width: 8), Tag('本机', color: colors.primary)],
                   ],
                 ),
               ),

@@ -1,11 +1,73 @@
 #include "flutter_window.h"
 
+#include <shellapi.h>
+
+#include <cstring>
 #include <optional>
+#include <string>
 
 #include "flutter/generated_plugin_registrant.h"
+#include "resource.h"
 
-FlutterWindow::FlutterWindow(const flutter::DartProject& project)
-    : project_(project) {}
+namespace {
+
+constexpr UINT kTrayMessage = WM_APP + 1;
+constexpr UINT kTrayId = 1;
+constexpr int kMenuShow = 1;
+constexpr int kMenuQuit = 2;
+
+// 当前用户的启动项
+constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kRunValue[] = L"Unison";
+
+// 启动项的值：本程序路径加开机自启参数
+std::wstring AutostartCommand() {
+  std::wstring path(MAX_PATH, L'\0');
+  for (;;) {
+    const DWORD length =
+        GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (length < path.size()) {
+      path.resize(length);
+      break;
+    }
+    path.resize(path.size() * 2);
+  }
+  const char* argument = FlutterWindow::kAutostartArgument;
+  return L"\"" + path + L"\" " + std::wstring(argument, argument + std::strlen(argument));
+}
+
+// 启动项存在且指向本程序
+bool AutostartEnabled() {
+  DWORD size = 0;
+  if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ, nullptr, nullptr,
+                   &size) != ERROR_SUCCESS) {
+    return false;
+  }
+  std::wstring value(size / sizeof(wchar_t) + 1, L'\0');
+  size = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+  if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, RRF_RT_REG_SZ, nullptr, value.data(),
+                   &size) != ERROR_SUCCESS) {
+    return false;
+  }
+  return _wcsicmp(value.c_str(), AutostartCommand().c_str()) == 0;
+}
+
+// 写入或删除启动项，返回之后的实际状态
+bool SetAutostart(bool on) {
+  if (on) {
+    const std::wstring command = AutostartCommand();
+    RegSetKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue, REG_SZ, command.c_str(),
+                    static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+  } else {
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kRunKey, kRunValue);
+  }
+  return AutostartEnabled();
+}
+
+}  // namespace
+
+FlutterWindow::FlutterWindow(const flutter::DartProject& project, bool show_on_start)
+    : project_(project), show_on_start_(show_on_start) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -34,7 +96,9 @@ bool FlutterWindow::OnCreate() {
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    this->Show();
+    if (show_on_start_) {
+      this->Show();
+    }
   });
 
   // Flutter can complete the first frame before the "show window" callback is
@@ -42,13 +106,107 @@ bool FlutterWindow::OnCreate() {
   // window is shown. It is a no-op if the first frame hasn't completed yet.
   flutter_controller_->ForceRedraw();
 
+  taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
+  show_message_ = RegisterWindowMessageW(kShowMessageName);
+  AddTrayIcon();
   return true;
+}
+
+void FlutterWindow::AddTrayIcon() {
+  tray_window_ = GetHandle();
+  if (tray_icon_ == nullptr) {
+    const UINT dpi = GetDpiForWindow(tray_window_);
+    tray_icon_ = static_cast<HICON>(LoadImageW(
+        GetModuleHandle(nullptr), MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+        GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi),
+        LR_DEFAULTCOLOR));
+  }
+  NOTIFYICONDATAW icon{};
+  icon.cbSize = static_cast<DWORD>(sizeof(icon));
+  icon.hWnd = tray_window_;
+  icon.uID = kTrayId;
+  icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+  icon.uCallbackMessage = kTrayMessage;
+  icon.hIcon = tray_icon_;
+  wcscpy_s(icon.szTip, L"Unison");
+  Shell_NotifyIconW(NIM_ADD, &icon);
+}
+
+void FlutterWindow::RemoveTrayIcon() {
+  if (tray_window_ == nullptr) {
+    return;
+  }
+  NOTIFYICONDATAW icon{};
+  icon.cbSize = static_cast<DWORD>(sizeof(icon));
+  icon.hWnd = tray_window_;
+  icon.uID = kTrayId;
+  Shell_NotifyIconW(NIM_DELETE, &icon);
+  tray_window_ = nullptr;
+  if (tray_icon_ != nullptr) {
+    DestroyIcon(tray_icon_);
+    tray_icon_ = nullptr;
+  }
+}
+
+void FlutterWindow::ShowTrayMenu() {
+  HWND window = GetHandle();
+  HMENU menu = CreatePopupMenu();
+  AppendMenuW(menu, MF_STRING, kMenuShow, L"显示 Unison");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, kMenuQuit, L"退出");
+  SetMenuDefaultItem(menu, kMenuShow, FALSE);
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  // 菜单所有者须在前台，点击别处时菜单才会关闭
+  SetForegroundWindow(window);
+  const BOOL command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                                      cursor.x, cursor.y, 0, window, nullptr);
+  PostMessage(window, WM_NULL, 0, 0);
+  DestroyMenu(menu);
+  if (command == kMenuShow) {
+    Present();
+  } else if (command == kMenuQuit) {
+    DestroyWindow(window);
+  }
+}
+
+bool FlutterWindow::InFront() {
+  HWND window = GetHandle();
+  return IsWindowVisible(window) && !IsIconic(window) &&
+         (GetForegroundWindow() == window || GetTickCount64() - deactivated_at_ < 500);
+}
+
+void FlutterWindow::Present() {
+  Reveal();
+  if (flutter_controller_) {
+    flutter_controller_->ForceRedraw();
+  }
+}
+
+void FlutterWindow::Dismiss() {
+  if (FullScreen()) {
+    KeepHiddenAfterFullScreen();
+    if (window_channel_) {
+      window_channel_->InvokeMethod("escape", nullptr);
+    }
+    return;
+  }
+  Hide();
 }
 
 void FlutterWindow::HandleWindowCall(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   const std::string& method = call.method_name();
+  if (method == "autostart") {
+    result->Success(flutter::EncodableValue(AutostartEnabled()));
+    return;
+  }
+  if (method == "setAutostart") {
+    const auto* on = std::get_if<bool>(call.arguments());
+    result->Success(flutter::EncodableValue(SetAutostart(on != nullptr && *on)));
+    return;
+  }
   if (method == "state") {
     result->Success(flutter::EncodableValue(flutter::EncodableMap{
         {flutter::EncodableValue("maximized"), flutter::EncodableValue(Maximized())},
@@ -92,6 +250,7 @@ void FlutterWindow::NotifyWindowState() {
 }
 
 void FlutterWindow::OnDestroy() {
+  RemoveTrayIcon();
   window_channel_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
@@ -104,6 +263,41 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  if (message == WM_ACTIVATE && LOWORD(wparam) == WA_INACTIVE) {
+    deactivated_at_ = GetTickCount64();
+  }
+  // 关闭按钮、Alt+F4 隐藏到托盘；托盘菜单的“退出”才结束进程
+  if (message == WM_CLOSE) {
+    Dismiss();
+    return 0;
+  }
+  if (message == kTrayMessage) {
+    switch (LOWORD(lparam)) {
+      case WM_LBUTTONDOWN:
+      case WM_LBUTTONDBLCLK:
+        front_at_tray_press_ = InFront();
+        break;
+      case WM_LBUTTONUP:
+        if (front_at_tray_press_) {
+          Dismiss();
+        } else {
+          Present();
+        }
+        break;
+      case WM_RBUTTONUP:
+        ShowTrayMenu();
+        break;
+    }
+    return 0;
+  }
+  if (show_message_ != 0 && message == show_message_) {
+    Present();
+    return 0;
+  }
+  if (taskbar_created_ != 0 && message == taskbar_created_) {
+    AddTrayIcon();
+    return 0;
+  }
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =

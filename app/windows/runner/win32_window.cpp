@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <flutter_windows.h>
+#include <shobjidl.h>
 #include <windowsx.h>
 
 #include "resource.h"
@@ -18,7 +19,7 @@ namespace {
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-constexpr const wchar_t kWindowClassName[] = L"FLUTTER_RUNNER_WIN32_WINDOW";
+constexpr const wchar_t* kWindowClassName = Win32Window::kClassName;
 
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
@@ -343,6 +344,7 @@ void Win32Window::SetFullScreen(bool on) {
     return;
   }
   if (on) {
+    hidden_before_fullscreen_ = !IsWindowVisible(window);
     GetWindowPlacement(window, &placement_);
     if (IsIconic(window) || IsZoomed(window)) {
       ShowWindow(window, SW_RESTORE);
@@ -359,16 +361,21 @@ void Win32Window::SetFullScreen(bool on) {
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     // 远程进入时系统可能不允许取得前台，键盘仍在其他应用；注册失败则只能在取得焦点后按 Esc
     RegisterHotKey(window, kEscapeHotKey, MOD_NOREPEAT, VK_ESCAPE);
+    // 隐藏在托盘时进入：出现在用户当前所在的虚拟桌面
+    MoveToCurrentDesktop();
     SetForegroundWindow(window);
     return;
   }
   WINDOWPLACEMENT placement = placement_;
-  if (IsIconic(window)) {
+  if (hidden_before_fullscreen_) {
+    placement.showCmd = SW_HIDE;
+  } else if (IsIconic(window)) {
     if (placement.showCmd == SW_SHOWMAXIMIZED) {
       placement.flags |= WPF_RESTORETOMAXIMIZED;
     }
     placement.showCmd = SW_SHOWMINIMIZED;
   }
+  hidden_before_fullscreen_ = false;
   UnregisterHotKey(window, kEscapeHotKey);
   fullscreen_ = false;
   const LONG_PTR style = GetWindowLongPtr(window, GWL_STYLE);
@@ -376,6 +383,55 @@ void Win32Window::SetFullScreen(bool on) {
   SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
   SetWindowPlacement(window, &placement);
+}
+
+void Win32Window::Reveal() {
+  HWND window = window_handle_;
+  hidden_before_fullscreen_ = false;
+  ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
+  MoveToCurrentDesktop();
+  SetForegroundWindow(window);
+}
+
+void Win32Window::Hide() {
+  ShowWindow(window_handle_, SW_HIDE);
+}
+
+void Win32Window::MoveToCurrentDesktop() {
+  IVirtualDesktopManager* manager = nullptr;
+  if (FAILED(CoCreateInstance(__uuidof(VirtualDesktopManager), nullptr, CLSCTX_ALL,
+                              IID_PPV_ARGS(&manager)))) {
+    return;
+  }
+  BOOL current = TRUE;
+  if (SUCCEEDED(manager->IsWindowOnCurrentVirtualDesktop(window_handle_, &current)) && !current) {
+    struct Search {
+      IVirtualDesktopManager* manager;
+      HWND self;
+      GUID desktop;
+      bool found;
+    } search{manager, window_handle_, GUID{}, false};
+    EnumWindows(
+        [](HWND window, LPARAM data) -> BOOL {
+          auto& state = *reinterpret_cast<Search*>(data);
+          BOOL on = FALSE;
+          GUID desktop{};
+          if (window != state.self && IsWindowVisible(window) &&
+              SUCCEEDED(state.manager->IsWindowOnCurrentVirtualDesktop(window, &on)) && on &&
+              SUCCEEDED(state.manager->GetWindowDesktopId(window, &desktop)) &&
+              desktop != GUID{}) {
+            state.desktop = desktop;
+            state.found = true;
+            return FALSE;
+          }
+          return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    if (search.found) {
+      manager->MoveWindowToDesktop(window_handle_, search.desktop);
+    }
+  }
+  manager->Release();
 }
 
 bool Win32Window::OnCreate() {

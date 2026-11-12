@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../desktop.dart';
 import 'theme.dart';
 
 /// 圆角面板
@@ -10,27 +11,15 @@ class Panel extends StatelessWidget {
   final EdgeInsetsGeometry padding;
 
   @override
-  Widget build(BuildContext context) => Container(
-    padding: padding,
-    decoration: BoxDecoration(
-      color: context.colors.surfaceContainer,
-      borderRadius: BorderRadius.circular(Grid.panelRadius),
+  Widget build(BuildContext context) => WindowSurface(
+    child: Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        color: context.colors.surfaceContainer,
+        borderRadius: BorderRadius.circular(Grid.panelRadius),
+      ),
+      child: child,
     ),
-    child: child,
-  );
-}
-
-class StatusDot extends StatelessWidget {
-  const StatusDot({super.key, required this.color, this.size = 8});
-
-  final Color color;
-  final double size;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    width: size,
-    height: size,
-    decoration: BoxDecoration(color: color, shape: BoxShape.circle),
   );
 }
 

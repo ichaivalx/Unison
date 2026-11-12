@@ -1,7 +1,9 @@
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 
 /// Windows 窗口：界面自绘的标题栏使用的窗口操作与状态
 abstract final class AppWindow {
@@ -37,6 +39,92 @@ abstract final class AppWindow {
   static void toggleMaximize() => _channel.invokeMethod<void>('toggleMaximize');
   static void close() => _channel.invokeMethod<void>('close');
   static Future<void> _blackout(bool on) => _channel.invokeMethod<void>('blackout', on);
+
+  /// 开机自启：当前用户的启动项存在且指向本程序；启动时驻留托盘、不显示窗口
+  static Future<bool> autostart() async => await _channel.invokeMethod<bool>('autostart') ?? false;
+
+  /// 写入或删除启动项，返回之后的实际状态
+  static Future<bool> setAutostart(bool on) async => await _channel.invokeMethod<bool>('setAutostart', on) ?? false;
+}
+
+/// 卡片、通道条等内容区：其中按下不拖动窗口
+class WindowSurface extends StatelessWidget {
+  const WindowSurface({super.key, required this.child});
+
+  static const _tag = #windowSurface;
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) => MetaData(metaData: _tag, child: child);
+}
+
+/// 页面背景上的空白处与标题栏一样：鼠标左键按住拖动窗口、双击最大化或还原。[WindowSurface]
+/// 与滚动条上不响应，触摸照常交给滚动
+class WindowDragArea extends StatefulWidget {
+  const WindowDragArea({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<WindowDragArea> createState() => _WindowDragAreaState();
+}
+
+class _WindowDragAreaState extends State<WindowDragArea> {
+  /// 空白处按下的位置，移动超过拖动阈值即交给系统拖动窗口
+  Offset? _pressed;
+
+  /// 上一次空白处按下，用于识别双击
+  PointerDownEvent? _previous;
+
+  bool _blank(Offset position) {
+    final result = HitTestResult();
+    WidgetsBinding.instance.hitTestInView(result, position, View.of(context).viewId);
+    for (final entry in result.path) {
+      final target = entry.target;
+      if (target is RenderMetaData && target.metaData == WindowSurface._tag) return false;
+      if (target is RenderCustomPaint && (target.foregroundPainter is ScrollbarPainter || target.painter is ScrollbarPainter)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void _down(PointerDownEvent event) {
+    _pressed = null;
+    if (event.kind != PointerDeviceKind.mouse || event.buttons != kPrimaryMouseButton || !_blank(event.position)) {
+      _previous = null;
+      return;
+    }
+    final previous = _previous;
+    if (previous != null &&
+        event.timeStamp - previous.timeStamp <= kDoubleTapTimeout &&
+        (event.position - previous.position).distance <= kDoubleTapSlop) {
+      _previous = null;
+      AppWindow.toggleMaximize();
+      return;
+    }
+    _previous = event;
+    _pressed = event.position;
+  }
+
+  void _move(PointerMoveEvent event) {
+    final pressed = _pressed;
+    if (pressed == null || (event.position - pressed).distance <= kPrecisePointerPanSlop) return;
+    _pressed = null;
+    _previous = null;
+    AppWindow.startDrag();
+  }
+
+  @override
+  Widget build(BuildContext context) => Listener(
+    behavior: HitTestBehavior.translucent,
+    onPointerDown: _down,
+    onPointerMove: _move,
+    onPointerUp: (_) => _pressed = null,
+    onPointerCancel: (_) => _pressed = null,
+    child: widget.child,
+  );
 }
 
 /// 黑屏：窗口全屏覆盖所在的显示器、纯黑并隐藏指针，接收与播放照常；期间系统不关闭显示器、

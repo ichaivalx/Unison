@@ -25,6 +25,9 @@ class Win32Window {
         : width(width), height(height) {}
   };
 
+  // 窗口类名：另一实例按此查找已在运行的窗口
+  static constexpr wchar_t kClassName[] = L"UnisonWindow";
+
   Win32Window();
   virtual ~Win32Window();
 
@@ -66,6 +69,14 @@ class Win32Window {
   // 全屏覆盖窗口所在的显示器并置顶；退出时恢复进入前的位置与状态（期间被最小化的保持最小化）。
   // 全屏期间以热键注册 Esc：窗口未能取得前台时也能收到（WM_HOTKEY，编号 kEscapeHotKey）
   void SetFullScreen(bool on);
+  bool FullScreen() const { return fullscreen_; }
+
+  // 黑屏退出后保持隐藏（黑屏期间要求隐藏到托盘）
+  void KeepHiddenAfterFullScreen() { hidden_before_fullscreen_ = true; }
+
+  // 显示（最小化的还原）、移到用户当前所在的虚拟桌面并置前；隐藏（不在任务栏）
+  void Reveal();
+  void Hide();
 
   static constexpr int kEscapeHotKey = 1;
 
@@ -114,7 +125,11 @@ class Win32Window {
   // 屏幕坐标 [lparam] 处于顶部的缩放边框内
   bool InTopBorder(LPARAM lparam);
 
+  // 窗口不在当前虚拟桌面时移过来：以当前桌面上任一可见窗口所在的桌面为准
+  void MoveToCurrentDesktop();
+
   bool fullscreen_ = false;
+  bool hidden_before_fullscreen_ = false;
   WINDOWPLACEMENT placement_{sizeof(WINDOWPLACEMENT)};
 
   bool quit_on_close_ = false;

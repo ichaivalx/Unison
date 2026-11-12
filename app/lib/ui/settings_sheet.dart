@@ -3,10 +3,11 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:unison_native/unison_native.dart';
 
+import '../desktop.dart';
 import '../settings.dart';
 import 'theme.dart';
 
-/// 本机设置：深色样式、Windows 输出设备
+/// 本机设置：深色样式、Windows 输出设备与开机自启
 Future<void> showSettingsSheet(BuildContext context) => showModalBottomSheet<void>(
   context: context,
   isScrollControlled: true,
@@ -25,10 +26,27 @@ class _SettingsSheetState extends State<_SettingsSheet> {
   List<OutputDevice>? _outputs;
   OutputDevice? _output = LocalSettings.outputDevice;
 
+  /// 开机自启：以启动项的实际状态为准，读取前为 null
+  bool? _autostart;
+
   @override
   void initState() {
     super.initState();
-    if (Platform.isWindows) _loadOutputs();
+    if (Platform.isWindows) {
+      _loadOutputs();
+      _loadAutostart();
+    }
+  }
+
+  Future<void> _loadAutostart() async {
+    final on = await AppWindow.autostart().catchError((_) => false);
+    if (mounted) setState(() => _autostart = on);
+  }
+
+  Future<void> _setAutostart(bool on) async {
+    setState(() => _autostart = on);
+    final actual = await AppWindow.setAutostart(on).catchError((_) => !on);
+    if (mounted) setState(() => _autostart = actual);
   }
 
   Future<void> _loadOutputs() async {
@@ -111,6 +129,14 @@ class _SettingsSheetState extends State<_SettingsSheet> {
               )
             else
               const LinearProgressIndicator(),
+            const SizedBox(height: 16),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text('开机自启', style: label),
+              subtitle: Text('登录后在托盘中运行，不显示窗口', style: texts.bodySmall?.copyWith(color: colors.onSurfaceVariant)),
+              value: _autostart ?? false,
+              onChanged: _autostart == null ? null : _setAutostart,
+            ),
           ],
           const SizedBox(height: 24),
           Text('本机', style: label),

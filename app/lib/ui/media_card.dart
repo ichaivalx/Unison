@@ -6,6 +6,7 @@ import '../control/clock.dart';
 import '../control/console.dart';
 import '../control/models.dart';
 import '../control/protocol.dart';
+import '../desktop.dart';
 import 'theme.dart';
 
 /// 音源设备上正在播放的媒体：标题、可拖动的进度、播放控制
@@ -80,20 +81,22 @@ class _MediaCardState extends State<MediaCard> {
     final media = widget.media;
     final colors = context.colors;
     final texts = context.texts;
-    return Container(
-      padding: const EdgeInsets.fromLTRB(Grid.panelPadding, 18, Grid.panelPadding, 12),
-      decoration: BoxDecoration(
-        color: colors.surfaceContainer,
-        borderRadius: BorderRadius.circular(Grid.panelRadius),
+    return WindowSurface(
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(Grid.panelPadding, 18, Grid.panelPadding, 12),
+        decoration: BoxDecoration(
+          color: colors.surfaceContainer,
+          borderRadius: BorderRadius.circular(Grid.panelRadius),
+        ),
+        child: media == null
+            ? SizedBox(
+                height: 72,
+                child: Center(
+                  child: Text('音源设备上没有正在播放的媒体', style: texts.bodyMedium?.copyWith(color: colors.onSurfaceVariant)),
+                ),
+              )
+            : _content(media, colors, texts),
       ),
-      child: media == null
-          ? SizedBox(
-              height: 72,
-              child: Center(
-                child: Text('音源设备上没有正在播放的媒体', style: texts.bodyMedium?.copyWith(color: colors.onSurfaceVariant)),
-              ),
-            )
-          : _content(media, colors, texts),
     );
   }
 
