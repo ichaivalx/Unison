@@ -195,7 +195,10 @@ internal class AcousticCalibration(
             val anchor = checkNotNull(microphoneAnchor)
             if (tone?.attached != true) {
                 tone?.close(); tone = null
-                tone = Tone(checkNotNull(playable)).also { check(it.attached) { "Calibration effect could not be attached" } }
+                // 先交给统一的收尾释放，再检查是否挂上
+                val restored = Tone(checkNotNull(playable))
+                tone = restored
+                check(restored.attached) { "Calibration effect could not be attached" }
             }
             val remote = JSONObject()
             for (receiver in receivers) {
