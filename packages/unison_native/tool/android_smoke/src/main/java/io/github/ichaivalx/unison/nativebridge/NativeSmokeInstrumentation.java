@@ -98,7 +98,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             activity = startActivitySync(launch);
             Object available = await(call("root", new Class<?>[]{String.class, JSONObject.class}, "available", new JSONObject()));
             if (!Boolean.TRUE.equals(available)) throw new IllegalStateException("Effect module unavailable");
-            await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250)));
+            await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250).put("channelDelays", new JSONObject())));
             Method notification = serviceClass.getDeclaredMethod("notification"); notification.setAccessible(true);
             Notification playingNotification = (Notification)notification.invoke(holder);
             if (playingNotification.actions.length != 2 || !"停止音源".contentEquals(playingNotification.actions[0].title) || !"退出".contentEquals(playingNotification.actions[1].title)) throw new IllegalStateException("Source notification actions mismatch");
@@ -106,7 +106,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             rootField.setAccessible(true); Process rootProcess = (Process)rootField.get(null);
             for (int restart = 0; restart < 3; ++restart) {
                 await(call("stopSource", new Class<?>[]{}));
-                await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250)));
+                await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250).put("channelDelays", new JSONObject())));
             }
             Thread.sleep(1200);
             if (!((JSONObject)call("getSource", new Class<?>[]{})).optBoolean("running") || service() != holder || rootField.get(null) != rootProcess) throw new IllegalStateException("Old session overwrote restarted source status");
@@ -122,7 +122,7 @@ public final class NativeSmokeInstrumentation extends Instrumentation {
             runOnMainSync(sourceActivity::finish);
             Thread.sleep(1000);
             // 模拟远端在音源已停止、Activity 已销毁后再次开启；不允许新建服务。
-            await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250)));
+            await(call("startSource", new Class<?>[]{JSONObject.class}, new JSONObject().put("latencyUs", 50000).put("localDelayUs", 1250).put("channelDelays", new JSONObject())));
             if (service() != holder || rootField.get(null) != rootProcess) throw new IllegalStateException("Background source replaced service/root process");
             // AUDIO 由 tap 帧生成；验证采集链路，不依赖房间噪声下的麦克风检出结果。
             java.net.DatagramSocket tap = new java.net.DatagramSocket(); tap.setSoTimeout(100);

@@ -81,10 +81,21 @@ class _DiagnosticsState extends State<Diagnostics> {
                             '音源 ${source.running ? '运行中' : '已停止'}',
                             '目标延迟 ${formatMs(source.latencyUs)}',
                             '本机延迟 ${formatMs(source.localDelayUs)}',
-                            '采集 ${source.sessions.isEmpty ? '无' : source.sessions.join('、')}',
+                            if (source.sessions.isEmpty) '采集 无',
                           ].join('   '),
                           style: mono,
                         ),
+                        for (final channel in source.channels)
+                          Text(
+                            '通道 ${channelLabel(channel.channel)}（${channel.channel}）   出声 ${formatMs(channel.latencyUs)}   '
+                            '${channel.base ? '基准' : '补偿 +${formatMs(channel.compensationUs)}'}',
+                            style: mono,
+                          ),
+                        for (final session in source.sessions)
+                          Text(
+                            '采集 ${session.app}   ${sessionChannel(session)}   生效延迟 ${formatMs(session.delayUs)}',
+                            style: mono?.copyWith(color: session.calibrated ? null : colors.error),
+                          ),
                         for (final device in state.devices)
                           if (!device.isSource)
                             Text.rich(

@@ -54,11 +54,23 @@ class OutputDevice {
 
 /// 音源端正在采集的一个播放会话。
 class CapturedSession {
-  const CapturedSession({required this.uid, required this.packageName, required this.sessionId});
+  const CapturedSession({
+    required this.uid,
+    required this.packageName,
+    required this.sessionId,
+    required this.channel,
+    required this.delayUs,
+  });
 
   final int uid;
   final String? packageName;
   final int sessionId;
+
+  /// 所在的输出通道（输出 flags，如 `PRIMARY|FAST`、`DEEP_BUFFER`）；未能确定时为 null
+  final String? channel;
+
+  /// 效果上实际生效的本机延迟：本机延迟加所在通道的补偿
+  final int delayUs;
 }
 
 /// 音源端状态（变化时推送，运行中至少每秒一次）。
@@ -107,12 +119,21 @@ class BandMeasurement {
   final int rounds;
 }
 
+/// 音源本机在一条输出通道上的测量；测试音按原样播放，不含通道补偿。
+class ChannelMeasurement {
+  const ChannelMeasurement({required this.channel, required this.measurements});
+
+  /// 测试音实际所在的输出通道（见 [CapturedSession.channel]）
+  final String channel;
+  final List<BandMeasurement> measurements;
+}
+
 /// 一次校准的测量结果；如何换算成目标延迟/本机延迟/各接收端偏移由调用方决定。
 class CalibrationResult {
   const CalibrationResult({required this.local, required this.receivers});
 
-  /// 音源本机
-  final List<BandMeasurement> local;
+  /// 音源本机，每条测得的输出通道一项，同一通道只测一次
+  final List<ChannelMeasurement> local;
 
   /// 各接收端（键为 receiverId）
   final Map<int, List<BandMeasurement>> receivers;
@@ -220,16 +241,19 @@ abstract final class UnisonNative {
   static Future<void> setVolume(double volume) => _call<void>('setVolume', volume);
   static Stream<double> get volumeChanges => _stream('volume').map((dynamic e) => (e as num).toDouble());
   static Future<bool> sourceAvailable() => _call<bool>('sourceAvailable');
-  static Future<void> startSource({required int latencyUs, required int localDelayUs}) =>
-      _call<void>('startSource', {'latencyUs': latencyUs, 'localDelayUs': localDelayUs});
+  /// [channelDelays]：各输出通道在本机延迟上追加的延迟，不在其中的通道不追加
+  static Future<void> startSource({required int latencyUs, required int localDelayUs, required Map<String, int> channelDelays}) =>
+      _call<void>('startSource', {'latencyUs': latencyUs, 'localDelayUs': localDelayUs, 'channelDelays': channelDelays});
   static Future<void> stopSource() => _call<void>('stopSource');
   static Future<void> setSourceLatencyUs(int latencyUs) => _call<void>('setSourceLatencyUs', latencyUs);
   static Future<void> setLocalDelayUs(int localDelayUs) => _call<void>('setLocalDelayUs', localDelayUs);
+  static Future<void> setChannelDelays(Map<String, int> delays) => _call<void>('setChannelDelays', {'delays': delays});
   static Stream<SourceStatus> get sourceStatus => _stream('source').map((dynamic e) => SourceStatus(
     running: e['running'] == true, latencyUs: (e['latencyUs'] as num?)?.toInt() ?? 50000,
     localDelayUs: (e['localDelayUs'] as num?)?.toInt() ?? 0,
     sessions: ((e['sessions'] as List?) ?? []).map((dynamic s) => CapturedSession(uid: (s['uid'] as num).toInt(),
-      packageName: s['packageName'] as String?, sessionId: (s['sessionId'] as num).toInt())).toList(),
+      packageName: s['packageName'] as String?, sessionId: (s['sessionId'] as num).toInt(),
+      channel: s['channel'] as String?, delayUs: (s['delayUs'] as num).toInt())).toList(),
     receiverIds: ((e['receiverIds'] as List?) ?? []).cast<int>(), error: e['error'] as String?));
   static Future<CalibrationResult> calibrate({required List<int> receiverIds, required List<CalibrationBand> bands,
     required void Function(CalibrationProgress progress) onProgress}) async {
@@ -240,7 +264,8 @@ abstract final class UnisonNative {
       List<BandMeasurement> measurements(dynamic rows) => (rows as List).map((dynamic m) => BandMeasurement(
         band: CalibrationBand.values.byName(m['band'] as String), arrivalUs: (m['arrivalUs'] as num?)?.toInt(),
         spreadUs: (m['spreadUs'] as num?)?.toInt(), rounds: (m['rounds'] as num).toInt())).toList();
-      return CalibrationResult(local: measurements(result['local']), receivers: {
+      return CalibrationResult(local: [for (final dynamic c in result['local'] as List)
+        ChannelMeasurement(channel: c['channel'] as String, measurements: measurements(c['measurements']))], receivers: {
         for (final entry in (result['receivers'] as Map).entries) int.parse(entry.key.toString()): measurements(entry.value)});
     } finally { await subscription.cancel(); }
   }

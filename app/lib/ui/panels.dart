@@ -111,6 +111,11 @@ class SourcePanel extends StatelessWidget {
             const SizedBox(height: 10),
             Text(error, style: texts.bodySmall?.copyWith(color: colors.error)),
           ],
+          for (final session in source.sessions)
+            if (!session.calibrated) ...[
+              const SizedBox(height: 10),
+              Text('${session.app}：${sessionChannel(session)}', style: texts.bodySmall?.copyWith(color: colors.error)),
+            ],
           const SizedBox(height: 18),
           DialField(
             label: '目标延迟',

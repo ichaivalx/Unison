@@ -24,7 +24,8 @@ internal fun joinThread(thread: Thread?) {
 }
 
 internal class SourceSession(private val excludeUid: Int, @Volatile var latencyUs: Long,
-    @Volatile var localDelayUs: Long, private val onFatal: (SourceSession, Throwable) -> Unit) {
+    @Volatile var localDelayUs: Long, @Volatile var channelDelays: Map<String, Long>,
+    private val onFatal: (SourceSession, Throwable) -> Unit) {
     private val MAGIC = 0x4E534E55
     private val SOURCE_PORT = 47800
     private val BEACON_PORT = 47801
@@ -75,7 +76,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
         try {
             channel = DatagramChannel.open().apply { configureBlocking(false); socket().broadcast = true; bind(InetSocketAddress(SOURCE_PORT)) }
             effect = EffectSource().also { it.onSessionsChanged = { publishStatus() } }
-            checkNotNull(effect).start(excludeUid, localDelayUs)
+            checkNotNull(effect).start(excludeUid, localDelayUs, channelDelays)
             val udp = checkNotNull(channel)
             val name = android.os.Build.MODEL.toByteArray(Charsets.UTF_8)
             val beacon = message(1, 4 + name.size).apply { putShort(SOURCE_PORT.toShort()).putShort(name.size.toShort()).put(name) }
@@ -120,6 +121,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
 
     fun receiverIds(): List<Long> = subscribers.values.filter { System.nanoTime() - it.lastNs < SUBSCRIBE_TIMEOUT_NS }.map { it.id }.distinct()
     fun setDelay(us: Long) { check(calibration?.isRunning != true) { "校准中" }; check(us >= 0); effect?.setLocalDelay(us); localDelayUs = us; publishStatus() }
+    fun setChannelDelays(delays: Map<String, Long>) { effect?.setChannelDelays(delays); channelDelays = delays; publishStatus() }
     fun setLatency(us: Long) { check(calibration?.isRunning != true) { "校准中" }; latencyUs = us; publishStatus() }
     fun cancelCalibration() { calibration?.cancel() }
     fun calibrate(ids: List<Long>, bands: List<String>, progress: (org.json.JSONObject) -> Unit,

@@ -26,6 +26,7 @@ object CaptureMain {
     private var media: RootMedia? = null
     private var latencyUs = 50_000L
     private var delayUs = 0L
+    private var channelDelays = emptyMap<String, Long>()
     private var excludeUid = -1
     @JvmStatic fun main(args: Array<String>) {
         try {
@@ -50,8 +51,9 @@ object CaptureMain {
                         "startSource" -> synchronized(sourceLifecycle) {
                             check(available()) { "Unison effect module is not active or has a different version" }
                             closeSource(); latencyUs = data.getLong("latencyUs"); delayUs = data.getLong("localDelayUs")
+                            channelDelays = delays(data.getJSONObject("channelDelays"))
                             check(delayUs >= 0)
-                            val session = SourceSession(excludeUid, latencyUs, delayUs) { failed, _ -> if (source === failed) exitProcess(1) }
+                            val session = SourceSession(excludeUid, latencyUs, delayUs, channelDelays) { failed, _ -> if (source === failed) exitProcess(1) }
                             synchronized(sourceEvents) { source = session }
                             try { session.start() } catch (error: Throwable) { closeSource(); throw error }
                             null
@@ -59,6 +61,7 @@ object CaptureMain {
                         "stopSource" -> { closeSource(); publishStopped(); null }
                         "setSourceLatencyUs" -> { val value = data.getLong("value"); source?.setLatency(value); latencyUs = value; publishStopped(); null }
                         "setLocalDelayUs" -> { val value = data.getLong("value"); check(value >= 0); source?.setDelay(value); delayUs = value; publishStopped(); null }
+                        "setChannelDelays" -> { val value = delays(data.getJSONObject("delays")); source?.setChannelDelays(value); channelDelays = value; null }
                         "calibrate" -> {
                             val session = checkNotNull(source) { "Source is not running" }
                             val ids = data.getJSONArray("receiverIds").let { array -> List(array.length()) { array.getLong(it) } }
@@ -85,6 +88,8 @@ object CaptureMain {
     private fun available(): Boolean = AudioEffect.queryEffects()?.any {
         it.uuid == UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202") && it.implementor == "Unison/5"
     } == true
+    private fun delays(json: JSONObject): Map<String, Long> = json.keys().asSequence().associateWith { json.getLong(it) }
+        .also { check(it.values.all { delay -> delay >= 0 }) }
     private fun stopped() = JSONObject().put("running", false).put("latencyUs", latencyUs).put("localDelayUs", delayUs)
         .put("sessions", org.json.JSONArray()).put("receiverIds", org.json.JSONArray()).put("error", JSONObject.NULL)
     internal fun publish(session: SourceSession, type: String, value: JSONObject) = synchronized(sourceEvents) {

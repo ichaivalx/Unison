@@ -183,6 +183,62 @@ class DeviceView {
   );
 }
 
+/// 音源正在采集的一个播放会话
+class SessionView {
+  const SessionView({required this.app, required this.channel, required this.delayUs, required this.calibrated});
+
+  /// 应用包名
+  final String app;
+
+  /// 所在的输出通道；未能确定时为 null
+  final String? channel;
+
+  /// 实际生效的本机延迟：本机延迟加所在通道的补偿
+  final int delayUs;
+
+  /// 所在通道已校准并按其补偿；否则不补偿
+  final bool calibrated;
+
+  Map<String, Object?> toJson() => {'app': app, 'channel': channel, 'delayUs': delayUs, 'calibrated': calibrated};
+
+  static SessionView fromJson(Map json) => SessionView(
+    app: json['app'] as String? ?? '',
+    channel: json['channel'] as String?,
+    delayUs: (json['delayUs'] as num?)?.toInt() ?? 0,
+    calibrated: json['calibrated'] == true,
+  );
+}
+
+/// 本机一条已校准的输出通道
+class ChannelView {
+  const ChannelView({required this.channel, required this.latencyUs, required this.compensationUs, required this.base});
+
+  final String channel;
+
+  /// 实测的取样点到发声的延迟（中高频，不含本机延迟）
+  final int latencyUs;
+
+  /// 当前对齐频段下追加的延迟
+  final int compensationUs;
+
+  /// 基准通道：出声最慢，其他通道补偿到与之同时
+  final bool base;
+
+  Map<String, Object?> toJson() => {
+    'channel': channel,
+    'latencyUs': latencyUs,
+    'compensationUs': compensationUs,
+    'base': base,
+  };
+
+  static ChannelView fromJson(Map json) => ChannelView(
+    channel: json['channel'] as String? ?? '',
+    latencyUs: (json['latencyUs'] as num?)?.toInt() ?? 0,
+    compensationUs: (json['compensationUs'] as num?)?.toInt() ?? 0,
+    base: json['base'] == true,
+  );
+}
+
 class SourceView {
   const SourceView({
     required this.running,
@@ -190,22 +246,29 @@ class SourceView {
     required this.localDelayUs,
     required this.error,
     required this.sessions,
+    required this.channels,
   });
 
   final bool running;
   final int latencyUs;
+
+  /// 对所有会话的基础本机延迟，各通道的补偿另加
   final int localDelayUs;
   final String? error;
 
-  /// 正在采集的播放会话（应用包名）
-  final List<String> sessions;
+  /// 正在采集的播放会话
+  final List<SessionView> sessions;
+
+  /// 已校准的本机输出通道，出声慢的在前
+  final List<ChannelView> channels;
 
   Map<String, Object?> toJson() => {
     'running': running,
     'latencyUs': latencyUs,
     'localDelayUs': localDelayUs,
     'error': error,
-    'sessions': sessions,
+    'sessions': [for (final session in sessions) session.toJson()],
+    'channels': [for (final channel in channels) channel.toJson()],
   };
 
   static SourceView fromJson(Map json) => SourceView(
@@ -213,7 +276,8 @@ class SourceView {
     latencyUs: (json['latencyUs'] as num?)?.toInt() ?? 0,
     localDelayUs: (json['localDelayUs'] as num?)?.toInt() ?? 0,
     error: json['error'] as String?,
-    sessions: [...?(json['sessions'] as List?)?.cast<String>()],
+    sessions: [for (final session in (json['sessions'] as List? ?? const [])) SessionView.fromJson(session as Map)],
+    channels: [for (final channel in (json['channels'] as List? ?? const [])) ChannelView.fromJson(channel as Map)],
   );
 }
 

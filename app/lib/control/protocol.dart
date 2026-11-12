@@ -13,7 +13,7 @@ abstract final class Protocol {
   static const app = 'unison';
 
   /// 控制协议版本，两端不同时不建立连接
-  static const version = 1;
+  static const version = 2;
 
   static String encode(Map<String, Object?> message) => jsonEncode(message);
 

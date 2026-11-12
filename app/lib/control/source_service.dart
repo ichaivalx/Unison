@@ -85,7 +85,7 @@ class _Peer {
 /// 校准前的设置，用于撤销
 typedef _Snapshot = ({
   int localDelayUs,
-  BandGaps localGaps,
+  Channels channels,
   Map<String, ({int base, BandGaps gaps})> peers,
 });
 
@@ -98,7 +98,7 @@ class SourceService implements Console {
   static const _latencyKey = 'source.latencyUs';
   static const _localDelayKey = 'source.localDelayUs';
   static const _weightKey = 'band.weight';
-  static const _localGapsKey = 'band.localGaps';
+  static const _channelsKey = 'calibration.channels';
   static const _boostKey = 'calibration.boost';
   static const _boostLevelKey = 'calibration.boostLevel';
 
@@ -183,7 +183,7 @@ class SourceService implements Console {
   late int _latencyUs = _prefs.getInt(_latencyKey) ?? _defaultLatencyUs;
   late int _localDelayUs = _prefs.getInt(_localDelayKey) ?? 0;
   late double _weight = _prefs.getDouble(_weightKey) ?? 0;
-  late BandGaps _localGaps = gapsFromJson(_decode(_prefs.getString(_localGapsKey)));
+  late Channels _channels = channelsFromJson(_decode(_prefs.getString(_channelsKey)));
   late bool _boost = _prefs.getBool(_boostKey) ?? true;
   late double _boostLevel = _prefs.getDouble(_boostLevelKey) ?? 0.6;
 
@@ -240,6 +240,7 @@ class SourceService implements Console {
       }
       _status = status;
       if (status.error != null) _error = status.error;
+      _syncChannelDelays();
       _publish();
     }, onError: (_) {});
     UnisonNative.mediaState.listen((media) {
@@ -306,6 +307,20 @@ class SourceService implements Console {
 
   int _effectiveOffset(_Peer peer) => peer.baseOffsetUs + bandShift(_weight, peer.gaps, _localGaps);
 
+  /// 接收端与本机基准通道对齐
+  BandGaps get _localGaps => localGapsOf(_channels);
+
+  /// 已下发给原生的各通道补偿
+  Map<String, int>? _sentChannelDelays;
+
+  /// 校准结果或对齐频段变化后，把各通道的补偿下发给运行中的音源
+  void _syncChannelDelays() {
+    final delays = channelDelays(_channels, _weight);
+    if (!_running || mapEquals(delays, _sentChannelDelays)) return;
+    _sentChannelDelays = delays;
+    _guard(() => UnisonNative.setChannelDelays(delays));
+  }
+
   void _savePeers() {
     _prefs.setString(_peersKey, jsonEncode({for (final peer in _peers.values) peer.id: peer.toJson()}));
   }
@@ -328,7 +343,9 @@ class SourceService implements Console {
     _starting = true;
     await _guard(() async {
       _error = null;
-      await UnisonNative.startSource(latencyUs: _latencyUs, localDelayUs: _localDelayUs);
+      final delays = channelDelays(_channels, _weight);
+      _sentChannelDelays = delays;
+      await UnisonNative.startSource(latencyUs: _latencyUs, localDelayUs: _localDelayUs, channelDelays: delays);
     });
     _starting = false;
   }
@@ -524,6 +541,7 @@ class SourceService implements Console {
           _weight = weight.toDouble().clamp(0.0, 1.0).toDouble();
           _prefs.setDouble(_weightKey, _weight);
           _normalize();
+          _syncChannelDelays();
         }
     }
     _publish();
@@ -575,7 +593,7 @@ class SourceService implements Console {
     final effective = {for (final peer in peers.values) peer.id: _effectiveOffset(peer)};
     final undo = (
       localDelayUs: _localDelayUs,
-      localGaps: _localGaps,
+      channels: _channels,
       peers: {for (final peer in _peers.values) peer.id: (base: peer.baseOffsetUs, gaps: peer.gaps)},
     );
     _publish(immediate: true);
@@ -599,29 +617,37 @@ class SourceService implements Console {
       if (_cancelled) throw const CalibrationFailure('已取消');
       final outcome = solveCalibration(
         effective: effective,
-        local: result.local,
+        localDelayUs: undo.localDelayUs,
+        local: {for (final channel in result.local) channel.channel: channel.measurements},
         receivers: {
           for (final MapEntry(key: rid, value: peer) in peers.entries)
             peer.id: result.receivers[rid] ?? const [],
         },
       );
       _undo = undo;
-      _localGaps = outcome.localGaps;
+      _channels = outcome.channels;
       for (final peer in _peers.values) {
         peer.baseOffsetUs = outcome.baseOffsets[peer.id] ?? peer.baseOffsetUs;
         if (outcome.gaps[peer.id] case final gaps?) peer.gaps = gaps;
       }
       _saveCalibration();
       _normalize();
+      _syncChannelDelays();
       _calibration = CalibrationView(
         stage: CalibrationStage.done,
         canUndo: true,
         rows: [
-          CalibrationRow(
-            name: LocalSettings.deviceName,
-            result: '本机延迟 ${formatMs(_localDelayUs)}',
-            detail: _localGapsNote(),
-          ),
+          CalibrationRow(name: LocalSettings.deviceName, result: '本机延迟 ${formatMs(_localDelayUs)}'),
+          for (final channel in _channelViews())
+            CalibrationRow(
+              name: '本机 · ${channelLabel(channel.channel)}',
+              result: channel.base
+                  ? '出声 ${formatMs(channel.latencyUs)} · 基准'
+                  : '出声 ${formatMs(channel.latencyUs)} · 补偿 +${formatMs(channel.compensationUs)}',
+              detail: [channel.channel, _gapsNote(_channels[channel.channel]!.gaps)].join('，'),
+            ),
+          for (final channel in outcome.unmeasured)
+            CalibrationRow(name: '本机 · ${channelLabel(channel)}', result: '未测到测试音', detail: channel),
           for (final peer in peers.values)
             outcome.missing.contains(peer.id)
                 ? CalibrationRow(name: peer.name, result: '未测到测试音')
@@ -694,16 +720,26 @@ class SourceService implements Console {
     _publish(immediate: immediate);
   }
 
-  String _localGapsNote() {
-    if (_localGaps.isEmpty) return '未测到低频';
+  static String _gapsNote(BandGaps gaps) {
+    if (gaps.isEmpty) return '未测到低频';
     return [
-      for (final MapEntry(key: band, value: gap) in _localGaps.entries)
+      for (final MapEntry(key: band, value: gap) in gaps.entries)
         '${bandLabel(band)}${gap < 0 ? '早' : '晚'} ${formatMs(gap.abs())}',
     ].join('，');
   }
 
+  /// 已校准的通道，出声慢的在前
+  List<ChannelView> _channelViews() {
+    final base = baseChannel(_channels);
+    final delays = channelDelays(_channels, _weight);
+    return [
+      for (final MapEntry(key: channel, value: latency) in _channels.entries)
+        ChannelView(channel: channel, latencyUs: latency.midUs, compensationUs: delays[channel]!, base: channel == base),
+    ]..sort((a, b) => b.latencyUs.compareTo(a.latencyUs));
+  }
+
   void _saveCalibration() {
-    _prefs.setString(_localGapsKey, jsonEncode(gapsToJson(_localGaps)));
+    _prefs.setString(_channelsKey, jsonEncode(channelsToJson(_channels)));
     _savePeers();
   }
 
@@ -711,7 +747,7 @@ class SourceService implements Console {
     final undo = _undo;
     if (undo == null || _calibration.stage == CalibrationStage.running) return;
     _undo = null;
-    _localGaps = undo.localGaps;
+    _channels = undo.channels;
     for (final MapEntry(key: id, value: saved) in undo.peers.entries) {
       if (_peers[id] case final peer?) {
         peer
@@ -723,6 +759,7 @@ class SourceService implements Console {
     _saveCalibration();
     // 快照本身合法，只在其后调过对齐频段而出现负偏移时修正
     _normalize(minimize: false);
+    _syncChannelDelays();
     _calibration = const CalibrationView(message: '已撤销本次校准');
   }
 
@@ -750,6 +787,7 @@ class SourceService implements Console {
         return a.name.compareTo(b.name);
       });
     final available = _localGaps.isNotEmpty || _peers.values.any((p) => p.gaps.isNotEmpty);
+    final channels = _channelViews();
     final state = ConsoleState(
       sourceId: selfId,
       source: SourceView(
@@ -757,7 +795,16 @@ class SourceService implements Console {
         latencyUs: _latencyUs,
         localDelayUs: _localDelayUs,
         error: _error,
-        sessions: [for (final s in status?.sessions ?? const <CapturedSession>[]) s.packageName ?? 'uid ${s.uid}'],
+        sessions: [
+          for (final s in status?.sessions ?? const <CapturedSession>[])
+            SessionView(
+              app: s.packageName ?? 'uid ${s.uid}',
+              channel: s.channel,
+              delayUs: s.delayUs,
+              calibrated: _channels.containsKey(s.channel),
+            ),
+        ],
+        channels: channels,
       ),
       media: _media == null ? null : MediaView.of(_media!),
       devices: [
@@ -795,7 +842,7 @@ class SourceService implements Console {
         weight: _weight,
         available: available,
         notes: [
-          if (available) '本机：${_localGapsNote()}',
+          if (available) '本机：${_gapsNote(_localGaps)}',
           for (final peer in others)
             if (peer.gaps.isNotEmpty) '${peer.name}：${bandNote(peer.gaps, _localGaps)}',
         ],

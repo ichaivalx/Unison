@@ -70,14 +70,13 @@ internal class AcousticCalibration(
     @Volatile private var micTimestampFrame = 0L
     @Volatile private var microphoneFailure: Throwable? = null
     @Volatile private var recorder: AudioRecord? = null
-    @Volatile private var player: AudioTrack? = null
+    @Volatile private var tone: Tone? = null
     private val control = Any()
     private val tones = Any()
     private var pendingTone: ShortArray? = null
     private val inputEffects = mutableListOf<AudioEffect>()
     private var worker: Thread? = null
     private var micThread: Thread? = null
-    private var playThread: Thread? = null
     private external fun detect(samples: FloatArray, sine: FloatArray, cosine: FloatArray, directSound: Boolean, lookback: Int, ratio: Double): DoubleArray?
 
     fun start() {
@@ -96,6 +95,51 @@ internal class AcousticCalibration(
         }
     }
 
+    /**
+     * 测试音的一种播放方式。省电模式由 AudioTrack 加上 FLAG_DEEP_BUFFER，走大缓冲通道；普通模式且缓冲
+     * 不足 100ms 时不会被自动加上该标志（AudioTrack.shouldEnablePowerSaving），与多数播放器一样走主输出。
+     */
+    private class Request(val name: String, val mode: Int, val bufferMs: Int)
+    private val requests = listOf(
+        Request("powerSaving", AudioTrack.PERFORMANCE_MODE_POWER_SAVING, 200),
+        Request("normal", AudioTrack.PERFORMANCE_MODE_NONE, 40),
+    )
+
+    /** 播放中的测试音轨道及其写入线程 */
+    private inner class Tone(request: Request) {
+        val track: AudioTrack
+        @Volatile var stopped = false
+        private val writer: Thread
+
+        init {
+            val format = AudioFormat.Builder().setSampleRate(RATE).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build()
+            track = AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                .setAudioFormat(format).setTransferMode(AudioTrack.MODE_STREAM)
+                .setPerformanceMode(request.mode)
+                .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT), RATE * request.bufferMs / 1000 * 4)).build()
+            writer = try {
+                sessionId = track.audioSessionId
+                source.setCalibrationSession(track.audioSessionId)
+                val deadline = System.nanoTime() + 3_000_000_000L
+                while (track.audioSessionId !in source.activeSessions()) {
+                    check(System.nanoTime() < deadline) { "Calibration effect could not be attached" }; pause(20)
+                }
+                track.play()
+                thread(name = "calibration-output", isDaemon = true) { writeAudio(this) }
+            } catch (error: Throwable) { track.release(); throw error }
+        }
+
+        fun close() {
+            stopped = true
+            runCatching { track.pause() }
+            joinThread(writer)
+            track.release()
+        }
+    }
+
     private fun run() {
         var result: JSONObject? = null
         var failure: Throwable? = null
@@ -107,80 +151,35 @@ internal class AcousticCalibration(
                 return
             }
             openMicrophone()
-            val format = AudioFormat.Builder().setSampleRate(RATE).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build()
-            val track = AudioTrack.Builder().setAudioAttributes(AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
-                .setAudioFormat(format).setTransferMode(AudioTrack.MODE_STREAM)
-                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_POWER_SAVING)
-                .setBufferSizeInBytes(maxOf(AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT), RATE / 5 * 4)).build()
-            player = track; sessionId = track.audioSessionId
-            source.setCalibrationSession(track.audioSessionId)
-            source.setCalibrationLocal(true)
-            val deadline = System.nanoTime() + 3_000_000_000L
-            while (track.audioSessionId !in source.activeSessions()) {
-                check(System.nanoTime() < deadline) { "Calibration effect could not be attached" }; pause(20)
-            }
-            track.play()
-            playThread = thread(name = "calibration-output", isDaemon = true) { writeAudio(track) }
-            pause(2500)
-            val microphoneAnchor = checkNotNull(micOriginNs) { "Microphone monotonic timestamp unavailable" }
-            val total = (receivers.size + 1) * bands.size * 3
+            val perDevice = bands.size * 3
+            val total = (requests.size + receivers.size) * perDevice
             var step = 0
             val local = org.json.JSONArray()
+            val measured = mutableSetOf<String>()
+            var microphoneAnchor: Long? = null
+            for (request in requests) {
+                tone?.close(); tone = null
+                val current = Tone(request)
+                tone = current
+                check(!cancelled) { "校准已停止" }
+                // 测试音须确实落在已确定的通道上；与已测通道相同时不重复测量
+                val channel = checkNotNull(source.channelOf(current.track.audioSessionId)) {
+                    "无法确定测试音所在的输出通道（${request.name}）"
+                }
+                println("INFO calibration_channel request=${request.name} channel=$channel duplicate=${channel in measured}")
+                if (!measured.add(channel)) { step += perDevice; continue }
+                pause(if (microphoneAnchor == null) 2500 else 1000)
+                val anchor = microphoneAnchor ?: checkNotNull(micOriginNs) { "Microphone monotonic timestamp unavailable" }
+                microphoneAnchor = anchor
+                val values = measure(null, "本机 $channel", anchor, step, total)
+                step += perDevice
+                local.put(JSONObject().put("channel", channel).put("request", request.name).put("measurements", values))
+            }
+            val anchor = checkNotNull(microphoneAnchor)
             val remote = JSONObject()
-            for (receiver in listOf<Long?>(null) + receivers) {
-                val valuesForDevice = org.json.JSONArray()
-                val name = receiver?.toString() ?: "本机"
-                synchronized(control) {
-                    check(!cancelled)
-                    source.setCalibrationLocal(receiver == null)
-                    networkTarget = receiver
-                }
-                pause(maxOf(localDelayUs, latencyUs.toLong()).coerceAtLeast(0) / 1000 + 500)
-                for (band in bands) {
-                    val values = mutableListOf<Double>()
-                    repeat(3) { round ->
-                        progress(JSONObject().put("step", step).put("totalSteps", total)
-                            .put("description", "$name ${band.name} ${round + 1}/3"))
-                        if (receiver == null || subscribed(receiver)) {
-                            val sine = chirp(band, round, false)
-                            val cosine = chirp(band, round, true)
-                            val tone = ShortArray(band.frames * 2) { (sine[it / 2] * 0.35f * 32767).roundToInt().toShort() }
-                            val periodMs = maxOf(localDelayUs, latencyUs.toLong()).coerceAtLeast(0) / 1000 + 1500
-                            val current = Window(((periodMs + 250) * RATE / 1000).toInt())
-                            window = current
-                            synchronized(tones) { pendingTone = tone }
-                            pause(periodMs); window = null
-                            val tap: FloatArray; val mic: FloatArray
-                            synchronized(current.lock) {
-                                current.frozen = true
-                                tap = current.tap.copyOf(current.tapCount); mic = current.mic.copyOf(current.micCount)
-                            }
-                            val reference = detect(tap, sine, cosine, false, band.lookback, band.ratio)
-                            val found = detect(mic, sine, cosine, true, band.lookback, band.ratio)
-                            check(!cancelled) { "校准已停止" }
-                            if (!current.gap && reference != null && found != null && reference[1] >= 8 &&
-                                reference[2] >= 0.1 && found[1] >= 8 && found[2] >= 0.1) {
-                                val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
-                                val micTime = microphoneAnchor + (current.micFirstFrame + found[0]) * 1_000_000_000.0 / RATE
-                                values.add((micTime - tapTime) / 1000.0)
-                            }
-                        }
-                        ++step
-                        progress(JSONObject().put("step", step).put("totalSteps", total)
-                            .put("description", "$name ${band.name} ${round + 1}/3"))
-                    }
-                    val sorted = values.sorted()
-                    val spread = if (sorted.isEmpty()) null else (sorted.last() - sorted.first()).toLong()
-                    val median = if (sorted.size < 2 || spread!! > 5000) null else
-                        ((sorted[(sorted.size - 1) / 2] + sorted[sorted.size / 2]) / 2).toLong()
-                    valuesForDevice.put(JSONObject().put("band", band.name).put("arrivalUs", median ?: JSONObject.NULL)
-                        .put("spreadUs", spread ?: JSONObject.NULL).put("rounds", values.size))
-                }
-                if (receiver == null) { for (i in 0 until valuesForDevice.length()) local.put(valuesForDevice.get(i)) }
-                else remote.put(receiver.toString(), valuesForDevice)
+            for (receiver in receivers) {
+                remote.put(receiver.toString(), measure(receiver, receiver.toString(), anchor, step, total))
+                step += perDevice
             }
             check(!cancelled) { "校准已停止" }
             result = JSONObject().put("local", local).put("receivers", remote)
@@ -194,6 +193,59 @@ internal class AcousticCalibration(
                 complete(result, failure)
             }
         }
+    }
+
+    /** 在当前测试音上测一台设备（[receiver] 为 null 时为本机）的各频段 */
+    private fun measure(receiver: Long?, name: String, microphoneAnchor: Long, firstStep: Int, total: Int): org.json.JSONArray {
+        val valuesForDevice = org.json.JSONArray()
+        var step = firstStep
+        synchronized(control) {
+            check(!cancelled)
+            source.setCalibrationLocal(receiver == null)
+            networkTarget = receiver
+        }
+        pause(maxOf(localDelayUs, latencyUs).coerceAtLeast(0) / 1000 + 500)
+        for (band in bands) {
+            val values = mutableListOf<Double>()
+            repeat(3) { round ->
+                progress(JSONObject().put("step", step).put("totalSteps", total)
+                    .put("description", "$name ${band.name} ${round + 1}/3"))
+                if (receiver == null || subscribed(receiver)) {
+                    val sine = chirp(band, round, false)
+                    val cosine = chirp(band, round, true)
+                    val wave = ShortArray(band.frames * 2) { (sine[it / 2] * 0.35f * 32767).roundToInt().toShort() }
+                    val periodMs = maxOf(localDelayUs, latencyUs).coerceAtLeast(0) / 1000 + 1500
+                    val current = Window(((periodMs + 250) * RATE / 1000).toInt())
+                    window = current
+                    synchronized(tones) { pendingTone = wave }
+                    pause(periodMs); window = null
+                    val tap: FloatArray; val mic: FloatArray
+                    synchronized(current.lock) {
+                        current.frozen = true
+                        tap = current.tap.copyOf(current.tapCount); mic = current.mic.copyOf(current.micCount)
+                    }
+                    val reference = detect(tap, sine, cosine, false, band.lookback, band.ratio)
+                    val found = detect(mic, sine, cosine, true, band.lookback, band.ratio)
+                    check(!cancelled) { "校准已停止" }
+                    if (!current.gap && reference != null && found != null && reference[1] >= 8 &&
+                        reference[2] >= 0.1 && found[1] >= 8 && found[2] >= 0.1) {
+                        val tapTime = current.tapNs + reference[0] * 1_000_000_000.0 / RATE
+                        val micTime = microphoneAnchor + (current.micFirstFrame + found[0]) * 1_000_000_000.0 / RATE
+                        values.add((micTime - tapTime) / 1000.0)
+                    }
+                }
+                ++step
+                progress(JSONObject().put("step", step).put("totalSteps", total)
+                    .put("description", "$name ${band.name} ${round + 1}/3"))
+            }
+            val sorted = values.sorted()
+            val spread = if (sorted.isEmpty()) null else (sorted.last() - sorted.first()).toLong()
+            val median = if (sorted.size < 2 || spread!! > 5000) null else
+                ((sorted[(sorted.size - 1) / 2] + sorted[sorted.size / 2]) / 2).toLong()
+            valuesForDevice.put(JSONObject().put("band", band.name).put("arrivalUs", median ?: JSONObject.NULL)
+                .put("spreadUs", spread ?: JSONObject.NULL).put("rounds", values.size))
+        }
+        return valuesForDevice
     }
 
     private fun chirp(band: Band, round: Int, quadrature: Boolean): FloatArray {
@@ -278,29 +330,29 @@ internal class AcousticCalibration(
         } catch (error: Exception) { if (!cancelled) microphoneFailure = error }
     }
 
-    private fun writeAudio(track: AudioTrack) {
+    private fun writeAudio(output: Tone) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val data = ShortArray(480 * 2)
-        var tone: ShortArray? = null
+        var wave: ShortArray? = null
         var position = 0
         try {
-            while (!cancelled) {
-                if (tone == null) synchronized(tones) { tone = pendingTone; pendingTone = null; position = 0 }
+            while (!cancelled && !output.stopped) {
+                if (wave == null) synchronized(tones) { wave = pendingTone; pendingTone = null; position = 0 }
                 data.fill(0)
-                tone?.let { wave ->
-                    val count = minOf(data.size, wave.size - position)
-                    wave.copyInto(data, 0, position, position + count)
+                wave?.let { samples ->
+                    val count = minOf(data.size, samples.size - position)
+                    samples.copyInto(data, 0, position, position + count)
                     position += count
-                    if (position == wave.size) tone = null
+                    if (position == samples.size) wave = null
                 }
                 var written = 0
-                while (!cancelled && written < data.size) {
-                    val n = track.write(data, written, data.size - written, AudioTrack.WRITE_BLOCKING)
+                while (!cancelled && !output.stopped && written < data.size) {
+                    val n = output.track.write(data, written, data.size - written, AudioTrack.WRITE_BLOCKING)
                     check(n > 0) { "测试音写入失败：$n" }
                     written += n
                 }
             }
-        } catch (error: Exception) { if (!cancelled) microphoneFailure = error }
+        } catch (error: Exception) { if (!cancelled && !output.stopped) microphoneFailure = error }
     }
 
     private fun pause(ms: Long) {
@@ -330,15 +382,15 @@ internal class AcousticCalibration(
             source.setCalibrationSession(null)
             runCatching { source.setCalibrationLocal(true) }
         }
-        runCatching { player?.pause() }
+        runCatching { tone?.track?.pause() }
         runCatching { recorder?.stop() }
         if (Thread.currentThread() !== worker) worker?.interrupt()
     }
 
     private fun close() {
         stopAudio()
-        joinThread(playThread); joinThread(micThread)
-        runCatching { player?.release() }; player = null
+        tone?.close(); tone = null
+        joinThread(micThread)
         inputEffects.forEach { runCatching { it.release() } }; inputEffects.clear()
         runCatching { recorder?.release() }; recorder = null
         source.setCalibrationSession(null)

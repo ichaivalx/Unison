@@ -58,7 +58,7 @@ class UnisonNativePlugin : FlutterPlugin, MethodChannel.MethodCallHandler, Event
                 "startSource" -> { requestNotificationPermission(); NativeRuntime.startSource(args) }
                 "stopSource" -> NativeRuntime.stopSource()
                 "setSourceLatencyUs", "setLocalDelayUs", "mediaSeek", "mediaCommand" -> NativeRuntime.root(call.method, JSONObject().put("value", call.arguments))
-                "calibrate" -> NativeRuntime.root("calibrate", args)
+                "setChannelDelays", "calibrate" -> NativeRuntime.root(call.method, args)
                 "cancelCalibration" -> NativeRuntime.root("cancelCalibration")
                 else -> { result.error("unsupported", "Unsupported Android capability: ${call.method}", null); return }
             }

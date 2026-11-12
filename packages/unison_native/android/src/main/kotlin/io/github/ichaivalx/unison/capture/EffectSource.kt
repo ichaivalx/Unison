@@ -13,7 +13,9 @@ import kotlin.concurrent.thread
 
 internal class EffectSource {
     var onSessionsChanged: (() -> Unit)? = null
-    private class Session(val uid: Int, val id: Int, val effect: AudioEffect) {
+    /** [outputIo]、[channel] 为会话所在的输出线程与通道，[delayUs] 为效果上生效的本机延迟 */
+    private class Session(val uid: Int, val id: Int, val effect: AudioEffect, var outputIo: Int?, var channel: String?,
+        var delayUs: Long) {
         @Volatile var io: Int? = null
     }
     private val lock = Any()
@@ -29,6 +31,10 @@ internal class EffectSource {
     @Volatile private var unresolvedClients = emptySet<Pair<Int, Int>>()
     @Volatile private var playingSessions = emptySet<Int>()
     @Volatile private var delayUs = 0L
+    /** 各输出通道在本机延迟上追加的延迟；不在其中的通道不追加 */
+    @Volatile private var channelDelays = emptyMap<String, Long>()
+    /** 已知的输出线程 io → 通道；io 在本次开机内不复用 */
+    @Volatile private var outputChannels = emptyMap<Int, String>()
     @Volatile private var outputMuted = false
     @Volatile private var calibrationSession: Int? = null
     @Volatile private var calibrationLocal = true
@@ -53,14 +59,16 @@ internal class EffectSource {
     private val getPid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientPid")
     private val getSession = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getSessionId")
     private val isActive = AudioPlaybackConfiguration::class.java.getDeclaredMethod("isActive")
+    private val captureUsages = intArrayOf(AudioAttributes.USAGE_MEDIA, AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN)
     private external fun openTap(): Int
     private external fun readTap(fd: Int): ByteArray?
     private external fun closeTap(fd: Int)
 
-    fun start(appUid: Int, localDelayUs: Long) {
+    fun start(appUid: Int, localDelayUs: Long, channelDelays: Map<String, Long>) {
         val context = RootContext.create()
         excludeUid = appUid
         delayUs = localDelayUs
+        this.channelDelays = channelDelays
         manager = AudioManager::class.java.getDeclaredConstructor(Context::class.java).newInstance(context)
         socket = openTap()
         val binder = Class.forName("android.os.ServiceManager").getDeclaredMethod("checkService", String::class.java)
@@ -92,7 +100,7 @@ internal class EffectSource {
                 try { Thread.sleep(1000) } catch (_: InterruptedException) { return@thread }
             }
         }
-        println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_us=$localDelayUs")
+        println("INFO effect=Unison_Tap attach=active_sessions exclude_uid=$appUid local_delay_us=$localDelayUs channel_delays_us=$channelDelays")
     }
 
     private fun refresh(configs: List<AudioPlaybackConfiguration>? = null) {
@@ -108,8 +116,7 @@ internal class EffectSource {
         val unknown = mutableSetOf<Pair<Int, Int>>()
         for (config in configs) {
             val usage = config.audioAttributes.usage
-            if (isActive.invoke(config) != true || usage !in intArrayOf(AudioAttributes.USAGE_MEDIA,
-                    AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN)) continue
+            if (isActive.invoke(config) != true || usage !in captureUsages) continue
             val uid = getUid.invoke(config) as Int
             if (uid < 0 || uid == excludeUid) continue
             val session = getSession.invoke(config) as Int
@@ -117,32 +124,20 @@ internal class EffectSource {
             if (session > 0) wanted[session] = uid
             else if (session < 0) unknown.add(uid to (getPid.invoke(config) as Int))
         }
+        calibrationSession?.let { wanted[it] = android.os.Process.myUid() }
         needsSessionLookup = unknown.isNotEmpty()
         val unresolved = unknown.toMutableSet()
-        if (unknown.isNotEmpty()) {
-            // 只查询缺失编号的活跃客户端；不在会话锁内等待 dumpsys，采集不受影响。
-            val dump = ProcessBuilder("dumpsys", "media.audio_flinger").redirectErrorStream(true).start()
-            val row = Regex("""^\s*(?:F\d+\s+)?\d+\s+yes\s+(\d+)\s*/\s*(\d+)\s+(\d+)\s+\d+\s+\S+\s+0x[0-9a-fA-F]+\s+\S+\s+\S+\s+\d+\s+\d+\s+(\d+)\s+""")
-            var output = false
-            dump.inputStream.bufferedReader().useLines { lines -> lines.forEach { line ->
-                if (line.startsWith("Output thread ")) output = true
-                if (line.trim() == "Local log:" || line.startsWith("Input thread ")) output = false
-                if (output) row.find(line)?.let { match ->
-                    val pid = match.groupValues[1].toInt()
-                    val uid = match.groupValues[2].toInt()
-                    val id = match.groupValues[3].toInt()
-                    val usage = match.groupValues[4].toInt()
-                    if ((uid to pid) in unknown && id > 0 && usage in intArrayOf(AudioAttributes.USAGE_MEDIA,
-                            AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN)) {
-                        wanted[id] = uid
-                        unresolved.remove(uid to pid)
-                    }
-                }
-            } }
-            dump.waitFor()
+        val known = synchronized(lock) { sessions.keys + failed }
+        // 新会话须在启用效果前确定所在通道，与缺失编号的客户端共用一次查询；不在会话锁内等待
+        // dumpsys，采集不受影响。
+        val outputs = if (unknown.isNotEmpty() || wanted.keys.any { it !in known }) readOutputs() else null
+        if (outputs != null) for (track in outputs.tracks) {
+            if ((track.uid to track.pid) in unknown && track.active && track.session > 0 && track.usage in captureUsages) {
+                wanted[track.session] = track.uid
+                unresolved.remove(track.uid to track.pid)
+            }
         }
         unresolvedClients = unresolved
-        calibrationSession?.let { wanted[it] = android.os.Process.myUid() }
         playingSessions = wanted.keys.toSet()
         synchronized(lock) {
             if (closed || deathReason != null) return@synchronized
@@ -157,13 +152,16 @@ internal class EffectSource {
                 if (id in sessions || id in failed) continue
                 var instance: AudioEffect? = null
                 try {
+                    val io = outputs?.ioOf(id)
+                    val channel = io?.let { outputChannels[it] }
+                    val delay = delayFor(id, channel)
                     instance = constructor.newInstance(UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8201"),
                         UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, id)
-                    check(setParameter.invoke(instance, 1, java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(delayUs).array()) == AudioEffect.SUCCESS) { "Cannot set local delay" }
+                    check(setParameter.invoke(instance, 1, delayBytes(delay)) == AudioEffect.SUCCESS) { "Cannot set local delay" }
                     if (shouldMute(id)) check(setInteger.invoke(instance, 2, 1) == AudioEffect.SUCCESS) { "Cannot mute local effect" }
                     check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
-                    sessions[id] = Session(uid, id, instance)
-                    println("INFO effect_attached uid=$uid session=$id local_delay_us=$delayUs")
+                    sessions[id] = Session(uid, id, instance, io, channel, delay)
+                    println("INFO effect_attached uid=$uid session=$id io=${io ?: "unknown"} channel=${channel ?: "unknown"} local_delay_us=$delay")
                 } catch (error: Exception) {
                     runCatching { instance?.release() }
                     failed.add(id)
@@ -175,14 +173,64 @@ internal class EffectSource {
         }
     }
 
+    private fun readOutputs(): AudioOutputs = AudioOutputs.read().also { outputChannels = outputChannels + it.channels }
+
+    /** 会话应生效的本机延迟：本机延迟加所在通道的补偿；校准测试音按原样测量，不补偿 */
+    private fun delayFor(id: Int, channel: String?): Long =
+        delayUs + if (id == calibrationSession || channel == null) 0L else channelDelays[channel] ?: 0L
+
+    private fun delayBytes(us: Long) = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(us).array()
+
+    /** 持有 [lock] 时调用 */
+    private fun applyDelay(session: Session) {
+        val delay = delayFor(session.id, session.channel)
+        if (delay == session.delayUs) return
+        check(setParameter.invoke(session.effect, 1, delayBytes(delay)) == AudioEffect.SUCCESS) { "Cannot set local delay" }
+        session.delayUs = delay
+    }
+
+    /** 采集包显示会话换到了另一输出线程：按新线程的通道更新补偿 */
+    private fun rechannel(id: Int, io: Int) {
+        if (closed || deathReason != null) return
+        try {
+            val channel = outputChannels[io] ?: readOutputs().channels[io]
+            val changed = synchronized(lock) {
+                val session = sessions[id]
+                if (closed || session == null || session.outputIo != io) return
+                if (channel == null) {
+                    println("WARN effect_channel session=$id io=$io channel=unknown")
+                    return
+                }
+                val previous = session.channel
+                session.channel = channel
+                applyDelay(session)
+                println("INFO effect_channel session=$id io=$io channel=$channel previous=${previous ?: "unknown"} local_delay_us=${session.delayUs}")
+                previous != channel
+            }
+            if (changed) onSessionsChanged?.invoke()
+        } catch (error: Exception) {
+            if (!closed) deathReason = "Cannot update output channel delay: ${error.cause ?: error}"
+        }
+    }
+
     fun setLocalDelay(us: Long) {
         require(us >= 0)
         synchronized(lock) {
             delayUs = us
-            val bytes = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(us).array()
-            for (session in sessions.values) check(setParameter.invoke(session.effect, 1, bytes) == AudioEffect.SUCCESS) { "Cannot set local delay" }
+            for (session in sessions.values) applyDelay(session)
         }
     }
+
+    fun setChannelDelays(delays: Map<String, Long>) {
+        require(delays.values.all { it >= 0 })
+        synchronized(lock) {
+            channelDelays = delays
+            for (session in sessions.values) applyDelay(session)
+        }
+    }
+
+    /** 会话所在的输出通道；未挂载或未能确定时为 null */
+    fun channelOf(id: Int): String? = synchronized(lock) { sessions[id]?.channel }
 
     fun supportsUnprocessedMic(): Boolean = manager.getProperty(AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED) == "true"
 
@@ -208,13 +256,19 @@ internal class EffectSource {
     private fun shouldMute(id: Int) = if (calibrationSession != null) id != calibrationSession || !calibrationLocal else outputMuted
     fun setCalibrationLocal(audible: Boolean) { calibrationLocal = audible; setOutputMuted(false) }
     fun sessionStatus(): org.json.JSONArray = synchronized(lock) {
-        org.json.JSONArray(sessions.values.map { session -> org.json.JSONObject().put("uid", session.uid).put("sessionId", session.id)
-            .put("packageName", runCatching { RootContext.create().packageManager.getPackagesForUid(session.uid)?.firstOrNull() }.getOrNull() ?: org.json.JSONObject.NULL) })
+        // 校准测试音不算作采集的播放
+        org.json.JSONArray(sessions.values.filter { it.id != calibrationSession }.map { session -> org.json.JSONObject().put("uid", session.uid).put("sessionId", session.id)
+            .put("packageName", runCatching { RootContext.create().packageManager.getPackagesForUid(session.uid)?.firstOrNull() }.getOrNull() ?: org.json.JSONObject.NULL)
+            .put("channel", session.channel ?: org.json.JSONObject.NULL).put("delayUs", session.delayUs) })
     }
 
     fun acceptStream(session: Int, io: Int): Boolean = synchronized(lock) {
         val entry = sessions[session] ?: return@synchronized false
         entry.io = io
+        if (io != entry.outputIo) {
+            entry.outputIo = io
+            handler.post { rechannel(session, io) }
+        }
         true
     }
 
@@ -223,7 +277,7 @@ internal class EffectSource {
     fun hasOtherPlayback(except: Int? = null): Boolean = playingSessions.any { it != except } || unresolvedClients.isNotEmpty()
 
     fun status(): String = synchronized(lock) {
-        "sessions=[${sessions.values.joinToString(",") { "${it.uid}/${it.id}/io:${it.io ?: "pending"}" }}] " +
+        "sessions=[${sessions.values.joinToString(",") { "${it.uid}/${it.id}/io:${it.io ?: "pending"}/${it.channel ?: "unknown"}/${it.delayUs}us" }}] " +
             "attach_failed=[${failed.joinToString(",")}] " +
             "local_muted=$outputMuted " +
             "session_lookup_pending=[${unresolvedClients.joinToString(",") { "${it.first}/${it.second}" }}]"
