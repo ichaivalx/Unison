@@ -12,7 +12,7 @@ import 'package:unison/ui/home.dart';
 import 'package:unison/ui/theme.dart';
 import 'package:unison_native/unison_native.dart';
 
-/// 首页在手机竖屏、平板横屏与桌面窗口下的截图，写入 build/screenshots 供检查布局；
+/// 首页在手机竖屏、平板小窗、平板横屏与桌面窗口下的截图，写入 build/screenshots 供检查布局；
 /// 溢出等渲染错误使测试失败。中文字体由 CI 下载到 build/test_fonts
 void main() {
   setUpAll(_loadFonts);
@@ -20,10 +20,16 @@ void main() {
   testWidgets('手机竖屏，接收端', (tester) async {
     await _render(tester, const Size(400, 860), self: 'phone', top: 28);
     await _shot(tester, 'phone');
-    // 从右侧边距处拖动页面，避开可拖动的控件
-    await tester.dragFrom(const Offset(394, 400), const Offset(0, -640));
-    await tester.pumpAndSettle();
-    await _shot(tester, 'phone-devices');
+    await _scrollToEnd(tester, 400);
+    await _shot(tester, 'phone-bottom');
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('平板小窗，音源', (tester) async {
+    await _render(tester, const Size(380, 800), self: 'pad');
+    await _shot(tester, 'tablet-window');
+    await _scrollToEnd(tester, 380);
+    await _shot(tester, 'tablet-window-bottom');
     await tester.pumpWidget(const SizedBox());
   });
 
@@ -59,6 +65,12 @@ Future<void> _render(WidgetTester tester, Size size, {required String self, doub
       ),
     ),
   );
+  await tester.pumpAndSettle();
+}
+
+/// 从右侧边距处拖动窄布局到底部，避开可拖动的控件
+Future<void> _scrollToEnd(WidgetTester tester, double width) async {
+  await tester.dragFrom(Offset(width - 6, 400), const Offset(0, -2000));
   await tester.pumpAndSettle();
 }
 

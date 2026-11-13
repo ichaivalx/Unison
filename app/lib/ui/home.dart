@@ -146,11 +146,14 @@ class _Home extends StatelessWidget {
     return ListView(
       padding: insets,
       children: [
-        SourcePanel(console: console, state: state),
+        // 打开就要操作的音源启停与设备条在上，不常用的延迟与校准设置下沉
+        SourceBar(console: console, state: state),
+        const SizedBox(height: Grid.gap),
+        SizedBox(height: Mixer.narrowHeight, child: Mixer(console: console, state: state)),
         const SizedBox(height: Grid.gap),
         MediaCard(console: console, media: state.media),
         const SizedBox(height: Grid.gap),
-        SizedBox(height: Mixer.narrowHeight, child: Mixer(console: console, state: state)),
+        SourceSettingsPanel(console: console, state: state),
         const SizedBox(height: Grid.gap),
         Diagnostics(state: state),
       ],
