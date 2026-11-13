@@ -84,11 +84,14 @@ class _SourceHeader extends StatelessWidget {
     final verb = source.running ? '停止' : '启动';
     final action = compact ? verb : (local ? '$verb本机音源' : '$verb $_name 的音源');
     final icon = Icon(source.running ? Icons.stop_rounded : Icons.play_arrow_rounded);
+    // 紧凑时收窄图标与按钮，把宽度留给设备名
+    final style = compact ? const ButtonStyle(padding: WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 12))) : null;
+    final mark = compact ? 40.0 : 44.0;
     final Widget button = local
         ? source.running
-              ? FilledButton.tonalIcon(onPressed: _toggle, icon: icon, label: Text(action))
-              : FilledButton.icon(onPressed: _toggle, icon: icon, label: Text(action))
-        : OutlinedButton.icon(onPressed: reachable ? _toggle : null, icon: icon, label: Text(action));
+              ? FilledButton.tonalIcon(onPressed: _toggle, style: style, icon: icon, label: Text(action))
+              : FilledButton.icon(onPressed: _toggle, style: style, icon: icon, label: Text(action))
+        : OutlinedButton.icon(onPressed: reachable ? _toggle : null, style: style, icon: icon, label: Text(action));
     final self = state.device(console.selfId)?.name;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -96,15 +99,15 @@ class _SourceHeader extends StatelessWidget {
         Row(
           children: [
             Container(
-              width: 44,
-              height: 44,
+              width: mark,
+              height: mark,
               decoration: BoxDecoration(
                 color: colors.primary.withValues(alpha: 0.14),
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Icon(Icons.podcasts_rounded, color: colors.primary),
             ),
-            const SizedBox(width: 14),
+            SizedBox(width: compact ? 12 : 14),
             Expanded(
               child: Row(
                 children: [
@@ -113,14 +116,14 @@ class _SourceHeader extends StatelessWidget {
                       _name,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: texts.titleLarge?.copyWith(fontWeight: FontWeight.w600),
+                      style: (compact ? texts.titleMedium : texts.titleLarge)?.copyWith(fontWeight: FontWeight.w600),
                     ),
                   ),
                   if (local) ...[const SizedBox(width: 8), Tag('本机', color: colors.primary)],
                 ],
               ),
             ),
-            if (compact) ...[const SizedBox(width: 12), button],
+            if (compact) ...[const SizedBox(width: 8), button],
           ],
         ),
         if (!compact) ...[
