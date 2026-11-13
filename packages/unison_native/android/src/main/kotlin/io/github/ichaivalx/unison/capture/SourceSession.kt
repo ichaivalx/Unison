@@ -138,23 +138,40 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
             position(20)
             putInt(SAMPLE_RATE).put(2.toByte()).put(1.toByte()).putShort(FRAMES.toShort())
         }
-        class Chunk(var startNs: Long, val samples: FloatArray) {
+        class Chunk(val firstFrame: Long, var startNs: Long, val samples: FloatArray) {
             val frames get() = samples.size / 2
             val endNs get() = startNs + framesToNs(frames.toLong())
         }
-        class Stream(val id: Long, var originNs: Long) {
+        /**
+         * 一个会话的采集流。块按内容时间线 [contentOriginNs] + 帧位置排列，确定后不随调用时刻的抖动移动，内容始终
+         * 连续；调用时刻与内容时间线之间的缓慢偏移由 driftNs 计入包的时间戳，由接收端按相邻包的时标吸收。
+         * 输出线程从 standby 恢复时，开头几批成批快速处理，调用时刻偏晚且逐批变化；在节奏恢复正常前不确定时间线，
+         * 块先留着不发，确定时取期间最早的测量值。
+         */
+        class Stream(val id: Long) {
+            var settled = false
+            var contentOriginNs = 0L
+            var earliestOriginNs = Long.MAX_VALUE
             var previousCallNs = 0L
             var previousFrame = 0L
             var previousBatch = 0
             var expectedFrame = 0L
             var droppedFrames = 0L
             var droppedBatches = 0L
+            var io = 0
             val chunks = ArrayDeque<Chunk>()
         }
         val streams = mutableMapOf<Int, Stream>()
         val mixed = FloatArray(FRAMES * 2)
+        // 内容时间线上的发送位置；实际时刻 = 内容时刻 + driftNs
         var cursorNs: Long? = null
+        var driftNs = 0L
         var sequence = 0
+        fun settle(stream: Stream) {
+            stream.settled = true
+            stream.contentOriginNs = stream.earliestOriginNs - driftNs
+            for (chunk in stream.chunks) chunk.startNs = stream.contentOriginNs + framesToNs(chunk.firstFrame)
+        }
         while (running) {
             val raw = source.read()
             val active = if (calibration?.isRunning == true) setOfNotNull(calibration?.sessionId) else source.activeSessions()
@@ -177,9 +194,11 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                 if (session in active && source.acceptStream(session, io)) {
                     val measuredOrigin = callNs - framesToNs(firstFrame)
                     var stream = streams[session]
+                    // 同一输出线程上已有确定的流时线程正在运行，新流的第一批即可确定时间线。
+                    var steady = streams.values.any { it.settled && it.io == io }
                     if (stream == null || stream.id != id) {
                         if (stream != null) { sequence += 2; if (streams.size == 1) cursorNs = null }
-                        stream = Stream(id, measuredOrigin)
+                        stream = Stream(id)
                         streams[session] = stream
                         println("INFO effect_stream session=$session io=$io stream=$id rate=$rate")
                     } else {
@@ -187,18 +206,23 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                         val advancedFrames = firstFrame - stream.previousFrame
                         val residualNs = elapsedNs - framesToNs(advancedFrames)
                         val toleranceNs = framesToNs(maxOf(stream.previousBatch, frames, FRAMES).toLong())
-                        if (advancedFrames <= 0 || elapsedNs <= 0 || abs(residualNs) > toleranceNs) {
-                            stream.originNs = measuredOrigin
+                        val errorNs = measuredOrigin - (stream.contentOriginNs + driftNs)
+                        if (advancedFrames <= 0 || elapsedNs <= 0 || abs(residualNs) > toleranceNs ||
+                            (stream.settled && abs(errorNs) > toleranceNs)) {
+                            // 时间线中断（输出线程停过或调度中断）：重新确定
+                            stream.settled = false
+                            stream.earliestOriginNs = Long.MAX_VALUE
                             stream.chunks.clear()
                             if (streams.size == 1) cursorNs = null
                             sequence += 2
+                            steady = false
                             synchronized(diagnosticsLock) { timelineResets++ }
                             println("INFO effect_timeline_reset session=$session residual_ms=${residualNs / 1_000_000.0} io=$io")
-                        } else {
-                            val correction = (measuredOrigin - stream.originNs) / 16
-                            stream.originNs += correction
-                            // 同一流尚未发出的批次共用当前零点，避免平滑后批边界重叠被重复相加。
-                            for (chunk in stream.chunks) chunk.startNs += correction
+                        } else if (stream.settled) {
+                            // 只修正时间戳映射，不移动内容
+                            driftNs += errorNs / 64
+                        } else if (abs(residualNs) <= framesToNs(maxOf(stream.previousBatch, frames).toLong()) / 8) {
+                            steady = true
                         }
                         if (firstFrame != stream.expectedFrame) {
                             sequence += 2
@@ -218,9 +242,15 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                     stream.previousCallNs = callNs; stream.previousFrame = firstFrame; stream.previousBatch = frames
                     stream.expectedFrame = firstFrame + frames
                     stream.droppedFrames = droppedFrames; stream.droppedBatches = droppedBatches
+                    stream.io = io
                     val samples = FloatArray(frames * 2)
                     batch.asFloatBuffer().get(samples)
-                    stream.chunks.addLast(Chunk(stream.originNs + framesToNs(firstFrame), samples))
+                    stream.chunks.addLast(Chunk(firstFrame, stream.contentOriginNs + framesToNs(firstFrame), samples))
+                    if (!stream.settled) {
+                        stream.earliestOriginNs = minOf(stream.earliestOriginNs, measuredOrigin)
+                        // 迟迟等不到正常节奏时也不无限积压
+                        if (steady || stream.chunks.sumOf { it.frames } >= SAMPLE_RATE / 2) settle(stream)
+                    }
                 }
             }
             synchronized(diagnosticsLock) {
@@ -233,7 +263,7 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                 continue
             }
             while (running) {
-                val chunks = streams.values.flatMap { it.chunks }
+                val chunks = streams.values.filter { it.settled }.flatMap { it.chunks }
                 val firstNs = chunks.minOfOrNull { it.startNs } ?: break
                 var startNs = cursorNs ?: firstNs
                 if (firstNs > startNs + framesToNs(FRAMES.toLong())) {
@@ -245,8 +275,8 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                 if (chunks.maxOf { it.endNs } + 10_000 < endNs) break
                 // 多会话批次错开到达时等到该量子末端，避免先到的流抢先发出。
                 // 单会话仍在收到完整量子时立即发送。
-                if (active.any { (streams[it]?.chunks?.lastOrNull()?.endNs ?: Long.MIN_VALUE) + 10_000 < endNs }
-                    && System.nanoTime() < endNs) break
+                if (active.any { session -> (streams[session]?.takeIf { it.settled }?.chunks?.lastOrNull()?.endNs ?: Long.MIN_VALUE) + 10_000 < endNs }
+                    && System.nanoTime() < endNs + driftNs) break
                 mixed.fill(0f)
                 for (chunk in chunks) {
                     val offset = Math.round((chunk.startNs - startNs) * SAMPLE_RATE / 1_000_000_000.0).toInt()
@@ -257,22 +287,23 @@ internal class SourceSession(private val excludeUid: Int, @Volatile var latencyU
                         mixed[(destination + frame) * 2 + channel] += chunk.samples[(sourceFrame + frame) * 2 + channel]
                     }
                 }
+                val timeNs = startNs + driftNs
                 val currentCalibration = calibration
-                currentCalibration?.onTap(startNs, mixed)
+                currentCalibration?.onTap(timeNs, mixed)
                 for (sample in mixed.indices) {
                     val pcm = (mixed[sample] * 32768f).toInt().coerceIn(-32768, 32767)
                     data.putShort(AUDIO_HEADER + sample * 2, pcm.toShort())
                 }
                 data.putInt(8, sequence++)
-                data.putLong(12, startNs / 1000 + latencyUs)
+                data.putLong(12, timeNs / 1000 + latencyUs)
                 synchronized(diagnosticsLock) {
-                    val age = System.nanoTime() - startNs
+                    val age = System.nanoTime() - timeNs
                     ageCount++; ageSumNs += age
                     ageMinNs = minOf(ageMinNs, age); ageMaxNs = maxOf(ageMaxNs, age)
                 }
                 publishAudio(udp, data)
                 cursorNs = endNs
-                for (stream in streams.values) while (stream.chunks.firstOrNull()?.let { it.endNs <= endNs + 10_000 } == true) {
+                for (stream in streams.values) while (stream.settled && stream.chunks.firstOrNull()?.let { it.endNs <= endNs + 10_000 } == true) {
                     stream.chunks.removeFirst()
                 }
             }
