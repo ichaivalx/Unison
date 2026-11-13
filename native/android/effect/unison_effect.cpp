@@ -261,7 +261,17 @@ private:
         } else if (fields[3] == kSystemGainParameter && fields[2] == 4) {
             float value; memcpy(&value, blob->bytes.data() + 16, 4);
             if (std::isnan(value) || value > 1.0f) return error("invalid system gain");
-            systemGain_ = value < 0 ? -1.0f : value;
+            const float next = value < 0 ? -1.0f : value;
+            const float previous = systemGain_.load();
+            // 在写入时记下实际变更的时刻：两批之间变了又变回，处理线程只看最新值会漏掉。先写时刻再写 S，
+            // 处理线程读到新 S 时必然也看到对应的时刻。启用前的首次下发不算变化。
+            if (systemWritten_ && next != previous) {
+                const int64_t now = nowNs();
+                if (previous == 0 && next > 0) systemRaisedNs_ = now;
+                systemChangedNs_ = now;
+            }
+            systemWritten_ = true;
+            systemGain_ = next;
         } else if (fields[3] == kClientMutedParameter && fields[2] == 4) {
             int32_t value; memcpy(&value, blob->bytes.data() + 16, 4); clientMuted_ = value != 0;
         } else return error("unknown vendor parameter");
@@ -277,12 +287,8 @@ private:
      */
     void tapTarget(const float volume[2], int64_t now, float target[2]) {
         const float system = systemGain_.load();
-        if (gain_.systemSeen && system != gain_.lastSystem) {
-            if (system > 0 && gain_.lastSystem == 0) gain_.systemRaisedNs = now;
-            gain_.systemChangedNs = now;
-        }
-        gain_.systemSeen = true;
-        gain_.lastSystem = system;
+        const int64_t systemChangedNs = systemChangedNs_.load();
+        const int64_t systemRaisedNs = systemRaisedNs_.load();
         gain_.history[gain_.next] = {now, {volume[0], volume[1]}};
         gain_.next = (gain_.next + 1) % kVolumeHistory;
         if (system < 0) {
@@ -297,7 +303,7 @@ private:
         if (volume[0] == 0 && volume[1] == 0) {
             // V 为 0 不反映比值（暂停、应用静音或系统音量正降到 0），保留已确认的比值。S 刚从 0 升起而 V 尚未跟上时
             // 照旧输出，否则立即跟随到 0。
-            const bool pending = gain_.haveStable && now - gain_.systemRaisedNs < kPairNs;
+            const bool pending = gain_.haveStable && now - systemRaisedNs < kPairNs;
             for (int c = 0; c < 2; ++c) target[c] = pending ? gain_.stable[c] : 0.0f;
             return;
         }
@@ -306,7 +312,7 @@ private:
             for (int c = 0; c < 2; ++c) gain_.stable[c] = std::min(1.0f, volume[c] / system);
             gain_.haveStable = true;
         } else if (const auto* past = pastVolume(now - kPairNs);
-                   past && past->v[0] + past->v[1] > 0 && gain_.systemChangedNs <= past->ns - kPairNs) {
+                   past && past->v[0] + past->v[1] > 0 && systemChangedNs <= past->ns - kPairNs) {
             for (int c = 0; c < 2; ++c) gain_.stable[c] = std::min(1.0f, past->v[c] / system);
         }
         for (int c = 0; c < 2; ++c) target[c] = gain_.stable[c];
@@ -337,6 +343,7 @@ private:
         frames_ = 0; droppedFrames_ = 0; droppedBatches_ = 0; delayUs_ = 0;
         muted_ = false;
         volumeLeft_ = 0; volumeRight_ = 0; systemGain_ = -1; clientMuted_ = false;
+        systemWritten_ = false; systemChangedNs_ = INT64_MIN / 2; systemRaisedNs_ = INT64_MIN / 2;
     }
     void process() noexcept {
         if (setpriority(PRIO_PROCESS, 0, -16) != 0)
@@ -416,6 +423,9 @@ private:
     std::atomic<float> volumeLeft_{0}, volumeRight_{0};
     // root 进程下发的系统部分 S；负数表示未知，此时 tap 与本机一样按 V 衰减。
     std::atomic<float> systemGain_{-1};
+    // S 最近一次实际变化、最近一次从 0 升起的时刻（CLOCK_MONOTONIC），由写入路径记录
+    std::atomic<int64_t> systemChangedNs_{INT64_MIN / 2}, systemRaisedNs_{INT64_MIN / 2};
+    bool systemWritten_ = false; // 只在持有 control_ 的参数写入路径访问
     // 播放配置报告的应用自己静音（客户端音量或 VolumeShaper 为 0）；只在 S 为 0、无法从 V 推算时使用。
     std::atomic<bool> clientMuted_{false};
     struct Gain {
@@ -424,10 +434,6 @@ private:
         float stable[2]{};
         bool started = false;
         bool haveStable = false;
-        bool systemSeen = false;
-        int64_t systemRaisedNs = INT64_MIN / 2;
-        int64_t systemChangedNs = INT64_MIN / 2;
-        float lastSystem = -1;
         // 每批收到的 V，环形
         std::array<VolumeSample, kVolumeHistory> history{};
         size_t next = 0;
