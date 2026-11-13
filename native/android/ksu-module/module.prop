@@ -1,6 +1,6 @@
 id=unison_tap
 name=Unison Tap (AIDL V2)
-version=0.6
-versionCode=6
+version=0.7
+versionCode=7
 author=ichaivalx
-description=按播放会话 tap 与可调本机延迟线；适用于已确认的 AIDL V2 音效配置。
+description=按播放会话 tap 与可调本机延迟线；适用于 Android 16 起、已确认的 AIDL V2 音效配置。

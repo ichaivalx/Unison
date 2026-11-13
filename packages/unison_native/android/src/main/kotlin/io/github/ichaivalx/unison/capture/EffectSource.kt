@@ -67,7 +67,7 @@ internal class EffectSource {
         override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) = updateSystemGain()
         override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) = updateSystemGain()
     }
-    /** 音量策略每次给某个音量组设定音量后的通知（IAudioVolumeChangeDispatcher，单向） */
+    /** 音量策略每次给某个音量组设定音量后的通知（IAudioVolumeChangeDispatcher，单向；Android 16 起） */
     private val volumeChanges = object : Binder() {
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
             if (code != FIRST_CALL_TRANSACTION) return super.onTransact(code, data, reply, flags)
