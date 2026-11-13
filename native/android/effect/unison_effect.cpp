@@ -6,6 +6,7 @@
 #include <aidl/android/media/audio/common/PcmType.h>
 #include <android/log.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
@@ -39,10 +40,14 @@ constexpr int kDelayParameter = 1;
 constexpr int kMuteParameter = 2;
 constexpr int kSystemGainParameter = 3;
 constexpr int kClientMutedParameter = 4;
-// AudioFlinger 交来的合成音量与 root 进程下发的系统增益各自异步更新；两者暂时对不上时，tap 比值最多保持这么久
-// 等另一半到达，超时才认定是应用自己的音量变化。
-constexpr int64_t kRatioSettleNs = 120'000'000;
-constexpr float kRatioTolerance = 0.005f;
+// AudioFlinger 交来的合成音量 V 与 root 进程下发的系统增益 S 各自异步更新，先后相隔不超过这么久即可配对。
+constexpr int64_t kPairNs = 120'000'000;
+// 配对评估回看的批次数上限，覆盖最短的混音周期
+constexpr size_t kVolumeHistory = 128;
+struct VolumeSample {
+    int64_t ns = 0;
+    float v[2]{};
+};
 int64_t nowNs() { timespec t{}; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000LL + t.tv_nsec; }
 AudioUuid typeUuid() { return {static_cast<int32_t>(0x8e2581c2), 0x3d9a, 0x4e15, 0xa77a, {0x61,0x7f,0x6f,0x9e,0x82,0x01}}; }
 AudioUuid implUuid() { auto u = typeUuid(); u.node.back() = 2; return u; }
@@ -263,16 +268,23 @@ private:
         return ScopedAStatus::ok();
     }
     /**
-     * tap 增益 = V 中属于应用的部分 = V ÷ S，按声道计算并钳到 1，绝不放大。V 与 S 各自异步更新：比值偏离已确认值时
-     * 先保持原值，另一半在 kRatioSettleNs 内到达、比值恢复时不变；超时才采用新比值（应用自己的音量变化），
-     * 此后 kRatioSettleNs 内的继续变化直接跟随。
+     * tap 增益 = V 中属于应用的部分 = V ÷ S，按声道计算并钳到 1，绝不放大。系统音量变化时 V 与 S 先后到达，
+     * 无论谁先到，中间的比值都不属于应用。因此比值按 kPairNs 之前的那一批评估：那一批前后 kPairNs 内 S 都没变过时，
+     * 它的 V 与现在的 S 必然配对，采用；否则保持已确认的比值。应用自己的音量变化与淡入淡出因此以 kPairNs 的滞后
+     * 平滑跟随，系统音量变化前后 kPairNs 内应用的变化暂缓采用。
      * V 降到 0 立即跟随（暂停渐弱、应用静音）。S 为 0 时无法推算，沿用已确认的比值（本实例还没有时按 1），
      * 应用报告静音时为 0。
      */
     void tapTarget(const float volume[2], int64_t now, float target[2]) {
         const float system = systemGain_.load();
-        if (system > 0 && gain_.lastSystem == 0) gain_.systemRaisedNs = now;
+        if (gain_.systemSeen && system != gain_.lastSystem) {
+            if (system > 0 && gain_.lastSystem == 0) gain_.systemRaisedNs = now;
+            gain_.systemChangedNs = now;
+        }
+        gain_.systemSeen = true;
         gain_.lastSystem = system;
+        gain_.history[gain_.next] = {now, {volume[0], volume[1]}};
+        gain_.next = (gain_.next + 1) % kVolumeHistory;
         if (system < 0) {
             for (int c = 0; c < 2; ++c) target[c] = volume[c];
             return;
@@ -285,30 +297,28 @@ private:
         if (volume[0] == 0 && volume[1] == 0) {
             // V 为 0 不反映比值（暂停、应用静音或系统音量正降到 0），保留已确认的比值。S 刚从 0 升起而 V 尚未跟上时
             // 照旧输出，否则立即跟随到 0。
-            const bool pending = gain_.haveStable && now - gain_.systemRaisedNs < kRatioSettleNs;
+            const bool pending = gain_.haveStable && now - gain_.systemRaisedNs < kPairNs;
             for (int c = 0; c < 2; ++c) target[c] = pending ? gain_.stable[c] : 0.0f;
             return;
         }
-        float candidate[2];
-        bool matches = true;
-        for (int c = 0; c < 2; ++c) {
-            candidate[c] = std::min(1.0f, volume[c] / system);
-            if (std::abs(candidate[c] - gain_.stable[c]) > kRatioTolerance * std::max(gain_.stable[c], 0.01f)) matches = false;
-        }
-        if (!gain_.haveStable || matches) {
-            for (int c = 0; c < 2; ++c) target[c] = gain_.stable[c] = candidate[c];
+        if (!gain_.haveStable) {
+            // 开始处理时 S 已在启用前下发，第一批 V 即按现值确认
+            for (int c = 0; c < 2; ++c) gain_.stable[c] = std::min(1.0f, volume[c] / system);
             gain_.haveStable = true;
-            gain_.deviationNs = 0;
-            return;
-        }
-        if (!gain_.deviationNs) gain_.deviationNs = now;
-        // 确认是应用的音量变化后，紧接着的连续变化（淡入淡出）直接跟随，不再逐段等待。
-        if (now - gain_.deviationNs >= kRatioSettleNs || now < gain_.followUntilNs) {
-            for (int c = 0; c < 2; ++c) gain_.stable[c] = candidate[c];
-            gain_.deviationNs = 0;
-            gain_.followUntilNs = now + kRatioSettleNs;
+        } else if (const auto* past = pastVolume(now - kPairNs);
+                   past && past->v[0] + past->v[1] > 0 && gain_.systemChangedNs <= past->ns - kPairNs) {
+            for (int c = 0; c < 2; ++c) gain_.stable[c] = std::min(1.0f, past->v[c] / system);
         }
         for (int c = 0; c < 2; ++c) target[c] = gain_.stable[c];
+    }
+    /** 不晚于 ns 的最近一批的 V；历史不够久时为空 */
+    const VolumeSample* pastVolume(int64_t ns) const {
+        for (size_t i = 1; i <= kVolumeHistory; ++i) {
+            const auto& entry = gain_.history[(gain_.next + kVolumeHistory - i) % kVolumeHistory];
+            if (entry.ns == 0) return nullptr;
+            if (entry.ns <= ns) return &entry;
+        }
+        return nullptr;
     }
     void stopWorker() {
         quit_ = true;
@@ -414,10 +424,13 @@ private:
         float stable[2]{};
         bool started = false;
         bool haveStable = false;
-        int64_t deviationNs = 0;
-        int64_t followUntilNs = 0;
+        bool systemSeen = false;
         int64_t systemRaisedNs = INT64_MIN / 2;
+        int64_t systemChangedNs = INT64_MIN / 2;
         float lastSystem = -1;
+        // 每批收到的 V，环形
+        std::array<VolumeSample, kVolumeHistory> history{};
+        size_t next = 0;
     };
     Gain gain_; // 只在 worker 中访问；START 前由控制线程重置
     std::atomic<DelayLine*> pending_{nullptr}, retired_{nullptr};
