@@ -1,6 +1,8 @@
 #!/system/bin/sh
 ORIGINAL=/odm/etc/audio_effects_config.xml
 SOUNDFX=/odm/lib64/soundfx
+# OPlus 多媒体名单；不存在时不处理。
+MM_LIST=/system_ext/etc/Multimedia_Daemon_List.xml
 RUNTIME="$MODDIR/runtime"
 
 init_mount_namespace() {
@@ -22,12 +24,13 @@ same_inode() {
 load_mount_state() {
   ACTIVE_CONFIG=
   ACTIVE_LIBS=
+  ACTIVE_MM=
   [ -f "$RUNTIME/mount-state" ] || return 0
-  { IFS= read -r ACTIVE_CONFIG; IFS= read -r ACTIVE_LIBS; } < "$RUNTIME/mount-state"
+  { IFS= read -r ACTIVE_CONFIG; IFS= read -r ACTIVE_LIBS; IFS= read -r ACTIVE_MM; } < "$RUNTIME/mount-state"
 }
 
 module_mounted() {
-  same_inode "$ACTIVE_CONFIG" "$ORIGINAL" || same_inode "$ACTIVE_LIBS" "$SOUNDFX"
+  same_inode "$ACTIVE_CONFIG" "$ORIGINAL" || same_inode "$ACTIVE_LIBS" "$SOUNDFX" || same_inode "$ACTIVE_MM" "$MM_LIST"
 }
 
 unmount_module() {
@@ -35,6 +38,7 @@ unmount_module() {
   # 只撤销仍指向本模块源 inode 的挂载，不碰其他模块后来覆盖的挂载。
   if same_inode "$ACTIVE_CONFIG" "$ORIGINAL"; then umount -l "$ORIGINAL" || result=1; fi
   if same_inode "$ACTIVE_LIBS" "$SOUNDFX"; then umount -l "$SOUNDFX" || result=1; fi
+  if same_inode "$ACTIVE_MM" "$MM_LIST"; then umount -l "$MM_LIST" || result=1; fi
   return "$result"
 }
 

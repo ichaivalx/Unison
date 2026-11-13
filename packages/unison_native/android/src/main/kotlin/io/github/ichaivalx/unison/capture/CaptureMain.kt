@@ -86,7 +86,7 @@ object CaptureMain {
         exitProcess(0)
     }
     private fun available(): Boolean = AudioEffect.queryEffects()?.any {
-        it.uuid == UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202") && it.implementor == "Unison/5"
+        it.uuid == UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202") && it.implementor == "Unison/6"
     } == true
     private fun delays(json: JSONObject): Map<String, Long> = json.keys().asSequence().associateWith { json.getLong(it) }
         .also { check(it.values.all { delay -> delay >= 0 }) }

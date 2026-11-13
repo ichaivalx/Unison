@@ -2,14 +2,19 @@ package io.github.ichaivalx.unison.capture
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.media.audiofx.AudioEffect
+import android.os.Binder
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Parcel
 import java.util.UUID
 import kotlin.concurrent.thread
+import kotlin.math.pow
 
 internal class EffectSource {
     var onSessionsChanged: (() -> Unit)? = null
@@ -19,7 +24,7 @@ internal class EffectSource {
      * 复用时可能不更新）
      */
     private class Session(val uid: Int, val id: Int, val effect: AudioEffect, val packageName: String?, val appName: String?,
-        var outputIo: Int?, var channel: String?, var delayUs: Long) {
+        var outputIo: Int?, var channel: String?, var delayUs: Long, var systemGain: Float, var clientMuted: Boolean) {
         @Volatile var io: Int? = null
     }
     /** 正在播放但挂载效果被拒的会话（典型是快速或直通通道）：声音没被采集，只上报给界面 */
@@ -43,6 +48,10 @@ internal class EffectSource {
     /** 已知的输出线程 io → 通道；io 在本次开机内不复用 */
     @Volatile private var outputChannels = emptyMap<Int, String>()
     @Volatile private var outputMuted = false
+    /** 媒体流的系统音量增益（AudioFlinger 乘到会话上的系统部分）；无法确定时为 -1 */
+    private var systemGain = -1f
+    /** 各会话的播放配置是否报告应用自己静音（客户端音量或 VolumeShaper 为 0） */
+    private var clientMuted = emptyMap<Int, Boolean>()
     @Volatile private var calibrationSession: Int? = null
     @Volatile private var calibrationLocal = true
     @Volatile private var deathReason: String? = null
@@ -54,6 +63,20 @@ internal class EffectSource {
             refresh(configs)
         }
     }
+    private val devices = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>) = updateSystemGain()
+        override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>) = updateSystemGain()
+    }
+    /** 音量策略每次给某个音量组设定音量后的通知（IAudioVolumeChangeDispatcher，单向） */
+    private val volumeChanges = object : Binder() {
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+            if (code != FIRST_CALL_TRANSACTION) return super.onTransact(code, data, reply, flags)
+            if (!closed) handler.post { updateSystemGain() }
+            return true
+        }
+    }.apply { attachInterface(null, VOLUME_DISPATCHER) }
+    private var volumeService: Any? = null
+    private val mediaAttributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build()
     private val constructor = AudioEffect::class.java.getDeclaredConstructor(UUID::class.java, UUID::class.java,
         Int::class.javaPrimitiveType, Int::class.javaPrimitiveType).apply { isAccessible = true }
     private val setParameter = AudioEffect::class.java.getDeclaredMethod("setParameter", Int::class.javaPrimitiveType,
@@ -66,6 +89,7 @@ internal class EffectSource {
     private val getPid = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getClientPid")
     private val getSession = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getSessionId")
     private val isActive = AudioPlaybackConfiguration::class.java.getDeclaredMethod("isActive")
+    private val getMutedBy = AudioPlaybackConfiguration::class.java.getDeclaredMethod("getMutedBy")
     private val captureUsages = intArrayOf(AudioAttributes.USAGE_MEDIA, AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN)
     private external fun openTap(): Int
     private external fun readTap(fd: Int): ByteArray?
@@ -87,7 +111,13 @@ internal class EffectSource {
         callbacks.start()
         handler = Handler(callbacks.looper)
         manager.registerAudioPlaybackCallback(callback, handler)
-        handler.post { refresh() }
+        manager.registerAudioDeviceCallback(devices, handler)
+        val service = AudioManager::class.java.getDeclaredMethod("getService").apply { isAccessible = true }.invoke(null)!!
+        val dispatcher = Class.forName(VOLUME_DISPATCHER)
+        service.javaClass.getMethod("registerAudioVolumeCallback", dispatcher).invoke(service,
+            Class.forName("$VOLUME_DISPATCHER\$Stub").getMethod("asInterface", IBinder::class.java).invoke(null, volumeChanges))
+        volumeService = service
+        handler.post { updateSystemGain(); refresh() }
         // 探测不占采集线程；HAL 死亡后只退出，不重新创建效果。
         healthThread = thread(name = "effect-health", isDaemon = true) {
             while (!closed) {
@@ -123,12 +153,15 @@ internal class EffectSource {
         if (closed || deathReason != null) return
         val wanted = linkedMapOf<Int, Int>()
         val unknown = mutableSetOf<Pair<Int, Int>>()
+        val muted = mutableMapOf<Int, Boolean>()
         for (config in configs) {
             val usage = config.audioAttributes.usage
             if (isActive.invoke(config) != true || usage !in captureUsages) continue
             val uid = getUid.invoke(config) as Int
             if (uid < 0 || uid == excludeUid) continue
             val session = getSession.invoke(config) as Int
+            // 同一会话的播放器全部被应用自己静音才算静音
+            if (session > 0) muted[session] = (muted[session] ?: true) && (getMutedBy.invoke(config) as Int) and CLIENT_MUTED != 0
             // session 0 是输出混音；AAudio 的 NONE(-1) 不等于底层 AudioTrack 没有会话。
             if (session > 0) wanted[session] = uid
             else if (session < 0) unknown.add(uid to (getPid.invoke(config) as Int))
@@ -149,6 +182,7 @@ internal class EffectSource {
         unresolvedClients = unresolved
         playingSessions = wanted.keys.toSet()
         synchronized(lock) {
+            clientMuted = muted
             if (closed || deathReason != null) return@synchronized
             val before = sessions.keys.toSet()
             val failedBefore = failed.keys.toSet()
@@ -169,9 +203,13 @@ internal class EffectSource {
                         UUID.fromString("8e2581c2-3d9a-4e15-a77a-617f6f9e8202"), 0, id)
                     check(setParameter.invoke(instance, 1, delayBytes(delay)) == AudioEffect.SUCCESS) { "Cannot set local delay" }
                     if (shouldMute(id)) check(setInteger.invoke(instance, 2, 1) == AudioEffect.SUCCESS) { "Cannot mute local effect" }
+                    val gain = systemGain
+                    val silenced = muted[id] == true
+                    check(setParameter.invoke(instance, 3, floatBytes(gain)) == AudioEffect.SUCCESS) { "Cannot set system gain" }
+                    check(setInteger.invoke(instance, 4, if (silenced) 1 else 0) == AudioEffect.SUCCESS) { "Cannot set client mute" }
                     check(instance.setEnabled(true) == AudioEffect.SUCCESS) { "Cannot enable effect" }
                     val (packageName, appName) = appOf(uid)
-                    sessions[id] = Session(uid, id, instance, packageName, appName, io, channel, delay)
+                    sessions[id] = Session(uid, id, instance, packageName, appName, io, channel, delay, gain, silenced)
                     println("INFO effect_attached uid=$uid session=$id io=${io ?: "unknown"} channel=${channel ?: "unknown"} local_delay_us=$delay")
                 } catch (error: Exception) {
                     runCatching { instance?.release() }
@@ -181,6 +219,7 @@ internal class EffectSource {
                     println("ERROR effect_attach uid=$uid session=$id error=${error.cause ?: error}")
                 }
             }
+            for (session in sessions.values) applyClientMuted(session)
             var moved = false
             if (outputs != null) for (session in sessions.values) {
                 val io = outputs.ioOf(session.id) ?: continue
@@ -206,6 +245,49 @@ internal class EffectSource {
         delayUs + if (id == calibrationSession || channel == null) 0L else channelDelays[channel] ?: 0L
 
     private fun delayBytes(us: Long) = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(us).array()
+
+    private fun floatBytes(value: Float) = java.nio.ByteBuffer.allocate(4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putFloat(value).array()
+
+    /**
+     * 当前媒体输出设备上媒体流的系统音量增益：音量策略按音量曲线给出的 dB，与 AudioFlinger 乘到会话上的端口
+     * 音量一致；静音或 0 时为 0，读不到设备时为 -1（效果按未知处理，tap 与本机一样随系统音量衰减）。
+     * 主音量不计入（手机上恒为 1）。
+     */
+    private fun currentSystemGain(): Float {
+        if (manager.isStreamMute(AudioManager.STREAM_MUSIC)) return 0f
+        val device = manager.getAudioDevicesForAttributes(mediaAttributes).firstOrNull() ?: return -1f
+        val db = runCatching {
+            manager.getStreamVolumeDb(AudioManager.STREAM_MUSIC, manager.getStreamVolume(AudioManager.STREAM_MUSIC), device.type)
+        }.getOrElse { return -1f }
+        return if (db == Float.NEGATIVE_INFINITY) 0f else 10f.pow(db / 20f).coerceIn(0f, 1f)
+    }
+
+    /** 在 handler 线程上：系统音量、静音或输出设备可能有变化，重新计算并下发给各会话的效果 */
+    private fun updateSystemGain() {
+        if (closed || deathReason != null) return
+        try {
+            val gain = currentSystemGain()
+            synchronized(lock) {
+                if (closed || gain == systemGain) return
+                systemGain = gain
+                for (session in sessions.values) {
+                    check(setParameter.invoke(session.effect, 3, floatBytes(gain)) == AudioEffect.SUCCESS) { "Cannot set system gain" }
+                    session.systemGain = gain
+                }
+            }
+            println("INFO system_gain value=$gain")
+        } catch (error: Exception) {
+            if (!closed) deathReason = "Cannot update system gain: ${error.cause ?: error}"
+        }
+    }
+
+    /** 持有 [lock] 时调用 */
+    private fun applyClientMuted(session: Session) {
+        val muted = clientMuted[session.id] == true
+        if (muted == session.clientMuted) return
+        check(setInteger.invoke(session.effect, 4, if (muted) 1 else 0) == AudioEffect.SUCCESS) { "Cannot set client mute" }
+        session.clientMuted = muted
+    }
 
     /** 持有 [lock] 时调用 */
     private fun applyDelay(session: Session) {
@@ -347,10 +429,26 @@ internal class EffectSource {
         }
     }
 
+    private companion object {
+        const val VOLUME_DISPATCHER = "android.media.audiopolicy.IAudioVolumeChangeDispatcher"
+        /** AudioPlaybackConfiguration.MUTED_BY_CLIENT_VOLUME | MUTED_BY_VOLUME_SHAPER */
+        const val CLIENT_MUTED = (1 shl 4) or (1 shl 5)
+    }
+
     fun close() {
         closed = true
         healthThread?.interrupt()
-        if (::handler.isInitialized) manager.unregisterAudioPlaybackCallback(callback)
+        if (::handler.isInitialized) {
+            manager.unregisterAudioPlaybackCallback(callback)
+            manager.unregisterAudioDeviceCallback(devices)
+        }
+        volumeService?.let { service ->
+            runCatching {
+                service.javaClass.getMethod("unregisterAudioVolumeCallback", Class.forName(VOLUME_DISPATCHER)).invoke(service,
+                    Class.forName("$VOLUME_DISPATCHER\$Stub").getMethod("asInterface", IBinder::class.java).invoke(null, volumeChanges))
+            }
+        }
+        volumeService = null
         callbacks.quitSafely()
         synchronized(lock) {
             for (session in sessions.values) runCatching { release(session) }

@@ -25,6 +25,7 @@ module_mounted && exit 0
 rm -f "$RUNTIME/mount-state"
 ACTIVE_CONFIG=
 ACTIVE_LIBS=
+ACTIVE_MM=
 printf '%s\n' "$BOOT_ID" > "$MODDIR/boot-pending.new" || exit 0
 mv -f "$MODDIR/boot-pending.new" "$MODDIR/boot-pending" || exit 0
 
@@ -60,7 +61,23 @@ chcon u:object_r:vendor_configs_file:s0 "$STAGE/config.tmp" || exit 0
 mv "$STAGE/config.tmp" "$STAGE/audio_effects_config.xml" || exit 0
 ACTIVE_CONFIG="$STAGE/audio_effects_config.xml"
 ACTIVE_LIBS="$STAGE/soundfx"
-printf '%s\n%s\n' "$ACTIVE_CONFIG" "$ACTIVE_LIBS" > "$STAGE/mount-state.tmp" || exit 0
+# OPlus 在媒体音量为 0 而仍在播放时让大缓冲输出空转（不再混音、不处理音效），采集随之中断。
+# 名单中 closepa-disable-switch 的 0x1 位关闭这一判定；准备失败时照常加载音效，只是不改名单。
+if [ -f "$MM_LIST" ] && awk '
+  pending && /<attribute>[0-9]+<\/attribute>/ {
+    match($0, /[0-9]+/); value = substr($0, RSTART, RLENGTH) + 0
+    if (value % 2 == 0) value++
+    sub(/[0-9]+/, value); pending = 0; patched++
+  }
+  /<name>closepa-disable-switch<\/name>/ { pending = 1 }
+  { print }
+  END { if (patched != 1) exit 1 }
+' "$MM_LIST" > "$STAGE/mm.tmp" && chmod 0644 "$STAGE/mm.tmp" &&
+   chcon --reference="$MM_LIST" "$STAGE/mm.tmp" && mv "$STAGE/mm.tmp" "$STAGE/Multimedia_Daemon_List.xml"; then
+  ACTIVE_MM="$STAGE/Multimedia_Daemon_List.xml"
+fi
+printf '%s\n%s\n%s\n' "$ACTIVE_CONFIG" "$ACTIVE_LIBS" "$ACTIVE_MM" > "$STAGE/mount-state.tmp" || exit 0
 mv -f "$STAGE/mount-state.tmp" "$RUNTIME/mount-state" || exit 0
 mount --bind "$ACTIVE_LIBS" "$SOUNDFX" || exit 0
-if ! mount --bind "$ACTIVE_CONFIG" "$ORIGINAL"; then unmount_module; fi
+if ! mount --bind "$ACTIVE_CONFIG" "$ORIGINAL"; then unmount_module; exit 0; fi
+[ -n "$ACTIVE_MM" ] && mount --bind "$ACTIVE_MM" "$MM_LIST"

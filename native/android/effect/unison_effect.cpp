@@ -5,7 +5,9 @@
 #include <aidl/android/hardware/audio/effect/DefaultExtension.h>
 #include <aidl/android/media/audio/common/PcmType.h>
 #include <android/log.h>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <mutex>
 #include <optional>
@@ -35,6 +37,12 @@ constexpr uint32_t kStatusNotFull = 0x01;
 constexpr uint32_t kStatusNotEmpty = 0x02;
 constexpr int kDelayParameter = 1;
 constexpr int kMuteParameter = 2;
+constexpr int kSystemGainParameter = 3;
+constexpr int kClientMutedParameter = 4;
+// AudioFlinger 交来的合成音量与 root 进程下发的系统增益各自异步更新；两者暂时对不上时，tap 比值最多保持这么久
+// 等另一半到达，超时才认定是应用自己的音量变化。
+constexpr int64_t kRatioSettleNs = 120'000'000;
+constexpr float kRatioTolerance = 0.005f;
 int64_t nowNs() { timespec t{}; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000000LL + t.tv_nsec; }
 AudioUuid typeUuid() { return {static_cast<int32_t>(0x8e2581c2), 0x3d9a, 0x4e15, 0xa77a, {0x61,0x7f,0x6f,0x9e,0x82,0x01}}; }
 AudioUuid implUuid() { auto u = typeUuid(); u.node.back() = 2; return u; }
@@ -44,8 +52,10 @@ Descriptor buildDescriptor() {
     d.common.id.uuid = implUuid();
     d.common.flags.type = Flags::Type::INSERT;
     d.common.flags.insert = Flags::Insert::LAST;
+    // 音量控制者：AudioFlinger 不再把合成音量乘到会话上，改由本效果收下音量、在 tap 之后施加。
+    d.common.flags.volume = Flags::Volume::CTRL;
     d.common.name = "Unison Tap";
-    d.common.implementor = "Unison/5";
+    d.common.implementor = "Unison/6";
     return d;
 }
 ScopedAStatus error(const char* message) {
@@ -112,6 +122,7 @@ public:
             if (state_ == State::PROCESSING) return ScopedAStatus::ok();
             quit_ = false;
             state_ = State::PROCESSING;
+            gain_ = Gain{};
             try { worker_ = std::thread([this] { process(); }); }
             catch (...) { state_ = State::IDLE; return error("worker start"); }
         } else if (id == CommandId::STOP || id == CommandId::RESET) {
@@ -175,10 +186,11 @@ private:
         const auto out = static_cast<size_t>(common_.output.frameCount) * 2;
         auto input = std::make_unique<Fmq<float>>(in);
         auto output = std::make_unique<Fmq<float>>(out);
-        std::vector<float> work(std::max(in, out));
+        std::vector<float> work(std::max(in, out)), tap(std::max(in, out));
         input_ = std::move(input);
         output_ = std::move(output);
         work_.swap(work);
+        tap_.swap(tap);
     }
     void descriptors(IEffect::OpenEffectReturn* result) {
         result->statusMQ = status_->descriptor();
@@ -204,7 +216,14 @@ private:
     ScopedAStatus parameter(const Parameter& param) {
         __android_log_print(ANDROID_LOG_DEBUG, "UnisonTap", "setParameter tag=%d state=%d",
             static_cast<int>(param.getTag()), static_cast<int>(state_.load()));
-        // 设备/模式/音量等 indication 可在 open 前到达，直通效果不消费它们。
+        // 音量可在 open 前到达；设备/模式等 indication 不消费。
+        if (param.getTag() == Parameter::volumeStereo) {
+            const auto& volume = param.get<Parameter::volumeStereo>();
+            // 合成音量不会超过 1；超出时按 1，不放大。
+            volumeLeft_ = std::clamp(volume.left, 0.0f, 1.0f);
+            volumeRight_ = std::clamp(volume.right, 0.0f, 1.0f);
+            return ScopedAStatus::ok();
+        }
         if (param.getTag() != Parameter::common && param.getTag() != Parameter::specific) return ScopedAStatus::ok();
         if (state_ == State::INIT) return error("parameter before open");
         if (param.getTag() == Parameter::common) {
@@ -218,7 +237,7 @@ private:
                 scheduleDelay(delayUs_);
                 streamId_ = static_cast<uint64_t>(nowNs()); frames_ = 0;
                 status_->wake(kMqChanged);
-                if (resume) { quit_ = false; state_ = State::PROCESSING; worker_ = std::thread([this] { process(); }); }
+                if (resume) { quit_ = false; state_ = State::PROCESSING; gain_ = Gain{}; worker_ = std::thread([this] { process(); }); }
             }
             return ScopedAStatus::ok();
         }
@@ -234,8 +253,62 @@ private:
             int64_t us; memcpy(&us, blob->bytes.data() + 16, 8); scheduleDelay(us);
         } else if (fields[3] == kMuteParameter && fields[2] == 4) {
             int32_t value; memcpy(&value, blob->bytes.data() + 16, 4); muted_ = value != 0;
+        } else if (fields[3] == kSystemGainParameter && fields[2] == 4) {
+            float value; memcpy(&value, blob->bytes.data() + 16, 4);
+            if (std::isnan(value) || value > 1.0f) return error("invalid system gain");
+            systemGain_ = value < 0 ? -1.0f : value;
+        } else if (fields[3] == kClientMutedParameter && fields[2] == 4) {
+            int32_t value; memcpy(&value, blob->bytes.data() + 16, 4); clientMuted_ = value != 0;
         } else return error("unknown vendor parameter");
         return ScopedAStatus::ok();
+    }
+    /**
+     * tap 增益 = V 中属于应用的部分 = V ÷ S，按声道计算并钳到 1，绝不放大。V 与 S 各自异步更新：比值偏离已确认值时
+     * 先保持原值，另一半在 kRatioSettleNs 内到达、比值恢复时不变；超时才采用新比值（应用自己的音量变化），
+     * 此后 kRatioSettleNs 内的继续变化直接跟随。
+     * V 降到 0 立即跟随（暂停渐弱、应用静音）。S 为 0 时无法推算，沿用已确认的比值（本实例还没有时按 1），
+     * 应用报告静音时为 0。
+     */
+    void tapTarget(const float volume[2], int64_t now, float target[2]) {
+        const float system = systemGain_.load();
+        if (system > 0 && gain_.lastSystem == 0) gain_.systemRaisedNs = now;
+        gain_.lastSystem = system;
+        if (system < 0) {
+            for (int c = 0; c < 2; ++c) target[c] = volume[c];
+            return;
+        }
+        if (system == 0) {
+            const bool muted = clientMuted_.load();
+            for (int c = 0; c < 2; ++c) target[c] = muted ? 0.0f : gain_.haveStable ? gain_.stable[c] : 1.0f;
+            return;
+        }
+        if (volume[0] == 0 && volume[1] == 0) {
+            // V 为 0 不反映比值（暂停、应用静音或系统音量正降到 0），保留已确认的比值。S 刚从 0 升起而 V 尚未跟上时
+            // 照旧输出，否则立即跟随到 0。
+            const bool pending = gain_.haveStable && now - gain_.systemRaisedNs < kRatioSettleNs;
+            for (int c = 0; c < 2; ++c) target[c] = pending ? gain_.stable[c] : 0.0f;
+            return;
+        }
+        float candidate[2];
+        bool matches = true;
+        for (int c = 0; c < 2; ++c) {
+            candidate[c] = std::min(1.0f, volume[c] / system);
+            if (std::abs(candidate[c] - gain_.stable[c]) > kRatioTolerance * std::max(gain_.stable[c], 0.01f)) matches = false;
+        }
+        if (!gain_.haveStable || matches) {
+            for (int c = 0; c < 2; ++c) target[c] = gain_.stable[c] = candidate[c];
+            gain_.haveStable = true;
+            gain_.deviationNs = 0;
+            return;
+        }
+        if (!gain_.deviationNs) gain_.deviationNs = now;
+        // 确认是应用的音量变化后，紧接着的连续变化（淡入淡出）直接跟随，不再逐段等待。
+        if (now - gain_.deviationNs >= kRatioSettleNs || now < gain_.followUntilNs) {
+            for (int c = 0; c < 2; ++c) gain_.stable[c] = candidate[c];
+            gain_.deviationNs = 0;
+            gain_.followUntilNs = now + kRatioSettleNs;
+        }
+        for (int c = 0; c < 2; ++c) target[c] = gain_.stable[c];
     }
     void stopWorker() {
         quit_ = true;
@@ -244,7 +317,7 @@ private:
         if (state_ != State::INIT) state_ = State::IDLE;
     }
     void release() {
-        input_.reset(); output_.reset(); status_.reset(); work_.clear();
+        input_.reset(); output_.reset(); status_.reset(); work_.clear(); tap_.clear();
         if (socket_ >= 0) ::close(socket_);
         socket_ = -1;
         delete activeDelay_; activeDelay_ = nullptr;
@@ -253,6 +326,7 @@ private:
         state_ = State::INIT;
         frames_ = 0; droppedFrames_ = 0; droppedBatches_ = 0; delayUs_ = 0;
         muted_ = false;
+        volumeLeft_ = 0; volumeRight_ = 0; systemGain_ = -1; clientMuted_ = false;
     }
     void process() noexcept {
         if (setpriority(PRIO_PROCESS, 0, -16) != 0)
@@ -273,16 +347,33 @@ private:
                 activeDelay_ = next;
             }
             const auto frames = static_cast<uint32_t>(n / 2);
+            const float volume[2] = {volumeLeft_.load(), volumeRight_.load()};
+            float tapGain[2];
+            tapTarget(volume, callNs, tapGain);
+            if (!gain_.started) {
+                // 开始处理前收到的音量直接生效；之后每批从上一批的增益线性过渡，与混音器的音量渐变相同。
+                for (int c = 0; c < 2; ++c) { gain_.local[c] = volume[c]; gain_.tap[c] = tapGain[c]; }
+                gain_.started = true;
+            }
+            for (uint32_t f = 0; f < frames; ++f) {
+                const float k = static_cast<float>(f + 1) / static_cast<float>(frames);
+                for (int c = 0; c < 2; ++c) {
+                    const float x = work_[2 * f + c];
+                    tap_[2 * f + c] = x * (gain_.tap[c] + (tapGain[c] - gain_.tap[c]) * k);
+                    work_[2 * f + c] = x * (gain_.local[c] + (volume[c] - gain_.local[c]) * k);
+                }
+            }
+            for (int c = 0; c < 2; ++c) { gain_.local[c] = volume[c]; gain_.tap[c] = tapGain[c]; }
             UnisonTapHeader header{UNISON_TAP_MAGIC, static_cast<uint32_t>(common_.input.base.sampleRate), frames,
                 common_.ioHandle, streamId_, frames_, callNs, droppedFrames_, droppedBatches_, activeDelay_ ? static_cast<int32_t>(activeDelay_->microseconds / 1000) : 0, common_.session};
-            iovec vectors[] = {{&header, sizeof(header)}, {work_.data(), n * sizeof(float)}};
+            iovec vectors[] = {{&header, sizeof(header)}, {tap_.data(), n * sizeof(float)}};
             msghdr message{};
             message.msg_name = &destination; message.msg_namelen = addressSize;
             message.msg_iov = vectors; message.msg_iovlen = 2;
             const ssize_t sent = socket_ < 0 ? -1 : sendmsg(socket_, &message, MSG_DONTWAIT | MSG_NOSIGNAL);
             if (sent != static_cast<ssize_t>(sizeof(header) + n * sizeof(float))) { droppedFrames_ += frames; ++droppedBatches_; }
             frames_ += frames;
-            // tap 始终位于本机延迟线之前。零延迟时直接保持原样。
+            // 本机输出：音量在延迟线之前施加，音量变化被听到的时刻与原先由混音器施加时相同。零延迟时直接保持原样。
             if (activeDelay_ && !activeDelay_->data.empty()) {
                 auto& line = *activeDelay_;
                 for (size_t i = 0; i < n; ++i) {
@@ -306,11 +397,29 @@ private:
     std::thread worker_;
     std::unique_ptr<Fmq<IEffect::Status>> status_;
     std::unique_ptr<Fmq<float>> input_, output_;
-    std::vector<float> work_;
+    std::vector<float> work_, tap_;
     int socket_ = -1;
     uint64_t streamId_ = 0, frames_ = 0, droppedFrames_ = 0, droppedBatches_ = 0;
     std::atomic<int64_t> delayUs_{0};
     std::atomic<bool> muted_{false};
+    // AudioFlinger 交来的合成音量 V（主音量 × 系统音量 × 应用给轨道的音量 × VolumeShaper），收到前按 0。
+    std::atomic<float> volumeLeft_{0}, volumeRight_{0};
+    // root 进程下发的系统部分 S；负数表示未知，此时 tap 与本机一样按 V 衰减。
+    std::atomic<float> systemGain_{-1};
+    // 播放配置报告的应用自己静音（客户端音量或 VolumeShaper 为 0）；只在 S 为 0、无法从 V 推算时使用。
+    std::atomic<bool> clientMuted_{false};
+    struct Gain {
+        float local[2]{};
+        float tap[2]{};
+        float stable[2]{};
+        bool started = false;
+        bool haveStable = false;
+        int64_t deviationNs = 0;
+        int64_t followUntilNs = 0;
+        int64_t systemRaisedNs = INT64_MIN / 2;
+        float lastSystem = -1;
+    };
+    Gain gain_; // 只在 worker 中访问；START 前由控制线程重置
     std::atomic<DelayLine*> pending_{nullptr}, retired_{nullptr};
     DelayLine* activeDelay_ = nullptr;
 };
